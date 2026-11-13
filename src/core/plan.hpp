@@ -113,7 +113,14 @@ struct Group {
   mutable std::array<std::shared_ptr<void>, kNumStrategies> exec_cache;
 
   bool pure() const { return fn.identity() && src.dtype == dst.dtype; }
-  int64_t bytes() const { return runs.total() * static_cast<int64_t>(itemsize(src.dtype)); }
+  // Cached: a plan's groups never change, and runs can be millions long.
+  int64_t bytes() const {
+    if (bytes_ < 0) bytes_ = runs.total() * static_cast<int64_t>(itemsize(src.dtype));
+    return bytes_;
+  }
+
+ private:
+  mutable int64_t bytes_ = -1;
 };
 
 struct Plan {

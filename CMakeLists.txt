@@ -89,7 +89,9 @@ if(CE_WITH_CUDA)
     set(_embed ${CMAKE_CURRENT_BINARY_DIR}/ce_kernels_fatbin.c)
     add_custom_command(
       OUTPUT ${_fatbin}
-      COMMAND ${CE_NVCC} --fatbin -std=c++17 -O3 --fmad=false ${_gencode}
+      # compress-mode=size: ~27x smaller; needs a CUDA 12.4+ era driver to load,
+      # older drivers fail kernel admission with a clear reason.
+      COMMAND ${CE_NVCC} --fatbin -std=c++17 -O3 --fmad=false --compress-mode=size ${_gencode}
               -I${CMAKE_CURRENT_SOURCE_DIR}/src -o ${_fatbin} ${CMAKE_CURRENT_SOURCE_DIR}/src/backends/cuda/kernels.cu
       DEPENDS src/backends/cuda/kernels.cu src/core/convert.hpp
       COMMENT "Compiling copy kernels (${CE_CUDA_ARCHS})"

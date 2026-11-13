@@ -1,5 +1,6 @@
 #include "copyengine/engine.hpp"
 
+#include <bit>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -94,8 +95,8 @@ struct Engine::Impl {
     return *cuda;
   }
 
-  void enqueue(const Endpoint& src, const Endpoint& dst, Runs runs, const Elementwise& fn, const Hints& hints,
-               uintptr_t strm) {
+  // Validated, absolute, safety-checked op ready to queue (runs may be empty).
+  Op make_op(const Endpoint& src, const Endpoint& dst, Runs runs, const Elementwise& fn, const Hints& hints) {
     const i64 ssz = static_cast<i64>(itemsize(src.dtype)), dsz = static_cast<i64>(itemsize(dst.dtype));
     for (const Endpoint* e : {&src, &dst}) {
       if (e->base % itemsize(e->dtype) != 0) fail(Errc::invalid_argument, "buffer base is not aligned to its dtype");
@@ -130,7 +131,7 @@ struct Engine::Impl {
     }
     if (pure) op.src.dtype = op.dst.dtype = DType::u8;
     op.runs = std::move(runs);
-    if (op.runs.empty()) return;
+    if (op.runs.empty()) return op;
     exec_for(op.src, op.dst);  // fail early when the platform is missing
     op.fp = fingerprint(op);
     if (!safe.count(op.fp)) {
@@ -138,6 +139,18 @@ struct Engine::Impl {
       if (static_cast<int>(safe.size()) >= opt.plan_cache * 4) safe.clear();
       safe.insert(op.fp);
     }
+    return op;
+  }
+
+  static Op clone(const Op& o) {
+    Op c;
+    c.src = o.src, c.dst = o.dst, c.runs = o.runs, c.fn = o.fn, c.ctx = o.ctx;
+    c.src_lo = o.src_lo, c.src_hi = o.src_hi, c.fp = o.fp;
+    return c;
+  }
+
+  void push(Op op, uintptr_t strm) {
+    if (op.runs.empty()) return;
     if (!queue.empty() && strm != stream) flush();
     stream = strm;
     queue.push_back(std::move(op));
@@ -145,6 +158,60 @@ struct Engine::Impl {
       flush();
       if (!opt.allow_async) synchronize();
     }
+  }
+
+  void enqueue(const Endpoint& src, const Endpoint& dst, Runs runs, const Elementwise& fn, const Hints& hints,
+               uintptr_t strm) {
+    push(make_op(src, dst, std::move(runs), fn, hints), strm);
+  }
+
+  // Statement cache: an identical copy (same buffers, layouts, tables,
+  // function) reuses the lowered, checked op without touching its runs.
+  std::unordered_map<Hash128, Op, Hash128Hasher> stmt_cache;
+
+  static void add_access(Hasher& h, const Access& a) {
+    h.add(static_cast<uint64_t>(a.base()));
+    h.add(static_cast<uint64_t>(a.rank()));
+    for (const Term& t : a.terms()) {
+      h.add(static_cast<uint64_t>(t.size));
+      h.add(static_cast<uint64_t>(t.stride));
+      if (t.table) h.add(std::span<const i64>(*t.table));
+      else h.add(uint64_t{0xA77});
+    }
+  }
+
+  static void add_endpoint(Hasher& h, const Endpoint& e) {
+    h.add((static_cast<uint64_t>(e.device.kind) << 40) | (static_cast<uint64_t>(e.device.index) << 8) |
+          (static_cast<uint64_t>(e.dtype) << 1) | (e.pinned ? 1u : 0u));
+    h.add(static_cast<uint64_t>(e.base));
+    h.add(static_cast<uint64_t>(e.nbytes));
+  }
+
+  void enqueue_stmt(const Endpoint& src, const Endpoint& dst, const Stmt& stmt, const Elementwise& fn,
+                    const Hints& hints, uintptr_t strm) {
+    Hasher h;
+    add_endpoint(h, src);
+    add_endpoint(h, dst);
+    add_access(h, stmt.src);
+    add_access(h, stmt.dst);
+    h.add(std::bit_cast<uint32_t>(fn.scale));
+    h.add(std::bit_cast<uint32_t>(fn.bias));
+    h.add((fn.round ? 1u : 0u) | (fn.clamp ? 2u : 0u));
+    h.add(std::bit_cast<uint32_t>(fn.lo));
+    h.add(std::bit_cast<uint32_t>(fn.hi));
+    h.add(hints.ctx);
+    h.add(uint64_t{hints.has_valid});
+    h.add(std::span<const i64>(hints.valid_start));
+    h.add(std::span<const i64>(hints.valid_len));
+    const Hash128 key = h.done();
+    if (auto it = stmt_cache.find(key); it != stmt_cache.end()) {
+      push(clone(it->second), strm);
+      return;
+    }
+    Op op = make_op(src, dst, lower(stmt), fn, hints);
+    if (static_cast<int>(stmt_cache.size()) >= opt.plan_cache * 4) stmt_cache.clear();
+    stmt_cache.emplace(key, clone(op));
+    push(std::move(op), strm);
   }
 
   void log(const Plan& p, size_t nops) {
@@ -249,9 +316,8 @@ void Engine::copy(const Endpoint& src, const Endpoint& dst, const Runs& runs, co
 
 void Engine::copy(const Endpoint& src, const Endpoint& dst, const Stmt& stmt, const Elementwise& fn,
                   const Hints& hints, uintptr_t stream) {
-  Runs runs = lower(stmt);
   std::lock_guard lk(impl_->mu);
-  impl_->enqueue(src, dst, std::move(runs), fn, hints, stream);
+  impl_->enqueue_stmt(src, dst, stmt, fn, hints, stream);
 }
 
 void Engine::begin_scope() {

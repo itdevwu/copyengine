@@ -444,6 +444,19 @@ std::pair<i64, i64> Access::extent() const {
   return {lo, hi};
 }
 
+Access broadcast_to(const Access& a, std::span<const i64> shape) {
+  if (a.rank() > shape.size()) fail(Errc::invalid_argument, "cannot broadcast to a lower rank");
+  Access r = a;
+  while (r.rank() < shape.size()) r = r.unsqueeze(0);
+  for (size_t d = 0; d < shape.size(); ++d) {
+    const i64 n = r.terms()[d].size;
+    if (n == shape[d]) continue;
+    if (n != 1) fail(Errc::invalid_argument, "shapes are not broadcastable");
+    r = r.expand(static_cast<int>(d), shape[d]);
+  }
+  return r;
+}
+
 // ---- Stmt / lowering -----------------------------------------------------------
 
 Stmt::Stmt(Access d, Access s) : dst(std::move(d)), src(std::move(s)) {

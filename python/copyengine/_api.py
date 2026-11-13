@@ -19,7 +19,10 @@ from ._tensor import (
     flat_endpoint,
     index_array,
     is_tensor,
+    raw_stream,
     torch,
+    torch_fast,
+    torch_parts,
     view,
 )
 
@@ -91,6 +94,14 @@ class Engine:
 
     def copy_(self, dst, src, *, fn: Optional[Elementwise] = None, ctx: str = "") -> Any:
         """``dst[...] = fn(src)`` for any strided views; ``src`` broadcasts to ``dst``."""
+        if not ctx and torch_fast(dst) and torch_fast(src):
+            dep, ds, dst_, doff, dcuda = torch_parts(dst)
+            sep, ss, sst, soff, scuda = torch_parts(src)
+            stream = raw_stream(dst if dcuda else src) if (dcuda or scuda) else 0
+            with self._lock:
+                self._e.copy_strided(sep, dep, ss, sst, soff, ds, dst_, doff, fn or _IDENTITY, stream)
+                self._after(src, dst)
+            return dst
         d, s = view(dst, writable=True), view(src)
         sacc = broadcast_to(s.access, list(d.access.shape))
         stmt = _core.Stmt(d.access, sacc)

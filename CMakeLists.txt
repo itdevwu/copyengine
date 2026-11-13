@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.26)
-project(copyengine VERSION 0.0.1 LANGUAGES C CXX)
+project(copyengine VERSION 0.1.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -44,6 +44,8 @@ target_include_directories(copyengine
 )
 target_compile_options(copyengine PRIVATE
   $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra -Wpedantic -Werror=return-type>
+  # GCC 13 false positive on std::variant holding std::shared_ptr (core/json.hpp)
+  $<$<CXX_COMPILER_ID:GNU>:-Wno-maybe-uninitialized>
 )
 set_target_properties(copyengine PROPERTIES C_VISIBILITY_PRESET hidden CXX_VISIBILITY_PRESET hidden)
 target_compile_definitions(copyengine PRIVATE CE_BUILDING_LIBRARY)

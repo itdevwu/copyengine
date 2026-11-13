@@ -271,3 +271,25 @@ def test_gap_filling_stays_correct():
     for i in range(0, 4096, 64):
         want[i:i + 32] = src[i:i + 32]
     torch.testing.assert_close(dst.cpu(), want, rtol=0, atol=0)
+
+
+def test_broadcast_and_element_transpose_kernels():
+    # qscale pattern: tiny broadcast H2D copies
+    L, B, N, S = 4, 16, 16, 8
+    k_qs = torch.rand(B, N, 1).pin_memory()
+    scale = torch.zeros(L, B, N, S, device=DEV)
+
+    def body(e):
+        scale.zero_()
+        with e.scope():
+            for l in range(L):
+                for b in range(B):
+                    e.copy_(scale[l, b], k_qs[b].expand(N, S))
+
+    want = k_qs.expand(B, N, S).unsqueeze(0).expand(L, B, N, S)
+    explore(body, check=lambda: torch.testing.assert_close(scale.cpu(), want, rtol=0, atol=0))
+    # element-level transpose on device with a cast
+    x = torch.randn(33, 65, device=DEV)
+    out = torch.empty(65, 33, device=DEV, dtype=torch.bfloat16)
+    ce.Engine(tune=False).copy_(out, x.t())
+    torch.testing.assert_close(out, x.t().bfloat16(), rtol=0, atol=0)

@@ -74,6 +74,9 @@ struct Group {
   // filled at plan time
   std::vector<Strategy> candidates;
   std::string bucket;
+  // Backend-built tables (chunk lists, copy lists) per strategy, reused on
+  // every plan-cache hit and frozen replay so the hot path does no planning.
+  mutable std::array<std::shared_ptr<void>, kNumStrategies> exec_cache;
 
   bool pure() const { return fn.identity() && src.dtype == dst.dtype; }
   int64_t bytes() const { return runs.total() * static_cast<int64_t>(itemsize(src.dtype)); }

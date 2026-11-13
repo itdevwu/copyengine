@@ -124,6 +124,9 @@ class Access {
   std::vector<Term> terms_;
 };
 
+// Numpy-style broadcast of `a` to `shape` (leading unsqueezes, size-1 expands).
+Access broadcast_to(const Access& a, std::span<const i64> shape);
+
 struct Stmt {
   Access dst, src;
   Stmt(Access dst_, Access src_);

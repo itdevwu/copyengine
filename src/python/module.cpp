@@ -255,6 +255,16 @@ NB_MODULE(_core, m) {
         e.copy(src, dst, stmt, fn, h, stream);
       }, "src"_a, "dst"_a, "stmt"_a, "fn"_a, "valid_start"_a = nb::none(), "valid_len"_a = nb::none(),
          "ctx"_a = "", "stream"_a = 0)
+      .def("copy_strided", [](ce::Engine& e, const ce::Endpoint& src, const ce::Endpoint& dst,
+                              const std::vector<i64>& s_shape, const std::vector<i64>& s_strides, i64 s_off,
+                              const std::vector<i64>& d_shape, const std::vector<i64>& d_strides, i64 d_off,
+                              const ce::Elementwise& fn, uintptr_t stream) {
+        ce::Access da = ce::Access::strided(d_shape, d_strides, d_off);
+        ce::Access sa = ce::broadcast_to(ce::Access::strided(s_shape, s_strides, s_off), d_shape);
+        ce::Stmt stmt(std::move(da), std::move(sa));
+        nb::gil_scoped_release release;
+        e.copy(src, dst, stmt, fn, {}, stream);
+      })
       .def("begin_scope", &ce::Engine::begin_scope)
       .def("end_scope", &ce::Engine::end_scope, nb::call_guard<nb::gil_scoped_release>())
       .def("flush", &ce::Engine::flush, nb::call_guard<nb::gil_scoped_release>())

@@ -1,6 +1,8 @@
 // Table-driven copy kernels, compiled AOT into a fatbin and loaded through the
-// driver API. One warp per chunk; chunks are (src, dst, len) in absolute
-// element indices, so a pointer is index * sizeof(T).
+// driver API. One warp per chunk. A chunk is a 2-D block in absolute element
+// indices (a pointer is index * sizeof(T)): `rows` rows of `width` elements,
+// row r at src + r * spitch / dst + r * dpitch. spitch may be 0 (broadcast) or
+// smaller than width; rows never overlap on the destination.
 //
 // Build with --fmad=false: conversions must match the host backend bit for bit.
 
@@ -9,7 +11,7 @@
 namespace {
 
 struct Chunk {
-  long long src, dst, len;
+  long long src, dst, width, rows, spitch, dpitch;
 };
 
 using namespace ce::cv;
@@ -22,9 +24,19 @@ __device__ __forceinline__ void typed(const Chunk* __restrict__ chunks, int n, F
   const Chunk c = chunks[warp];
   const S* __restrict__ s = reinterpret_cast<const S*>(static_cast<uintptr_t>(c.src) * sizeof(S));
   D* __restrict__ d = reinterpret_cast<D*>(static_cast<uintptr_t>(c.dst) * sizeof(D));
-  for (long long i = lane; i < c.len; i += 32) {
-    if constexpr (kIdentity) d[i] = cast<D>(s[i]);
-    else d[i] = apply<D>(s[i], fn);
+  auto one = [&](long long so, long long dof) {
+    if constexpr (kIdentity) d[dof] = cast<D>(s[so]);
+    else d[dof] = apply<D>(s[so], fn);
+  };
+  if (c.width >= 32 || c.rows == 1) {
+    for (long long r = 0; r < c.rows; ++r)
+      for (long long i = lane; i < c.width; i += 32) one(r * c.spitch + i, r * c.dpitch + i);
+  } else {  // narrow rows (broadcast, element transposes): flatten so all lanes work
+    const long long n = c.width * c.rows;
+    for (long long e = lane; e < n; e += 32) {
+      const long long r = e / c.width, i = e - r * c.width;
+      one(r * c.spitch + i, r * c.dpitch + i);
+    }
   }
 }
 
@@ -44,12 +56,14 @@ extern "C" __global__ void ce_bytes(const Chunk* __restrict__ chunks, int n) {
   const int lane = threadIdx.x & 31;
   if (warp >= n) return;
   const Chunk c = chunks[warp];
-  const uintptr_t s = static_cast<uintptr_t>(c.src), d = static_cast<uintptr_t>(c.dst);
-  const uintptr_t a = s | d | static_cast<uintptr_t>(c.len);
-  if ((a & 15) == 0) move<uint4>(s, d, c.len, lane);
-  else if ((a & 7) == 0) move<uint2>(s, d, c.len, lane);
-  else if ((a & 3) == 0) move<uint32_t>(s, d, c.len, lane);
-  else move<uint8_t>(s, d, c.len, lane);
+  const uintptr_t a = static_cast<uintptr_t>(c.src | c.dst | c.width | c.spitch | c.dpitch);
+  for (long long r = 0; r < c.rows; ++r) {
+    const uintptr_t s = static_cast<uintptr_t>(c.src + r * c.spitch), d = static_cast<uintptr_t>(c.dst + r * c.dpitch);
+    if ((a & 15) == 0) move<uint4>(s, d, c.width, lane);
+    else if ((a & 7) == 0) move<uint2>(s, d, c.width, lane);
+    else if ((a & 3) == 0) move<uint32_t>(s, d, c.width, lane);
+    else move<uint8_t>(s, d, c.width, lane);
+  }
 }
 
 #define CE_TYPES(X, ...)            \

@@ -22,8 +22,50 @@ namespace {
 
 using cuda::Driver;
 
+// Mirrors the kernel's chunk: rows x width elements at constant pitches.
 struct Chunk {
-  long long src, dst, len;
+  long long src, dst, width, rows, spitch, dpitch;
+};
+
+// Packs (src, dst, len) parts, in order, into kernel chunks: consecutive parts
+// of equal length at constant pitches (any src pitch, including 0) share a
+// chunk; nothing exceeds `max` elements.
+class ChunkBuilder {
+ public:
+  explicit ChunkBuilder(long long max) : max_(max) {}
+  void add(long long s, long long d, long long len) {
+    if (len <= 0) return;
+    if (len > max_) {
+      close();
+      for (long long k = 0; k < len; k += max_) out_.push_back({s + k, d + k, std::min(max_, len - k), 1, 0, 0});
+      return;
+    }
+    if (open_) {
+      Chunk& c = out_.back();
+      if (len == c.width && (c.rows + 1) * c.width <= max_) {
+        // Destination parts never overlap (checked at enqueue), so any
+        // constant destination pitch keeps rows disjoint.
+        if (c.rows == 1) {
+          c.spitch = s - c.src, c.dpitch = d - c.dst, c.rows = 2;
+          return;
+        }
+        const long long ls = c.src + (c.rows - 1) * c.spitch, ld = c.dst + (c.rows - 1) * c.dpitch;
+        if (s - ls == c.spitch && d - ld == c.dpitch) {
+          ++c.rows;
+          return;
+        }
+      }
+    }
+    out_.push_back({s, d, len, 1, 0, 0});
+    open_ = true;
+  }
+  void close() { open_ = false; }
+  std::vector<Chunk> take() { return std::move(out_); }
+
+ private:
+  long long max_;
+  bool open_ = false;
+  std::vector<Chunk> out_;
 };
 
 // A raw byte copy between two addresses on known sides.
@@ -146,10 +188,10 @@ class CudaExecutor final : public Executor {
     switch (strat) {
       case Strategy::passthrough: return passthrough(s, g, ops, st);
       case Strategy::runs: return runs(g, st);
-      case Strategy::batch: return batch(s, g.src, g.dst, rows_raw(g), st);
+      case Strategy::batch: return batch(s, g.src, g.dst, cached_rows(g, Strategy::batch), st);
       case Strategy::kernel: return kernel(s, g, st);
       case Strategy::staged: return staged(s, g, st);
-      case Strategy::bounce: return bounce(s, g.src, g.dst, rows_raw(g), st);
+      case Strategy::bounce: return bounce(s, g.src, g.dst, cached_rows(g, Strategy::bounce), st);
       default: fail(Errc::unsupported, "CUDA backend cannot run strategy " + std::string(strategy_name(strat)));
     }
   }
@@ -265,7 +307,7 @@ class CudaExecutor final : public Executor {
       check(d_->cuMemAlloc(&a, n * 4), "cuMemAlloc");
       check(d_->cuMemAlloc(&b, n * 2), "cuMemAlloc");
       check(d_->cuMemcpyHtoDAsync(a, in.data(), n * 4, s.side), "cuMemcpyHtoDAsync");
-      std::vector<Chunk> ch{{static_cast<long long>(a / 4), static_cast<long long>(b / 2), n}};
+      std::vector<Chunk> ch{{static_cast<long long>(a / 4), static_cast<long long>(b / 2), n, 1, 0, 0}};
       launch(s, "ce_cast_f32_f16", ch, {}, s.side);
       check(d_->cuMemcpyDtoHAsync(got.data(), b, n * 2, s.side), "cuMemcpyDtoHAsync");
       check(d_->cuStreamSynchronize(s.side), "cuStreamSynchronize");
@@ -356,6 +398,12 @@ class CudaExecutor final : public Executor {
                        static_cast<uintptr_t>(R.dst[r] + h * R.dst_pitch[r]) * ds,
                        static_cast<size_t>(R.width[r]) * ss});
     return out;
+  }
+
+  static const std::vector<Raw>& cached_rows(const Group& g, Strategy which) {
+    auto& slot = g.exec_cache[static_cast<int>(which)];
+    if (!slot) slot = std::make_shared<std::vector<Raw>>(rows_raw(g));
+    return *static_cast<std::vector<Raw>*>(slot.get());
   }
 
   int64_t runs(const Group& g, CUstream st) {
@@ -545,9 +593,6 @@ class CudaExecutor final : public Executor {
     (void)bytes;
   }
 
-  static void split(std::vector<Chunk>& out, long long s, long long d, long long len, long long max) {
-    for (long long k = 0; k < len; k += max) out.push_back({s + k, d + k, std::min(max, len - k)});
-  }
 
   static std::string kernel_name(const Group& g) {
     if (g.pure()) return "ce_bytes";
@@ -555,13 +600,13 @@ class CudaExecutor final : public Executor {
   }
 
   int64_t kernel(Dev& s, const Group& g, CUstream st) {
-    std::vector<Chunk> ch;
-    const long long max = g.pure() ? kByteChunk : kTypedChunk;
-    const Rects& R = g.rects;
-    for (size_t r = 0; r < R.size(); ++r)
-      for (i64 h = 0; h < R.height[r]; ++h)
-        split(ch, R.src[r] + h * R.src_pitch[r], R.dst[r] + h * R.dst_pitch[r], R.width[r], max);
-    launch(s, kernel_name(g), ch, to_cv(g.fn), st);
+    auto& slot = g.exec_cache[static_cast<int>(Strategy::kernel)];
+    if (!slot) {
+      ChunkBuilder cb(g.pure() ? kByteChunk : kTypedChunk);
+      for (size_t i = 0; i < g.runs.size(); ++i) cb.add(g.runs.src[i], g.runs.dst[i], g.runs.len[i]);
+      slot = std::make_shared<std::vector<Chunk>>(cb.take());
+    }
+    launch(s, kernel_name(g), *static_cast<std::vector<Chunk>*>(slot.get()), to_cv(g.fn), st);
     return 1;
   }
 
@@ -594,14 +639,20 @@ class CudaExecutor final : public Executor {
   // link (read gaps below kGapBytes inside one source allocation are copied
   // too); a kernel on the device side scatters / gathers and converts. This is
   // the "cut point on the device" transform: layout changes happen in HBM.
-  int64_t staged(Dev& s, const Group& g, CUstream st) {
+  // One staging round: raw link copies and kernel chunks, with staging-side
+  // addresses relative to the staging base (it may be reallocated).
+  struct StagedStep {
+    size_t bytes = 0;
+    std::vector<Raw> raws;
+    std::vector<Chunk> chunks;
+  };
+
+  std::vector<StagedStep> build_staged(const Group& g) const {
     const bool h2d = g.dst.device.kind == DeviceKind::cuda;
     const DType lt = h2d ? g.src.dtype : g.dst.dtype;  // dtype crossing the link
     const i64 isz = static_cast<i64>(itemsize(lt));
     const int64_t budget = std::max<int64_t>(opt_.staging_budget, 1 << 20);
     const i64 per = std::max<i64>(1, budget / isz);
-    const std::string name = kernel_name(g);
-    const cv::Fn fn = to_cv(g.fn);
 
     // Link-side intervals (elements of lt), sorted.
     const std::vector<i64>& link = h2d ? g.runs.src : g.runs.dst;
@@ -624,62 +675,87 @@ class CudaExecutor final : public Executor {
       }
       iv = std::move(m);
     }
-    // Pieces: intervals cut so each fits the staging budget.
     std::vector<std::pair<i64, i64>> pieces;
     for (size_t k = 0; k < iv.start.size(); ++k)
       for (i64 a = iv.start[k]; a < iv.end[k]; a += per) pieces.push_back({a, std::min(iv.end[k], a + per)});
 
-    // Runs ordered by their link-side offset.
+    // Runs ordered by link offset; stable so runs sharing a source (broadcast)
+    // keep destination order and pack into 2-D chunks.
     std::vector<size_t> order(g.runs.size());
     for (size_t i = 0; i < order.size(); ++i) order[i] = i;
-    std::sort(order.begin(), order.end(), [&](size_t a, size_t b) { return link[a] < link[b]; });
+    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return link[a] < link[b]; });
 
-    int64_t calls = 0;
+    std::vector<StagedStep> steps;
     size_t p = 0, ri = 0;
-    i64 r_done = 0;  // elements of run order[ri] already emitted
+    i64 r_done = 0;
     while (p < pieces.size()) {
-      // Chunk: consecutive pieces within the budget.
       size_t q = p;
       i64 total = 0;
       while (q < pieces.size() && total + (pieces[q].second - pieces[q].first) <= per) total += pieces[q].second - pieces[q].first, ++q;
       if (q == p) ++q, total = pieces[p].second - pieces[p].first;
-      const CUdeviceptr stg = staging(s, static_cast<size_t>(total * isz), st);
-      const i64 base = static_cast<i64>(stg) / isz;
-      std::vector<Raw> raws;
-      std::vector<Chunk> ch;
+      StagedStep step;
+      step.bytes = static_cast<size_t>(total * isz);
+      ChunkBuilder cb(g.pure() ? kByteChunk : kTypedChunk);
       i64 off = 0;
       for (size_t k = p; k < q; ++k) {
         const auto [a, b] = pieces[k];
-        if (h2d) raws.push_back({static_cast<uintptr_t>(a * isz), static_cast<uintptr_t>((base + off) * isz), static_cast<size_t>((b - a) * isz)});
-        else raws.push_back({static_cast<uintptr_t>((base + off) * isz), static_cast<uintptr_t>(a * isz), static_cast<size_t>((b - a) * isz)});
-        // Emit the parts of runs that fall in [a, b).
+        if (h2d) step.raws.push_back({static_cast<uintptr_t>(a * isz), static_cast<uintptr_t>(off * isz), static_cast<size_t>((b - a) * isz)});
+        else step.raws.push_back({static_cast<uintptr_t>(off * isz), static_cast<uintptr_t>(a * isz), static_cast<size_t>((b - a) * isz)});
         while (ri < order.size()) {
           const size_t r = order[ri];
           const i64 lo = link[r] + r_done, hi = link[r] + g.runs.len[r];
           if (lo >= b) break;
           const i64 take = std::min(hi, b) - lo;
-          const i64 stg_idx = base + off + (lo - a);
+          const i64 stg_idx = off + (lo - a);  // relative to the staging base
           const i64 other = (h2d ? g.runs.dst[r] : g.runs.src[r]) + r_done;
-          if (h2d) split(ch, stg_idx, other, take, kTypedChunk);
-          else split(ch, other, stg_idx, take, kTypedChunk);
+          if (h2d) cb.add(stg_idx, other, take);
+          else cb.add(other, stg_idx, take);
           r_done += take;
           if (r_done == g.runs.len[r]) ++ri, r_done = 0;
-          else break;  // continues in the next piece
+          else break;
         }
         off += b - a;
       }
-      const Side dev_side{h2d ? g.dst.device : g.src.device, lt, false};
-      const std::string kname = g.pure() ? "ce_bytes" : name;
+      step.chunks = cb.take();
+      steps.push_back(std::move(step));
+      p = q;
+    }
+    return steps;
+  }
+
+  // Host <-> device through device staging. Only dense intervals cross the
+  // link (read gaps below kGapBytes inside one source allocation are copied
+  // too); a kernel on the device side scatters / gathers and converts. This is
+  // the "cut point on the device" transform: layout changes happen in HBM.
+  int64_t staged(Dev& s, const Group& g, CUstream st) {
+    auto& slot = g.exec_cache[static_cast<int>(Strategy::staged)];
+    if (!slot) slot = std::make_shared<std::vector<StagedStep>>(build_staged(g));
+    const auto& steps = *static_cast<std::vector<StagedStep>*>(slot.get());
+    const bool h2d = g.dst.device.kind == DeviceKind::cuda;
+    const DType lt = h2d ? g.src.dtype : g.dst.dtype;
+    const i64 isz = static_cast<i64>(itemsize(lt));
+    const std::string name = g.pure() ? "ce_bytes" : kernel_name(g);
+    const cv::Fn fn = to_cv(g.fn);
+    const Side dev_side{h2d ? g.dst.device : g.src.device, lt, false};
+    int64_t calls = 0;
+    std::vector<Raw> raws;
+    std::vector<Chunk> ch;
+    for (const StagedStep& step : steps) {
+      const CUdeviceptr stg = staging(s, step.bytes, st);
+      const long long base = static_cast<long long>(stg / isz);
+      raws = step.raws;
+      ch = step.chunks;
+      for (Raw& r : raws) (h2d ? r.dst : r.src) += stg;
+      for (Chunk& c : ch) (h2d ? c.src : c.dst) += base;
       if (h2d) {
         copy_raws(s, g.src, dev_side, raws, st);
-        launch(s, kname, ch, fn, st);
+        launch(s, name, ch, fn, st);
       } else {
-        launch(s, kname, ch, fn, st);
+        launch(s, name, ch, fn, st);
         copy_raws(s, dev_side, g.dst, raws, st);
       }
       staging_release(s, st);
       calls += 2;
-      p = q;
     }
     return calls;
   }

@@ -115,6 +115,27 @@ def view(x, *, writable: bool = False) -> View:
     raise TypeError(f"expected a numpy array or torch tensor, got {type(x).__name__}")
 
 
+def torch_fast(t) -> bool:
+    """Plain strided CPU/CUDA tensor of a supported dtype (the copy_ fast path)."""
+    return (torch is not None and type(t) is torch.Tensor and t.layout == torch.strided
+            and t.dtype in _TORCH_DTYPES and t.device.type in ("cpu", "cuda"))
+
+
+def torch_parts(t):
+    """(endpoint, shape, strides, storage offset, is_cuda) without building Python Access objects."""
+    st = t.untyped_storage()
+    dev = t.device
+    if dev.type == "cuda":
+        ep = _core.Endpoint("cuda", dev.index or 0, st.data_ptr(), st.nbytes(), _TORCH_DTYPES[t.dtype], False)
+        return ep, list(t.shape), list(t.stride()), t.storage_offset(), True
+    ep = _core.Endpoint("host", 0, st.data_ptr(), st.nbytes(), _TORCH_DTYPES[t.dtype], t.is_pinned())
+    return ep, list(t.shape), list(t.stride()), t.storage_offset(), False
+
+
+def raw_stream(t) -> int:
+    return torch._C._cuda_getCurrentRawStream(t.device.index or 0)
+
+
 def _torch_view(t) -> View:
     if t.layout != torch.strided:
         raise _core.Unsupported(f"only strided tensors are supported, got {t.layout}")
@@ -188,7 +209,7 @@ def current_stream(*views: View) -> int:
     """The torch current stream of the CUDA device involved, or 0."""
     for v in views:
         if v.is_cuda:
-            return torch.cuda.current_stream(v.device_index).cuda_stream
+            return torch._C._cuda_getCurrentRawStream(v.device_index)
     return 0
 
 

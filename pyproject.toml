@@ -10,6 +10,23 @@ readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.10"
 dependencies = ["numpy>=1.22"]
+authors = [{ name = "itdevwu", email = "code@itdevwu.com" }]
+keywords = ["pytorch", "cuda", "memcpy", "kv-cache", "inference", "dma"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: C++",
+    "Programming Language :: Python :: 3",
+    "Environment :: GPU :: NVIDIA CUDA :: 12",
+    "Environment :: GPU :: NVIDIA CUDA :: 13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Homepage = "https://github.com/itdevwu/copyengine"
+Issues = "https://github.com/itdevwu/copyengine/issues"
 
 [project.optional-dependencies]
 test = ["pytest>=8"]

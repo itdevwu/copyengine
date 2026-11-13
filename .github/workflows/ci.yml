@@ -55,21 +55,6 @@ jobs:
       - name: Check both torch layers loaded
         working-directory: /tmp
         run: python -c "import copyengine as ce; assert ce._torch_ops.copy_ is not None, ce._torch_ops.error; assert ce._shim.lib is not None, ce._shim.error"
-      - name: Export the shim for this torch
-        working-directory: /tmp
-        run: |
-          python - <<'EOF'
-          import pathlib, shutil
-          import copyengine._shim as s
-          out = pathlib.Path("/tmp/shim-out") / s.shim_key()
-          out.mkdir(parents=True)
-          shutil.copy(s.lib._name, out / "libcopyengine_shim.so")
-          print(out)
-          EOF
-      - uses: actions/upload-artifact@v5
-        with:
-          name: shim-torch${{ matrix.torch }}
-          path: /tmp/shim-out
 
   # The stable ABI claim and the compile-on-import path: built with the newest
   # torch, run with the oldest supported one.
@@ -92,35 +77,40 @@ jobs:
         run: python -c "import copyengine as ce; assert ce._torch_ops.copy_ is not None, ce._torch_ops.error; assert ce._shim.lib is not None, ce._shim.error; print(ce._shim.lib._name)"
       - run: pytest -q
 
-  # Release wheel: CUDA kernels compiled, plus the shim of every torch release
-  # above, so matching installs never compile on import.
+  # Release wheels and sdist (docker/build-wheels.sh, which also runs locally):
+  # manylinux_2_28, CUDA kernels for every architecture, a prebuilt shim per
+  # supported torch release. On a v* tag the version must match CMakeLists.txt
+  # and the files are attached to the GitHub release.
   wheel:
-    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
-    needs: [torch]
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    needs: [core, torch, cross-torch]
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    container: nvidia/cuda:12.9.1-devel-ubuntu24.04
+    timeout-minutes: 120
+    container: quay.io/pypa/manylinux_2_28_x86_64
     steps:
-      - run: apt-get update && apt-get install -y git python3 python3-venv python3-dev ninja-build cmake g++
       - uses: actions/checkout@v6
-      - run: python3 -m venv /venv
-      - run: /venv/bin/pip install scikit-build-core nanobind numpy wheel "torch==2.11.0" --index-url "$TORCH_CPU_INDEX" --extra-index-url https://pypi.org/simple
-      - run: /venv/bin/pip wheel --no-build-isolation --no-deps . -w dist
-      - uses: actions/download-artifact@v5
-        with:
-          pattern: shim-torch*
-          path: shims
-          merge-multiple: true
-      - name: Add every torch release's shim to the wheel
+      - name: Tag matches the version
+        if: startsWith(github.ref, 'refs/tags/v')
         run: |
-          /venv/bin/python -m wheel unpack dist/*.whl -d unpacked
-          pkg=$(echo unpacked/*/copyengine)
-          mkdir -p "$pkg/shims"
-          cp -rn shims/* "$pkg/shims/"
-          ls "$pkg/shims"
-          rm dist/*.whl
-          /venv/bin/python -m wheel pack unpacked/* -d dist
+          want=$(sed -n 's/^project(copyengine VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt)
+          test "${GITHUB_REF_NAME#v}" = "$want" || { echo "tag $GITHUB_REF_NAME, CMakeLists.txt $want"; exit 1; }
+      - run: docker/build-wheels.sh
       - uses: actions/upload-artifact@v5
         with:
-          name: wheel
-          path: dist/*.whl
+          name: dist
+          path: dist/*
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [wheel]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          name: dist
+          path: dist
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes

@@ -84,13 +84,14 @@ void add_alloc(std::vector<Alloc>& set, Device d, int64_t lo, int64_t hi) {
 struct KeyStat {
   int64_t seen = 0, merged = 0;  // ops flushed; of those, in a group with others
   int single = -1;               // a lone op's locked choice: -1 unknown, 0 ce, 1 native
+  int64_t since = 0;             // ops run natively since one last went through the tuner
 };
 
 // A timed run whose GPU part is still in flight.
 struct PendingSample {
   std::string bucket;
   Strategy strategy;
-  double host;
+  double host, submit;
   int64_t a, b;
   Executor* ex;
 };
@@ -124,7 +125,12 @@ struct Engine::Impl {
 
   explicit Impl(EngineOptions o)
       : opt(o),
-        tuner(TunerConfig{o.explore, o.prior_only, o.tune_trials, o.tune_topk, o.ab_pairs, o.ab_max_pairs}),
+        tuner([&] {
+          TunerConfig c;
+          c.explore = o.explore, c.prior_only = o.prior_only, c.trials = o.tune_trials, c.topk = o.tune_topk;
+          c.pairs = o.ab_pairs, c.max_pairs = o.ab_max_pairs, c.online_every = o.online_every;
+          return c;
+        }()),
         host(o.host_threads > 0 ? o.host_threads
                                 : static_cast<int>(std::min(8u, std::max(1u, std::thread::hardware_concurrency())))) {
 #if CE_WITH_CUDA
@@ -237,13 +243,22 @@ struct Engine::Impl {
   // Interception-time decision: run natively now instead of queueing. Only
   // for an op class whose lone ops were measured slower in ce and that rarely
   // merges (so its first op is not the head of a mergeable run).
-  bool native_now(const Op& op) const {
+  // One op in online_every still goes through the queue and the tuner, which
+  // keeps re-checking the decision (it stands for the runs that skipped it).
+  bool native_now(Op& op) {
     if (!op.native || opt.prior_only) return false;
     if (opt.disable) return true;
     if (merges_with_tail(op)) return false;
     auto it = keys.find(op.key);
     if (it == keys.end() || it->second.single != 1) return false;
-    return depth == 0 || (it->second.seen >= 16 && it->second.merged * 10 < it->second.seen);
+    KeyStat& ks = it->second;
+    if (!(depth == 0 || (ks.seen >= 16 && ks.merged * 10 < ks.seen))) return false;
+    if (opt.online_every > 0 && ++ks.since >= opt.online_every) {
+      op.weight = ks.since;
+      ks.since = 0;
+      return false;
+    }
+    return true;
   }
 
   bool conflicts(Device sd, int64_t slo, int64_t shi, Device dd, int64_t dlo, int64_t dhi) const {
@@ -403,7 +418,7 @@ struct Engine::Impl {
     std::erase_if(samples, [&](const PendingSample& p) {
       const double gpu = p.ex->elapsed(p.a, p.b);
       if (gpu < 0) return false;
-      tuner.report(p.bucket, p.strategy, {p.host, gpu});
+      tuner.report(p.bucket, p.strategy, {p.host, gpu, p.submit});
       return true;
     });
   }
@@ -422,11 +437,11 @@ struct Engine::Impl {
       calls = ex.run(s, g, ops, strm);
     }
     if (measure) {
-      double host_us = us_since(t0);
+      double submit = 0;
       if (s != Strategy::native)  // ce also paid for submitting the ops; native would not have
-        for (int k : g.ops) host_us += ops[k].enqueue_us;
+        for (int k : g.ops) submit += ops[k].enqueue_us;
       const int64_t b = ex.mark(strm, device_of(g));
-      samples.push_back({g.bucket, s, host_us, a, b, &ex});
+      samples.push_back({g.bucket, s, us_since(t0) + submit, submit, a, b, &ex});
     }
     note_pending(g.src, g.dst, strm,
                  std::any_of(g.ops.begin(), g.ops.end(), [&](int k) { return !ops[k].host_async; }));
@@ -440,17 +455,26 @@ struct Engine::Impl {
 
   // The hot depth-0 case: the same lone op as last time, its strategy locked.
   // Runs it without hashing, tuner lookups, key statistics or stats strings.
+  // It hands one run in online_every back to the tuner, with the count of
+  // runs it served, so the decision keeps being checked.
   struct Memo {
     bool valid = false;
     Hash128 fp;
     std::shared_ptr<const Plan> plan;
     Strategy strategy = Strategy::passthrough;
+    int64_t served = 0;
   } memo;
 
   bool flush_memo() {
     if (!memo.valid || queue.size() != 1) return false;
     Op& op = queue.front();
     if (!(op.fp == memo.fp) || (memo.strategy == Strategy::native && !op.native)) return false;
+    if (opt.online_every > 0 && memo.served + 1 >= opt.online_every) {
+      op.weight += memo.served;
+      memo.valid = false;
+      return false;
+    }
+    ++memo.served;
     const Group& g = memo.plan->groups.front();
     const int64_t calls = run_group(g, memo.strategy, queue, stream, false, nullptr);
     if (memo.strategy != Strategy::native) op.native.reset();
@@ -503,9 +527,11 @@ struct Engine::Impl {
     for (const Group& g : plan.groups) {
       const Choice c = choice_for(g, ops);
       Tuner::Pick p{c.baseline, false};
-      if (!opt.disable) p = tuner.pick(g.bucket, c);
+      int64_t runs = 1;
+      for (int k : g.ops) runs = std::max(runs, ops[k].weight);
+      if (!opt.disable) p = tuner.pick(g.bucket, c, runs);
       if (ops.size() == 1 && plan.groups.size() == 1 && !p.measure && (opt.disable || tuner.locked(g.bucket)))
-        memo = {true, ops.front().fp, pp, p.strategy};
+        memo = {true, ops.front().fp, pp, p.strategy, 0};
       run_group(g, p.strategy, ops, stream, p.measure, &st);
       ran.strategies.push_back(p.strategy);
       any_native |= p.strategy == Strategy::native;
@@ -514,7 +540,8 @@ struct Engine::Impl {
         ++ks.seen;
         ks.merged += g.ops.size() > 1;
       }
-      if (g.ops.size() == 1 && tuner.locked(g.bucket)) keys[ops[g.ops[0]].key].single = p.strategy == Strategy::native;
+      if (g.ops.size() == 1)
+        if (auto l = tuner.locked_strategy(g.bucket)) keys[ops[g.ops[0]].key].single = *l == Strategy::native;
     }
     if (!any_native)  // only a frozen native replay needs the frontend's payloads
       for (Op& op : ops) op.native.reset();
@@ -645,6 +672,7 @@ std::string Engine::dump_profile() const {
   Json t = impl_->tuner.dump();
   return Json::object()
       .set("copyengine_profile", 2)
+      .set("version", t["version"])
       .set("hardware", hardware_fingerprint())
       .set("buckets", t["buckets"])
       .set("uncovered", t["uncovered"])

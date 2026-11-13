@@ -251,6 +251,7 @@ NB_MODULE(_core, m) {
       .def_rw("tune_topk", &ce::EngineOptions::tune_topk)
       .def_rw("ab_pairs", &ce::EngineOptions::ab_pairs)
       .def_rw("ab_max_pairs", &ce::EngineOptions::ab_max_pairs)
+      .def_rw("online_every", &ce::EngineOptions::online_every)
       .def_rw("allow_async", &ce::EngineOptions::allow_async)
       .def_rw("sync_always", &ce::EngineOptions::sync_always)
       .def_rw("disable", &ce::EngineOptions::disable)

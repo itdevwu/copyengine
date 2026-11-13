@@ -71,8 +71,9 @@ class Engine:
     until the scope exits (or :meth:`barrier` is called).
     """
 
-    def __init__(self, *, staging_budget_mb: int = 256, explore: bool = True, tune_trials: int = 3,
-                 tune_topk: int = 3, ab_pairs: int = 20, ab_max_pairs: int = 50, allow_async: bool = False,
+    def __init__(self, *, staging_budget_mb: int = 256, explore: bool = True, tune_trials: int = 5,
+                 tune_topk: int = 3, ab_pairs: int = 20, ab_max_pairs: int = 50, online_every: int = 64,
+                 allow_async: bool = False,
                  host_threads: int = 0, disable: bool = False, prior_only: bool = False,
                  _intercept: Optional[str] = None):
         """``explore=False`` uses only a loaded profile (uncovered buckets take the
@@ -86,6 +87,7 @@ class Engine:
         o.tune_topk = tune_topk
         o.ab_pairs = ab_pairs
         o.ab_max_pairs = ab_max_pairs
+        o.online_every = online_every
         o.allow_async = allow_async
         o.host_threads = host_threads
         o.disable = disable

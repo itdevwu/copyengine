@@ -21,7 +21,11 @@ Merges that at least halve the number of calls are applied directly; every
 other strategy is measured against the baseline in paired runs, including the
 host time ce spends planning and submitting, and kept only if it is
 significantly faster. Otherwise the baseline runs, and a lone copy whose class
-loses runs natively without entering the queue.
+loses runs natively without entering the queue. Locked decisions keep being
+checked: one run in 64 is timed (never synchronizing), now and then on the
+other finalist, and a decision flips only on the same significance test or
+re-opens when its strategy drifts. Profiles from another copyengine version
+are re-measured.
 
 ## Install
 

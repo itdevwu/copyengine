@@ -253,7 +253,8 @@ def test_tuner_locks_and_profile_round_trip():
     assert locked and all(locked)
     e2 = ce.Engine()
     e2.load_profile(e.dump_profile())
-    assert json.loads(e2.dump_profile())["buckets"] == prof["buckets"]
+    locks = lambda p: {k: (v["locked"], v["alt"], v["samples"]) for k, v in p["buckets"].items()}
+    assert locks(json.loads(e2.dump_profile())) == locks(prof)
     prof["hardware"] = "elsewhere"
     with pytest.raises(ValueError):
         e2.load_profile(json.dumps(prof))
@@ -409,3 +410,80 @@ def test_fence_flushes_only_conflicting_queued_copies():
         e.copy_(dst, src)
         e._e.fence([], [rng(src)])  # overwrites what the queue reads
         assert e._e.queued == 0
+
+
+# ---- online sampling after a decision is locked ------------------------------------------
+
+
+def _online_engine():
+    return ce.Engine(tune_trials=1, ab_pairs=8, ab_max_pairs=16, online_every=2)
+
+
+def test_online_sampling_leaves_native_when_it_gets_slow():
+    src = np.arange(1 << 16, dtype=np.float32)
+    dst = np.zeros_like(src)
+    e = _online_engine()
+    e._native = lambda d, s: None  # free: native locks
+    for _ in range(60):
+        e.copy_(dst, src)
+    assert e.stats()["native_ops"] > 0
+
+    def slow(d, s):
+        time.sleep(0.002)
+        np.copyto(d, s)
+
+    e._native = slow
+    for _ in range(400):
+        e.copy_(dst, src)
+    before = e.stats()["native_ops"]
+    for _ in range(20):
+        e.copy_(dst, src)
+    assert e.stats()["native_ops"] == before  # ce again: nothing runs natively at interception
+    on = [b["online"] for b in json.loads(e.dump_profile())["buckets"].values()]
+    assert sum(o["flips"] + o["reopens"] for o in on) >= 1
+    np.testing.assert_array_equal(dst, src)
+
+
+def test_online_sampling_moves_to_native_when_it_gets_fast():
+    src = np.arange(1 << 16, dtype=np.float32)
+    dst = np.zeros_like(src)
+    e = _online_engine()
+
+    def slow(d, s):
+        time.sleep(0.002)
+        np.copyto(d, s)
+
+    e._native = slow
+    for _ in range(60):
+        e.copy_(dst, src)
+    assert e.stats()["native_ops"] == 0
+    e._native = lambda d, s: np.copyto(d, s) if False else None  # now free
+    for _ in range(400):
+        e.copy_(dst, src)
+    assert e.stats()["native_ops"] > 0
+    on = [b["online"] for b in json.loads(e.dump_profile())["buckets"].values()]
+    assert sum(o["flips"] for o in on) >= 1
+
+
+def test_online_sampling_off_never_times_locked_runs():
+    src = np.arange(1 << 12, dtype=np.float32)
+    dst = np.zeros_like(src)
+    e = ce.Engine(tune_trials=1, ab_pairs=4, ab_max_pairs=8, online_every=0)
+    for _ in range(200):
+        e.copy_(dst, src)
+    assert all(b["online"]["samples"] == 0 for b in json.loads(e.dump_profile())["buckets"].values())
+
+
+def test_profiles_from_another_version_are_not_trusted():
+    src = np.arange(1 << 12, dtype=np.float32)
+    dst = np.zeros_like(src)
+    e = ce.Engine(tune_trials=1, ab_pairs=4, ab_max_pairs=8)
+    for _ in range(40):
+        e.copy_(dst, src)
+    prof = json.loads(e.dump_profile())
+    assert prof["version"] == ce.__version__ and prof["buckets"]
+    prof["version"] = "0.0.0"
+    e2 = ce.Engine()
+    e2.load_profile(json.dumps(prof))
+    p2 = json.loads(e2.dump_profile())
+    assert not p2["buckets"] and set(p2["uncovered"]) >= set(prof["buckets"])

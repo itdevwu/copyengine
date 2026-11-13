@@ -1,8 +1,10 @@
 #include "core/tuner.hpp"
 
 #include <algorithm>
+#include <climits>
 #include <cmath>
 
+#include "copyengine/copyengine.hpp"
 #include "copyengine/error.hpp"
 
 namespace ce {
@@ -52,7 +54,7 @@ std::vector<double> col(const std::vector<Sample>& v, size_t n, F f) {
 
 Json sample_list(const std::vector<Sample>& v) {
   Json arr = Json::array();
-  for (const Sample& s : v) arr.push(Json::array().push(s.host).push(s.gpu));
+  for (const Sample& s : v) arr.push(Json::array().push(s.host).push(s.gpu).push(s.submit));
   return arr;
 }
 
@@ -60,8 +62,9 @@ std::vector<Sample> parse_samples(const Json& arr) {
   std::vector<Sample> out;
   if (!arr.is_array()) return out;
   for (auto& p : arr.elements())
-    if (p.is_array() && p.elements().size() == 2 && p.elements()[0].is_number() && p.elements()[1].is_number())
-      out.push_back({p.elements()[0].num(), p.elements()[1].num()});
+    if (p.is_array() && p.elements().size() == 3 && p.elements()[0].is_number() && p.elements()[1].is_number() &&
+        p.elements()[2].is_number())
+      out.push_back({p.elements()[0].num(), p.elements()[1].num(), p.elements()[2].num()});
   return out;
 }
 
@@ -103,7 +106,7 @@ bool Tuner::challenger_wins(const std::vector<Sample>& c, const std::vector<Samp
   return wins >= sign_test_threshold(static_cast<int>(n));
 }
 
-Tuner::Pick Tuner::pick(const std::string& bucket, const Choice& c) {
+Tuner::Pick Tuner::pick(const std::string& bucket, const Choice& c, int64_t runs) {
   const Strategy reference = c.safe ? *c.safe : c.baseline;
   if (cfg_.prior_only) return {c.cands.empty() ? reference : c.cands.front(), false};
   auto it = table_.find(bucket);
@@ -114,7 +117,15 @@ Tuner::Pick Tuner::pick(const std::string& bucket, const Choice& c) {
     return {reference, false};
   }
   Entry& e = it != table_.end() ? it->second : table_[bucket];
-  if (e.locked >= 0 && allowed(static_cast<Strategy>(e.locked), c)) return {static_cast<Strategy>(e.locked), false};
+  if (e.locked >= 0 && allowed(static_cast<Strategy>(e.locked), c)) {
+    const auto locked = static_cast<Strategy>(e.locked);
+    if (cfg_.online_every <= 0 || (e.since += runs) < cfg_.online_every) return {locked, false};
+    e.since = 0;
+    // An online sample: mostly the locked side, every alt_every-th the other finalist.
+    if (e.alt >= 0 && allowed(static_cast<Strategy>(e.alt), c) && ++e.taken % cfg_.alt_every == 0)
+      return {static_cast<Strategy>(e.alt), true};
+    return {locked, true};
+  }
   e.locked = -1;
   const Strategy s = decide(e, c);
   if (e.locked >= 0) return {s, false};
@@ -129,22 +140,27 @@ Strategy Tuner::decide(Entry& e, const Choice& c) {
   for (Strategy s : c.cands)
     if (s != reference) cands.push_back(s);
   if (cands.empty()) {
-    e.locked = static_cast<int>(reference);
+    lock(e, static_cast<int>(reference), -1);
     return reference;
   }
   if (e.challenger < 0 || !allowed(static_cast<Strategy>(e.challenger), c)) {
     e.challenger = -1;
+    // Round-robin, so clock or load changes during exploration hit every
+    // candidate alike: the least-sampled one goes next (prior order on ties).
+    Strategy next = cands.front();
+    int fewest = INT32_MAX;
     for (Strategy s : cands) {
-      const int i = static_cast<int>(s);
-      if (static_cast<int>(e.samples[i].size()) + e.pending[i] < cfg_.trials) return s;
+      const int i = static_cast<int>(s), have = static_cast<int>(e.samples[i].size()) + e.pending[i];
+      if (have < fewest) next = s, fewest = have;
     }
+    if (fewest < cfg_.trials) return next;
     for (Strategy s : cands)
       if (e.pending[static_cast<int>(s)] > 0) return reference;  // wait for outstanding samples
     Strategy best = cands.front();
     double best_t = 1e300;
     for (Strategy s : cands) {
       std::vector<double> t;
-      for (const Sample& x : e.samples[static_cast<int>(s)]) t.push_back(x.total());
+      for (const Sample& x : e.samples[static_cast<int>(s)]) t.push_back(x.own());
       if (median(t) < best_t) best = s, best_t = median(t);
     }
     e.challenger = static_cast<int>(best);
@@ -160,15 +176,62 @@ Strategy Tuner::decide(Entry& e, const Choice& c) {
     std::vector<double> ct, rt;
     for (int i = 0; i < n; ++i) ct.push_back(cs[i].total()), rt.push_back(rs[i].total());
     if (challenger_wins(cs, rs, cfg_.margin)) {
-      e.locked = e.challenger;
+      lock(e, e.challenger, static_cast<int>(reference));
       return ch;
     }
     if (n >= cfg_.max_pairs || median(ct) >= median(rt)) {
-      e.locked = static_cast<int>(reference);
+      lock(e, static_cast<int>(reference), e.challenger);
       return reference;
     }
   }
   return e.issued++ % 2 == 0 ? ch : reference;
+}
+
+void Tuner::lock(Entry& e, int winner, int other) {
+  e.locked = winner;
+  e.alt = other;
+  std::vector<double> t;
+  for (const Sample& x : e.samples[winner]) t.push_back(x.total());
+  e.lock_total = median(t);
+  e.since = e.taken = 0;
+  e.on_locked.clear();
+  e.on_alt.clear();
+}
+
+void Tuner::online(Entry& e, Strategy s, Sample sample) {
+  const size_t w = static_cast<size_t>(std::max(2, cfg_.window));
+  if (static_cast<int>(s) == e.locked) {
+    e.on_locked.push_back(sample);
+    if (e.on_locked.size() > w) e.on_locked.erase(e.on_locked.begin());
+  } else if (static_cast<int>(s) == e.alt) {
+    e.on_alt.push_back(sample);
+  } else {
+    return;
+  }
+  // The other finalist got clearly faster: swap, with the A/B's own rule.
+  if (e.on_alt.size() >= w && e.on_locked.size() >= w) {
+    if (challenger_wins(e.on_alt, e.on_locked, cfg_.margin)) {
+      const int was = e.locked;
+      e.samples[e.alt] = e.on_alt;
+      lock(e, e.alt, was);
+      ++e.flips;
+      return;
+    }
+    e.on_alt.clear();
+  }
+  // The locked side itself drifted well away from what won: explore again.
+  if (e.on_locked.size() >= w) {
+    std::vector<double> t;
+    for (const Sample& x : e.on_locked) t.push_back(x.total());
+    if (e.lock_total <= 0) e.lock_total = median(t);  // locked without samples: this is the reference
+    if (median(t) > e.lock_total * cfg_.drift) {
+      e.locked = e.challenger = e.alt = -1;
+      for (auto& v : e.samples) v.clear();
+      e.on_locked.clear();
+      e.on_alt.clear();
+      ++e.reopens;
+    }
+  }
 }
 
 void Tuner::report(const std::string& bucket, Strategy s, Sample sample) {
@@ -177,7 +240,14 @@ void Tuner::report(const std::string& bucket, Strategy s, Sample sample) {
   Entry& e = it->second;
   int& p = e.pending[static_cast<int>(s)];
   if (p > 0) --p;
-  if (e.locked < 0) e.samples[static_cast<int>(s)].push_back(sample);
+  if (e.locked >= 0) online(e, s, sample);
+  else e.samples[static_cast<int>(s)].push_back(sample);
+}
+
+std::optional<Strategy> Tuner::locked_strategy(const std::string& bucket) const {
+  auto it = table_.find(bucket);
+  if (it == table_.end() || it->second.locked < 0) return std::nullopt;
+  return static_cast<Strategy>(it->second.locked);
 }
 
 bool Tuner::locked(const std::string& bucket) const {
@@ -197,19 +267,36 @@ Json Tuner::dump() const {
       if (!e.samples[i].empty()) samples.set(std::string(kNames[i]), sample_list(e.samples[i]));
     buckets.set(k, Json::object()
                        .set("locked", e.locked >= 0 ? Json(kNames[e.locked]) : Json(nullptr))
-                       .set("samples", std::move(samples)));
+                       .set("alt", e.alt >= 0 ? Json(kNames[e.alt]) : Json(nullptr))
+                       .set("lock_total", e.lock_total)
+                       .set("samples", std::move(samples))
+                       .set("online", Json::object()
+                                          .set("samples", e.taken)
+                                          .set("flips", e.flips)
+                                          .set("reopens", e.reopens)));
   }
   Json uncovered = Json::array();
   for (auto& k : uncovered_) uncovered.push(k);
-  return Json::object().set("buckets", std::move(buckets)).set("uncovered", std::move(uncovered));
+  return Json::object()
+      .set("version", std::string(version_string()))
+      .set("buckets", std::move(buckets))
+      .set("uncovered", std::move(uncovered));
 }
 
 void Tuner::load(const Json& j) {
   const Json& buckets = j["buckets"];
   if (!buckets.is_object()) fail(Errc::invalid_argument, "profile: buckets must be an object");
+  // Strategies and kernels change between versions: their measurements are re-taken.
+  const bool same = j["version"].is_string() && j["version"].str() == version_string();
   for (auto& [k, v] : buckets.items()) {
+    if (!same) {
+      if (!table_.count(k)) uncovered_.insert(k);
+      continue;
+    }
     Entry e;
     if (v["locked"].is_string()) e.locked = static_cast<int>(parse_strategy(v["locked"].str()));
+    if (v["alt"].is_string()) e.alt = static_cast<int>(parse_strategy(v["alt"].str()));
+    if (v["lock_total"].is_number()) e.lock_total = v["lock_total"].num();
     if (v["samples"].is_object())
       for (auto& [name, arr] : v["samples"].items()) e.samples[static_cast<int>(parse_strategy(name))] = parse_samples(arr);
     table_[k] = std::move(e);

@@ -34,10 +34,13 @@ struct EngineOptions {
   // and are recorded for the next warmup.
   bool explore = true;
   bool prior_only = false;               // testing: run the prior's first candidate, never measure
-  int tune_trials = 3;                   // samples per speculative candidate before the A/B
+  int tune_trials = 5;                   // samples per speculative candidate before the A/B
   int tune_topk = 3;                     // speculative candidates explored
   int ab_pairs = 20;                     // paired samples before an A/B decision
   int ab_max_pairs = 50;                 // an inconclusive A/B keeps sampling up to this
+  // Once locked, one run in `online_every` is timed (never synchronizing) to
+  // keep checking the decision; 0 turns this off.
+  int online_every = 64;
   bool allow_async = false;              // scope exit may return before host-side copies finish
   bool sync_always = false;              // wait after every flush, also device-only (CE_SYNC; debugging)
   bool disable = false;                  // every op natively, else as submitted (CE_DISABLE)

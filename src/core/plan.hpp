@@ -78,6 +78,7 @@ struct Op {
   std::shared_ptr<NativeOp> native;  // the frontend's own implementation (the baseline), or null
   double enqueue_us = 0;           // host time spent submitting it
   bool host_async = false;         // Hints::host_async
+  int64_t weight = 1;              // runs this op stands for in online sampling (see Impl::native_now)
   std::shared_ptr<const Form> form;  // null when the statement has tables or came in as runs
   Hash128 fp;  // content fingerprint
   // byte-interval read / write sets (absolute addresses), computed lazily

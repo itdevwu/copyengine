@@ -422,3 +422,22 @@ def test_torch_ops_host_tensors_and_python_fallback(pinned, monkeypatch):
         back = host((256, 64), pinned=pinned, fill=False)
         e.copy_(back, dst.t(), fn=ce.Elementwise(scale=2.0))
         torch.testing.assert_close(back, src * 2, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("pair", [(torch.int8, torch.float16), (torch.float32, torch.bfloat16),
+                                  (torch.float16, torch.float32), (torch.float64, torch.int8),
+                                  (torch.uint8, torch.float64), (torch.bool, torch.int32)])
+@pytest.mark.parametrize("fn", [None, ce.Elementwise(scale=0.5, bias=1.0, round=True, clamp=(-100, 100))])
+def test_kernel_vector_and_scalar_paths_agree_with_host(pair, fn):
+    sdt, ddt = pair
+    rng = torch.Generator().manual_seed(1)
+    base = (torch.randn(6000, generator=rng) * 50).to(sdt)
+    for so, do, n, rows in [(0, 0, 4096, 1), (3, 5, 1001, 1), (8, 16, 777, 1), (1, 0, 64, 7), (0, 0, 256, 9)]:
+        src = base.to(DEV)[so:so + n * rows].view(rows, n)
+        out = torch.zeros(rows * n + do + 3, dtype=ddt, device=DEV)
+        dst = out[do:do + n * rows].view(rows, n)
+        ce.Engine(prior_only=True).copy_(dst, src, fn=fn)
+        want = torch.zeros(rows, n, dtype=ddt)
+        ce.Engine(prior_only=True).copy_(want, base[so:so + n * rows].view(rows, n), fn=fn)  # host conversion
+        bits = {1: torch.int8, 2: torch.int16, 4: torch.int32, 8: torch.int64}[want.element_size()]
+        assert torch.equal(dst.cpu().view(bits), want.view(bits)), (so, do, n, rows)

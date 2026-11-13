@@ -87,8 +87,10 @@ struct Base {
 
 struct FusedBatch {
   StmtDesc desc{};
+  int tile_a = -1, tile_b = -1;  // destination / source contiguous dims when they differ (tiled kernel)
   i64 link_size = 1;  // itemsize of the side that lives in staging (cross-device only)
   std::vector<Base> bases;
+  std::shared_ptr<void> table;  // the bases, resident on the device (set on first run)
 };
 
 // Structured statements grouped by structure; for cross-device groups the
@@ -143,6 +145,7 @@ class CudaExecutor final : public Executor {
   }
 
   ~CudaExecutor() override {
+    alive_.reset();  // resident tables outliving the executor must not touch the driver
     for (Mark& m : marks_) {
       if (!m.ev) continue;
       d_->cuCtxPushCurrent(devs_[m.dev].ctx);
@@ -662,39 +665,101 @@ class CudaExecutor final : public Executor {
     return sl;
   }
 
-  void launch(Dev& s, const std::string& name, const std::vector<Chunk>& chunks, const cv::Fn& fn, CUstream st) {
-    if (chunks.empty()) return;
+  // A parameter table in device memory for the life of the group that built
+  // it: launches read it in place, so the hot path uploads nothing.
+  struct DevTable {
+    const Driver* d = nullptr;
+    CUcontext ctx{};
+    CUdeviceptr ptr = 0;
+    size_t count = 0;
+    std::weak_ptr<int> alive;  // the executor
+    ~DevTable() {
+      if (!ptr || alive.expired()) return;
+      d->cuCtxPushCurrent(ctx);
+      d->cuMemFree(ptr);
+      CUcontext dummy{};
+      d->cuCtxPopCurrent(&dummy);
+    }
+  };
+
+  // Built once, when a group first runs a strategy (planning, not the hot path).
+  template <class T>
+  std::shared_ptr<DevTable> resident(Dev& s, const std::vector<T>& v) {
+    auto t = std::make_shared<DevTable>();
+    t->d = d_, t->ctx = s.ctx, t->alive = alive_, t->count = v.size();
+    if (v.empty()) return t;
+    const size_t bytes = v.size() * sizeof(T);
+    check(d_->cuMemAlloc(&t->ptr, bytes), "cuMemAlloc (table)");
+    check(d_->cuMemcpyHtoDAsync(t->ptr, v.data(), bytes, s.side), "cuMemcpyHtoDAsync");
+    check(d_->cuStreamSynchronize(s.side), "cuStreamSynchronize");
+    return t;
+  }
+
+  // Chunk kernels on a device table; `sadd` / `dadd` offset every chunk.
+  void launch_table(Dev& s, const std::string& name, CUdeviceptr table, size_t chunks, const cv::Fn& fn,
+                    long long sadd, long long dadd, CUstream st) {
+    if (chunks == 0) return;
     CUfunction f = function(s, name);
-    for (size_t at = 0; at < chunks.size();) {
-      const size_t n = std::min<size_t>(chunks.size() - at, size_t{1} << 24);
-      Slot& sl = upload(s, chunks.data() + at, n * sizeof(Chunk), st);
+    const bool bytes = name == "ce_bytes";  // no function argument
+    for (size_t at = 0; at < chunks;) {
+      const size_t n = std::min<size_t>(chunks - at, size_t{1} << 24);
       int count = static_cast<int>(n);
-      CUdeviceptr table = sl.dev;
+      CUdeviceptr t = table + at * sizeof(Chunk);
       cv::Fn fcopy = fn;
-      void* args[] = {&table, &count, &fcopy};
+      void* typed_args[] = {&t, &count, &fcopy, &sadd, &dadd};
+      void* bytes_args[] = {&t, &count, &sadd, &dadd};
       const unsigned threads = 256, warps = threads / 32;
       const unsigned blocks = static_cast<unsigned>((n + warps - 1) / warps);
-      check(d_->cuLaunchKernel(f, blocks, 1, 1, threads, 1, 1, 0, st, args, nullptr), ("cuLaunchKernel " + name).c_str());
-      check(d_->cuEventRecord(sl.done, st), "cuEventRecord");
-      sl.used = true;
+      check(d_->cuLaunchKernel(f, blocks, 1, 1, threads, 1, 1, 0, st, bytes ? bytes_args : typed_args, nullptr),
+            ("cuLaunchKernel " + name).c_str());
       at += n;
     }
   }
 
-  void launch_stmt(Dev& s, const std::vector<Base>& bases, const StmtDesc& desc, const cv::Fn& fn, CUstream st) {
-    if (bases.empty()) return;
-    CUfunction f = function(s, "ce_stmt");
-    Slot& sl = upload(s, bases.data(), bases.size() * sizeof(Base), st);
-    CUdeviceptr table = sl.dev;
-    long long total = static_cast<long long>(bases.size()) * desc.numel;
-    StmtDesc dcopy = desc;
-    cv::Fn fcopy = fn;
-    void* args[] = {&table, &total, &dcopy, &fcopy};
-    const unsigned threads = 256;
-    const unsigned blocks = static_cast<unsigned>((total + threads - 1) / threads);
-    check(d_->cuLaunchKernel(f, blocks, 1, 1, threads, 1, 1, 0, st, args, nullptr), "cuLaunchKernel ce_stmt");
+  // A one-off table (admission, passthrough of a single op) through the upload ring.
+  void launch(Dev& s, const std::string& name, const std::vector<Chunk>& chunks, const cv::Fn& fn, CUstream st) {
+    if (chunks.empty()) return;
+    Slot& sl = upload(s, chunks.data(), chunks.size() * sizeof(Chunk), st);
+    launch_table(s, name, sl.dev, chunks.size(), fn, 0, 0, st);
     check(d_->cuEventRecord(sl.done, st), "cuEventRecord");
     sl.used = true;
+  }
+
+  // Destination and source each have a unit-stride dimension, and they
+  // differ (a transpose): the tiled kernel keeps both sides coalesced.
+  static void transpose_dims(const Form& f, int* a, int* b) {
+    int da = -1, sb = -1;
+    for (int k = 0; k < f.rank; ++k) {
+      if (f.ds[k] == 1 || f.ds[k] == -1) da = k;
+      if (f.ss[k] == 1 || f.ss[k] == -1) sb = k;
+    }
+    if (da >= 0 && sb >= 0 && da != sb && f.shape[da] >= 8 && f.shape[sb] >= 8) *a = da, *b = sb;
+  }
+
+  void launch_stmt(const DevTable& table, const FusedBatch& batch, const cv::Fn& fn, long long sadd, long long dadd,
+                   Dev& s, CUstream st) {
+    if (table.count == 0) return;
+    const StmtDesc& desc = batch.desc;
+    const bool tiled = batch.tile_a >= 0;
+    CUfunction f = function(s, tiled ? "ce_stmt_tile" : "ce_stmt");
+    CUdeviceptr t = table.ptr;
+    StmtDesc dcopy = desc;
+    cv::Fn fcopy = fn;
+    if (tiled) {
+      const long long sa = desc.shape[batch.tile_a], sb = desc.shape[batch.tile_b];
+      long long count = static_cast<long long>(table.count) * (static_cast<long long>(desc.numel) / (sa * sb));
+      int a = batch.tile_a, b = batch.tile_b;
+      void* args[] = {&t, &count, &dcopy, &fcopy, &a, &b, &sadd, &dadd};
+      const unsigned gx = static_cast<unsigned>((sb + 31) / 32), gy = static_cast<unsigned>((sa + 31) / 32);
+      const unsigned gz = static_cast<unsigned>(std::min<long long>(count, 65535));
+      check(d_->cuLaunchKernel(f, gx, gy, gz, 32, 8, 1, 0, st, args, nullptr), "cuLaunchKernel ce_stmt_tile");
+    } else {
+      long long total = static_cast<long long>(table.count) * desc.numel;
+      void* args[] = {&t, &total, &dcopy, &fcopy, &sadd, &dadd};
+      const unsigned threads = 256;
+      const unsigned blocks = static_cast<unsigned>((total + threads - 1) / threads);
+      check(d_->cuLaunchKernel(f, blocks, 1, 1, threads, 1, 1, 0, st, args, nullptr), "cuLaunchKernel ce_stmt");
+    }
   }
 
   // ---- fused structured statements --------------------------------------------------------
@@ -722,6 +787,7 @@ class CudaExecutor final : public Executor {
         for (int k = 0; k < f.rank; ++k)
           b.desc.shape[k] = static_cast<unsigned>(f.shape[k]), b.desc.ss[k] = f.ss[k], b.desc.ds[k] = f.ds[k];
         b.link_size = static_cast<i64>(itemsize(P.h2d ? f.sdt : f.ddt));
+        transpose_dims(f, &b.tile_a, &b.tile_b);
         P.batches.push_back(std::move(b));
       }
       batch_of[i] = j;
@@ -801,16 +867,12 @@ class CudaExecutor final : public Executor {
       for (Raw& r : raws) (P.h2d ? r.dst : r.src) += stg;
       if (P.h2d) copy_raws(s, host_side, dev_side, raws, st);
     }
-    std::vector<Base> bases;
     for (const FusedBatch& b : P.batches) {
-      if (P.cross) {
-        bases = b.bases;
-        const long long add = static_cast<long long>(stg) / b.link_size;
-        for (Base& x : bases) (P.h2d ? x.src : x.dst) += add;
-        launch_stmt(s, bases, b.desc, fn, st);
-      } else {
-        launch_stmt(s, b.bases, b.desc, fn, st);
-      }
+      auto& table = const_cast<FusedBatch&>(b).table;
+      if (!table) table = resident(s, b.bases);
+      // Cross-device: the link side's indices are relative to the staging base.
+      const long long add = P.cross ? static_cast<long long>(stg) / b.link_size : 0;
+      launch_stmt(*static_cast<DevTable*>(table.get()), b, fn, P.h2d ? add : 0, P.h2d ? 0 : add, s, st);
     }
     if (P.cross) {
       if (!P.h2d) copy_raws(s, dev_side, host_side, raws, st);
@@ -824,14 +886,23 @@ class CudaExecutor final : public Executor {
     return std::string(g.fn.identity() ? "ce_cast_" : "ce_apply_") + short_name(g.src.dtype) + "_" + short_name(g.dst.dtype);
   }
 
-  int64_t kernel(Dev& s, const Group& g, CUstream st) {
-    auto& slot = g.exec_cache[static_cast<int>(Strategy::kernel)];
-    if (!slot) {
-      ChunkBuilder cb(g.pure() ? kByteChunk : kTypedChunk);
-      for (size_t i = 0; i < g.runs.size(); ++i) cb.add(g.runs.src[i], g.runs.dst[i], g.runs.len[i]);
-      slot = std::make_shared<std::vector<Chunk>>(cb.take());
+  static std::vector<Chunk> chunks_of(const Group& g) {
+    ChunkBuilder cb(g.pure() ? kByteChunk : kTypedChunk);
+    for (size_t i = 0; i < g.runs.size(); ++i) cb.add(g.runs.src[i], g.runs.dst[i], g.runs.len[i]);
+    return cb.take();
+  }
+
+  // `resident`: the group belongs to a cached plan, so its table can live on
+  // the device; a one-off group (passthrough of one op) uploads it per call.
+  int64_t kernel(Dev& s, const Group& g, CUstream st, bool resident_table = true) {
+    if (!resident_table) {
+      launch(s, kernel_name(g), chunks_of(g), to_cv(g.fn), st);
+      return 1;
     }
-    launch(s, kernel_name(g), *static_cast<std::vector<Chunk>*>(slot.get()), to_cv(g.fn), st);
+    auto& slot = g.exec_cache[static_cast<int>(Strategy::kernel)];
+    if (!slot) slot = resident(s, chunks_of(g));
+    const auto& t = *static_cast<DevTable*>(slot.get());
+    launch_table(s, kernel_name(g), t.ptr, t.count, to_cv(g.fn), 0, 0, st);
     return 1;
   }
 
@@ -870,6 +941,7 @@ class CudaExecutor final : public Executor {
     size_t bytes = 0;
     std::vector<Raw> raws;
     std::vector<Chunk> chunks;
+    std::shared_ptr<DevTable> table;  // the chunks, resident on the device (set on first run)
   };
 
   std::vector<StagedStep> build_staged(const Group& g) const {
@@ -952,7 +1024,7 @@ class CudaExecutor final : public Executor {
   // link (read gaps below kGapBytes inside one source allocation are copied
   // too); a kernel on the device side scatters / gathers and converts. This is
   // the "cut point on the device" transform: layout changes happen in HBM.
-  int64_t staged(Dev& s, const Group& g, CUstream st) {
+  int64_t staged(Dev& s, const Group& g, CUstream st, bool resident_table = true) {
     auto& slot = g.exec_cache[static_cast<int>(Strategy::staged)];
     if (!slot) slot = std::make_shared<std::vector<StagedStep>>(build_staged(g));
     const auto& steps = *static_cast<std::vector<StagedStep>*>(slot.get());
@@ -964,19 +1036,27 @@ class CudaExecutor final : public Executor {
     const Side dev_side{h2d ? g.dst.device : g.src.device, lt, false};
     int64_t calls = 0;
     std::vector<Raw> raws;
-    std::vector<Chunk> ch;
     for (const StagedStep& step : steps) {
       const CUdeviceptr stg = staging(s, step.bytes, st);
-      const long long base = static_cast<long long>(stg / isz);
+      const long long base = static_cast<long long>(stg / isz);  // staging-side chunk indices are relative
       raws = step.raws;
-      ch = step.chunks;
       for (Raw& r : raws) (h2d ? r.dst : r.src) += stg;
-      for (Chunk& c : ch) (h2d ? c.src : c.dst) += base;
+      auto run_kernel = [&] {
+        if (!resident_table) {
+          std::vector<Chunk> ch = step.chunks;
+          for (Chunk& c : ch) (h2d ? c.src : c.dst) += base;
+          launch(s, name, ch, fn, st);
+          return;
+        }
+        auto& table = const_cast<StagedStep&>(step).table;
+        if (!table) table = resident(s, step.chunks);
+        launch_table(s, name, table->ptr, table->count, fn, h2d ? base : 0, h2d ? 0 : base, st);
+      };
       if (h2d) {
         copy_raws(s, g.src, dev_side, raws, st);
-        launch(s, name, ch, fn, st);
+        run_kernel();
       } else {
-        launch(s, name, ch, fn, st);
+        run_kernel();
         copy_raws(s, dev_side, g.dst, raws, st);
       }
       staging_release(s, st);
@@ -1001,8 +1081,9 @@ class CudaExecutor final : public Executor {
       one.src = op.src, one.dst = op.dst, one.fn = op.fn;
       one.runs = op.runs();
       one.rects = recover_2d(op.runs(), 1 << 30);  // rows only
-      calls += (op.src.device.kind == DeviceKind::cuda && op.dst.device.kind == DeviceKind::cuda) ? kernel(s, one, st)
-                                                                                                    : staged(s, one, st);
+      calls += (op.src.device.kind == DeviceKind::cuda && op.dst.device.kind == DeviceKind::cuda)
+                   ? kernel(s, one, st, false)
+                   : staged(s, one, st, false);
     }
     return calls;
   }
@@ -1011,6 +1092,7 @@ class CudaExecutor final : public Executor {
     CUevent ev = nullptr;
     int dev = -1;
   };
+  std::shared_ptr<int> alive_ = std::make_shared<int>(0);
   std::vector<Mark> marks_;
   std::vector<int64_t> free_marks_;
 

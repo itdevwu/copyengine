@@ -4,7 +4,6 @@
 #include <bit>
 #include <cmath>
 #include <map>
-#include <set>
 #include <tuple>
 
 #include "copyengine/error.hpp"
@@ -101,15 +100,11 @@ void check_safe(const Op& op) {
 
 // ---- dependencies ---------------------------------------------------------------
 
-static bool depends(const Op& a, const Op& b) {
-  if (a.dst.device == b.src.device && intersects(a.write(), b.read())) return true;   // flow
-  if (a.dst.device == b.dst.device && intersects(a.write(), b.write())) return true;  // output
-  if (a.src.device == b.dst.device && intersects(a.read(), b.write())) return true;   // anti
-  return false;
-}
-
 std::vector<int> waves(const std::vector<Op>& ops) {
   const int n = static_cast<int>(ops.size());
+  // Every exact read / write interval, per device. Overlap of two intervals
+  // with at least one writer is a dependency by definition (flow, anti or
+  // output), so no pair needs a second, exact check.
   struct Item {
     i64 lo, hi;
     int k;
@@ -119,37 +114,46 @@ std::vector<int> waves(const std::vector<Op>& ops) {
   for (int k = 0; k < n; ++k) {
     const Op& op = ops[k];
     if (op.runs.empty()) continue;
-    const Intervals &r = op.read(), &w = op.write();
-    by_dev[{int(op.src.device.kind), op.src.device.index}].push_back({r.lo(), r.hi(), k, false});
-    by_dev[{int(op.dst.device.kind), op.dst.device.index}].push_back({w.lo(), w.hi(), k, true});
+    auto& r = by_dev[{int(op.src.device.kind), op.src.device.index}];
+    const Intervals& rd = op.read();
+    for (size_t i = 0; i < rd.start.size(); ++i) r.push_back({rd.start[i], rd.end[i], k, false});
+    auto& w = by_dev[{int(op.dst.device.kind), op.dst.device.index}];
+    const Intervals& wr = op.write();
+    for (size_t i = 0; i < wr.start.size(); ++i) w.push_back({wr.start[i], wr.end[i], k, true});
   }
-  // Sweep over bounding boxes; only box-overlapping pairs with a writer are checked exactly.
-  std::vector<std::set<int>> preds(n);
+  // (pred, succ) pairs with pred < succ, possibly repeated.
+  std::vector<std::pair<int, int>> edges;
   for (auto& [dev, items] : by_dev) {
     if (std::none_of(items.begin(), items.end(), [](const Item& i) { return i.write; })) continue;
     std::sort(items.begin(), items.end(), [](const Item& a, const Item& b) { return a.lo < b.lo; });
+    // Intervals still open at the sweep position. Each op's own intervals are
+    // disjoint per side, so an active set only grows with real overlap.
     std::vector<Item> act_r, act_w;
     auto prune = [](std::vector<Item>& v, i64 s) {
-      v.erase(std::remove_if(v.begin(), v.end(), [&](const Item& a) { return a.hi <= s; }), v.end());
+      std::erase_if(v, [&](const Item& a) { return a.hi <= s; });
+    };
+    auto link = [&](const std::vector<Item>& act, const Item& it) {
+      for (const Item& a : act)
+        if (a.k != it.k) edges.emplace_back(std::min(a.k, it.k), std::max(a.k, it.k));
     };
     for (const Item& it : items) {
       prune(act_w, it.lo);
-      for (const Item& a : act_w)
-        if (a.k != it.k) preds[std::max(a.k, it.k)].insert(std::min(a.k, it.k));
+      link(act_w, it);
       if (it.write) {
         prune(act_r, it.lo);
-        for (const Item& a : act_r)
-          if (a.k != it.k) preds[std::max(a.k, it.k)].insert(std::min(a.k, it.k));
+        link(act_r, it);
         act_w.push_back(it);
       } else {
         act_r.push_back(it);
       }
     }
   }
+  std::sort(edges.begin(), edges.end(), [](const auto& a, const auto& b) {
+    return a.second != b.second ? a.second < b.second : a.first < b.first;
+  });
+  edges.erase(std::unique(edges.begin(), edges.end()), edges.end());
   std::vector<int> level(n, 0);
-  for (int j = 0; j < n; ++j)
-    for (int i : preds[j])
-      if (level[i] >= level[j] && depends(ops[i], ops[j])) level[j] = level[i] + 1;
+  for (const auto& [i, j] : edges) level[j] = std::max(level[j], level[i] + 1);  // i < j: level[i] is final
   return level;
 }
 

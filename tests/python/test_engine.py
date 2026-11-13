@@ -273,6 +273,46 @@ def test_dependent_copies_split_into_waves():
     np.testing.assert_array_equal(a[:8], np.arange(8, 16, dtype=np.float32))
 
 
+def test_random_programs_match_sequential_order():
+    # Overlapping copies among three buffers: the queued, merged result must equal program order.
+    rng = np.random.default_rng(3)
+    for trial in range(200):
+        bufs = [np.arange(64, dtype=np.float32) + 100 * i for i in range(3)]
+        ref = [b.copy() for b in bufs]
+        prog = []
+        for _ in range(int(rng.integers(1, 12))):
+            s, d = rng.integers(0, 3, 2)
+            n = int(rng.integers(1, 9))
+            so, do = rng.integers(0, 64 - 2 * n, 2)
+            step = int(rng.integers(1, 3))
+            if s == d and not (so + 2 * n <= do or do + 2 * n <= so):
+                continue  # one copy must not overlap itself
+            prog.append((int(s), int(d), int(so), int(do), n, step))
+        e = engine()
+        with e.scope():
+            for s, d, so, do, n, step in prog:
+                e.copy_(bufs[d][do:do + n * step:step], bufs[s][so:so + n * step:step])
+        for s, d, so, do, n, step in prog:
+            ref[d][do:do + n * step:step] = ref[s][so:so + n * step:step].copy()
+        for got, want in zip(bufs, ref):
+            np.testing.assert_array_equal(got, want, err_msg=f"trial {trial}: {prog}")
+
+
+def test_many_scatters_into_one_buffer_share_a_wave():
+    # Every op's write bounding box spans the whole buffer, but the rows are disjoint.
+    n, rows = 2048, 4
+    dst = np.zeros((n * rows, 16), np.float32)
+    src = np.arange(n * 16, dtype=np.float32).reshape(n, 1, 16)
+    perm = np.random.default_rng(0).permutation(n * rows).reshape(n, rows)
+    e = engine()
+    with e.scope():
+        for k in range(n):
+            e.scatter_(dst, perm[k], np.broadcast_to(src[k], (rows, 16)))
+    assert e.stats()["last"]["waves"] == 1
+    for k in (0, n // 2, n - 1):
+        np.testing.assert_array_equal(dst[perm[k]], np.broadcast_to(src[k], (rows, 16)))
+
+
 def test_lazy_views_compose():
     cache = np.arange(10 * 4 * 3, dtype=np.float32).reshape(10, 4, 3)
     ids = [7, 1, 1, 4]

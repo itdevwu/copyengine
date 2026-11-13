@@ -54,9 +54,9 @@ Hash128 fingerprint(const Op& op) {
   h.add(uint64_t{op.form != nullptr});
   h.add(static_cast<uint64_t>(op.src_lo));
   h.add(static_cast<uint64_t>(op.src_hi));
-  h.add(op.runs.src);
-  h.add(op.runs.dst);
-  h.add(op.runs.len);
+  h.add(op.runs().src);
+  h.add(op.runs().dst);
+  h.add(op.runs().len);
   return h.done();
 }
 
@@ -75,18 +75,25 @@ std::pair<i64, i64> Form::dst_extent() const { return extent_of(d_base, shape, d
 
 // ---- safety ----------------------------------------------------------------------
 
+const Runs& Op::runs() const {
+  static const Runs kEmpty;
+  return body ? body->runs : kEmpty;
+}
+
 const Intervals& Op::read() const {
-  if (!rd) rd = std::make_unique<Intervals>(interval_union(runs.src, runs.len, itemsize(src.dtype)));
-  return *rd;
+  const Runs& r = runs();
+  if (!body->rd) body->rd = std::make_unique<Intervals>(interval_union(r.src, r.len, itemsize(src.dtype)));
+  return *body->rd;
 }
 
 const Intervals& Op::write() const {
-  if (!wr) wr = std::make_unique<Intervals>(interval_union(runs.dst, runs.len, itemsize(dst.dtype)));
-  return *wr;
+  const Runs& r = runs();
+  if (!body->wr) body->wr = std::make_unique<Intervals>(interval_union(r.dst, r.len, itemsize(dst.dtype)));
+  return *body->wr;
 }
 
 void check_safe(const Op& op) {
-  const Runs& r = op.runs;
+  const Runs& r = op.runs();
   if (r.empty()) return;
   std::vector<size_t> o(r.size());
   for (size_t i = 0; i < o.size(); ++i) o[i] = i;
@@ -113,7 +120,7 @@ std::vector<int> waves(const std::vector<Op>& ops) {
   std::map<std::pair<int, int>, std::vector<Item>> by_dev;
   for (int k = 0; k < n; ++k) {
     const Op& op = ops[k];
-    if (op.runs.empty()) continue;
+    if (op.runs().empty()) continue;
     auto& r = by_dev[{int(op.src.device.kind), op.src.device.index}];
     const Intervals& rd = op.read();
     for (size_t i = 0; i < rd.start.size(); ++i) r.push_back({rd.start[i], rd.end[i], k, false});
@@ -178,7 +185,7 @@ Plan build_plan(const std::vector<Op>& ops) {
         it->src = op.src, it->dst = op.dst, it->fn = op.fn, it->ctx = op.ctx, it->wave = lv;
       }
       it->ops.push_back(k);
-      it->runs.append(op.runs);
+      it->runs.append(op.runs());
     }
     for (Group& g : groups) {
       std::vector<i64> lo, len;

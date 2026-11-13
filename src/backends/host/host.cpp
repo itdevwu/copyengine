@@ -181,12 +181,12 @@ int64_t HostExecutor::run(Strategy s, const Group& g, const std::vector<Op>& ops
       int64_t calls = 0;
       for (int k : g.ops) {
         const Op& op = ops[k];
-        for (size_t i = 0; i < op.runs.size(); ++i) {
-          host_copy(reinterpret_cast<const void*>(addr(op.runs.src[i], op.src.dtype)), op.src.dtype,
-                    reinterpret_cast<void*>(addr(op.runs.dst[i], op.dst.dtype)), op.dst.dtype, op.runs.len[i],
+        for (size_t i = 0; i < op.runs().size(); ++i) {
+          host_copy(reinterpret_cast<const void*>(addr(op.runs().src[i], op.src.dtype)), op.src.dtype,
+                    reinterpret_cast<void*>(addr(op.runs().dst[i], op.dst.dtype)), op.dst.dtype, op.runs().len[i],
                     op.fn);
         }
-        calls += static_cast<int64_t>(op.runs.size());
+        calls += static_cast<int64_t>(op.runs().size());
       }
       return calls;
     }

@@ -58,16 +58,23 @@ struct Form {
   }
 };
 
+// An op's runs and their lazily computed byte intervals. Shared by every
+// queued copy of a cached statement, so a statement-cache hit copies nothing.
+struct OpBody {
+  Runs runs;  // absolute element indices
+  mutable std::unique_ptr<Intervals> rd, wr;
+};
+
 struct Op {
   Side src, dst;
-  Runs runs;  // absolute element indices
+  std::shared_ptr<const OpBody> body;
+  const Runs& runs() const;
   Elementwise fn;
   std::string ctx;
   int64_t src_lo = 0, src_hi = 0;  // the source allocation, absolute bytes: reads may widen within it
   std::shared_ptr<const Form> form;  // null when the statement has tables or came in as runs
   Hash128 fp;  // content fingerprint
   // byte-interval read / write sets (absolute addresses), computed lazily
-  mutable std::unique_ptr<Intervals> rd, wr;
   const Intervals& read() const;
   const Intervals& write() const;
 };

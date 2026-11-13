@@ -943,15 +943,15 @@ class CudaExecutor final : public Executor {
     for (int k : g.ops) {
       const Op& op = ops[k];
       if (g.pure()) {
-        for (size_t i = 0; i < op.runs.size(); ++i, ++calls)
-          copy1d(op.src, op.dst, static_cast<uintptr_t>(op.runs.src[i]), static_cast<uintptr_t>(op.runs.dst[i]),
-                 static_cast<size_t>(op.runs.len[i]), st);
+        for (size_t i = 0; i < op.runs().size(); ++i, ++calls)
+          copy1d(op.src, op.dst, static_cast<uintptr_t>(op.runs().src[i]), static_cast<uintptr_t>(op.runs().dst[i]),
+                 static_cast<size_t>(op.runs().len[i]), st);
         continue;
       }
       Group one;
       one.src = op.src, one.dst = op.dst, one.fn = op.fn;
-      one.runs = op.runs;
-      one.rects = recover_2d(op.runs, 1 << 30);  // rows only
+      one.runs = op.runs();
+      one.rects = recover_2d(op.runs(), 1 << 30);  // rows only
       calls += (op.src.device.kind == DeviceKind::cuda && op.dst.device.kind == DeviceKind::cuda) ? kernel(s, one, st)
                                                                                                     : staged(s, one, st);
     }

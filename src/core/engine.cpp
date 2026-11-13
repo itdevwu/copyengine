@@ -45,9 +45,10 @@ EngineOptions EngineOptions::from_env() { return from_env(EngineOptions{}); }
 
 namespace {
 
+// What one flush executed: the plan and the strategy picked per group.
 struct Ran {
-  Strategy strategy;
-  Group group;
+  std::shared_ptr<const Plan> plan;
+  std::vector<Strategy> strategies;
 };
 
 using Clock = std::chrono::steady_clock;
@@ -60,7 +61,7 @@ struct Engine::Impl {
   int depth = 0;
   std::vector<Op> queue;
   uintptr_t stream = 0;
-  std::unordered_map<Hash128, Plan, Hash128Hasher> plans;
+  std::unordered_map<Hash128, std::shared_ptr<const Plan>, Hash128Hasher> plans;
   std::unordered_set<Hash128, Hash128Hasher> safe;
   Tuner tuner;
   HostExecutor host;
@@ -71,7 +72,7 @@ struct Engine::Impl {
   FlushStats last;
   int64_t total_flushes = 0, total_ops = 0, total_calls = 0, total_bytes = 0, plan_hits = 0;
   std::shared_ptr<std::vector<Op>> last_ops;
-  std::vector<Ran> last_ran;
+  Ran last_ran;
 
   explicit Impl(EngineOptions o)
       : opt(o),
@@ -131,8 +132,10 @@ struct Engine::Impl {
       runs.len[i] *= scale;
     }
     if (pure) op.src.dtype = op.dst.dtype = DType::u8;
-    op.runs = std::move(runs);
-    if (op.runs.empty()) return op;
+    if (runs.empty()) return op;
+    auto body = std::make_shared<OpBody>();
+    body->runs = std::move(runs);
+    op.body = std::move(body);
     exec_for(op.src, op.dst);  // fail early when the platform is missing
     op.form = std::move(form);
     op.fp = fingerprint(op);
@@ -142,13 +145,6 @@ struct Engine::Impl {
       safe.insert(op.fp);
     }
     return op;
-  }
-
-  static Op clone(const Op& o) {
-    Op c;
-    c.src = o.src, c.dst = o.dst, c.runs = o.runs, c.fn = o.fn, c.ctx = o.ctx;
-    c.src_lo = o.src_lo, c.src_hi = o.src_hi, c.fp = o.fp, c.form = o.form;
-    return c;
   }
 
   // Structured form of a table-free statement, or null if it has none.
@@ -171,7 +167,7 @@ struct Engine::Impl {
   }
 
   void push(Op op, uintptr_t strm) {
-    if (op.runs.empty()) return;
+    if (op.runs().empty()) return;
     if (!queue.empty() && strm != stream) flush();
     stream = strm;
     queue.push_back(std::move(op));
@@ -226,13 +222,13 @@ struct Engine::Impl {
     h.add(std::span<const i64>(hints.valid_len));
     const Hash128 key = h.done();
     if (auto it = stmt_cache.find(key); it != stmt_cache.end()) {
-      push(clone(it->second), strm);
+      push(it->second, strm);
       return;
     }
     std::shared_ptr<const Form> form = hints.has_valid ? nullptr : make_form(src, dst, stmt);
     Op op = make_op(src, dst, lower(stmt), fn, hints, std::move(form));
     if (static_cast<int>(stmt_cache.size()) >= opt.plan_cache * 4) stmt_cache.clear();
-    stmt_cache.emplace(key, clone(op));
+    stmt_cache.emplace(key, op);
     push(std::move(op), strm);
   }
 
@@ -280,27 +276,29 @@ struct Engine::Impl {
     auto it = plans.find(key);
     const bool hit = it != plans.end();
     if (!hit) {
-      Plan p = build_plan(ops);
-      for (Group& g : p.groups) {
+      auto p = std::make_shared<Plan>(build_plan(ops));
+      for (Group& g : p->groups) {
         g.candidates = tuner.shortlist(exec_for(g.src, g.dst).candidates(g));
         g.bucket = bucket_key(g, static_cast<int>(g.ops.size()));
       }
-      if (opt.log_plan) log(p, ops.size());
+      if (opt.log_plan) log(*p, ops.size());
       if (static_cast<int>(plans.size()) >= opt.plan_cache) plans.clear();
       it = plans.emplace(key, std::move(p)).first;
     }
-    const Plan& plan = it->second;
+    const std::shared_ptr<const Plan> pp = it->second;
+    const Plan& plan = *pp;
     FlushStats st;
     st.ops = static_cast<int>(ops.size());
     st.waves = plan.waves;
     st.groups = static_cast<int>(plan.groups.size());
     st.plan_hit = hit;
-    std::vector<Ran> ran;
+    Ran ran{pp, {}};
+    ran.strategies.reserve(plan.groups.size());
     for (const Group& g : plan.groups) {
       const Strategy s = opt.disable ? Strategy::passthrough : tuner.pick(g.bucket, g.candidates);
       const bool measure = !opt.disable && tuner.exploring(g.bucket);
       run_group(g, s, ops, stream, measure, &st);
-      ran.push_back({s, g});
+      ran.strategies.push_back(s);
     }
     last = st;
     ++total_flushes;
@@ -435,18 +433,20 @@ void Engine::load_profile(const std::string& text) {
 namespace {
 class FrozenImpl final : public Frozen {
  public:
-  FrozenImpl(Engine::Impl* eng, std::shared_ptr<std::vector<Op>> ops, std::vector<Ran> ran)
+  FrozenImpl(Engine::Impl* eng, std::shared_ptr<std::vector<Op>> ops, Ran ran)
       : eng_(eng), ops_(std::move(ops)), ran_(std::move(ran)) {}
   void run(uintptr_t stream) override {
     std::lock_guard lk(eng_->mu);
-    for (const Ran& r : ran_) eng_->run_group(r.group, r.strategy, *ops_, stream, false, nullptr);
+    const auto& groups = ran_.plan->groups;
+    for (size_t i = 0; i < groups.size(); ++i)
+      eng_->run_group(groups[i], ran_.strategies[i], *ops_, stream, false, nullptr);
     if (!eng_->opt.allow_async) eng_->synchronize();
   }
 
  private:
   Engine::Impl* eng_;
   std::shared_ptr<std::vector<Op>> ops_;
-  std::vector<Ran> ran_;
+  Ran ran_;
 };
 }  // namespace
 

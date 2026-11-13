@@ -111,12 +111,17 @@ extern "C" __global__ void ce_bytes(const Chunk* __restrict__ chunks, int n, lon
 
 // Structured statements: dst[D(i)] = f(src[S(i)]) over a shared domain, for a
 // batch of statements with the same shape and strides but different bases.
-// One thread per element; strides may be 0 (broadcast) or negative. Dtypes are
-// dispatched at runtime (same bits as the typed kernels, see convert.hpp).
+// Strides may be 0 (broadcast) or negative. Dtypes are dispatched at runtime
+// (same bits as the typed kernels, see convert.hpp). Each thread takes `vec`
+// consecutive elements of the innermost dimension (the host checks it divides
+// that dimension, which is contiguous and vec-aligned on the destination) and
+// stores them as one access.
 struct StmtDesc {
   int rank, sdt, ddt, mode;  // mode 0: raw element copy, 1: cast, 2: apply fn
+  int vec;
   unsigned numel;
   unsigned shape[6];
+  unsigned magic[6], shift[6];  // n / shape[k] == (umulhi(n, magic) + n) >> shift, for n < 2^31
   long long ss[6], ds[6];
 };
 
@@ -124,21 +129,7 @@ struct Base {
   long long src, dst;
 };
 
-extern "C" __global__ void ce_stmt(const Base* __restrict__ bases, long long total, StmtDesc D, Fn fn, long long sadd,
-                                   long long dadd) {
-  const long long e = blockIdx.x * static_cast<long long>(blockDim.x) + threadIdx.x;
-  if (e >= total) return;
-  const long long op = e / D.numel;
-  unsigned r = static_cast<unsigned>(e - op * D.numel);
-  long long so = bases[op].src + sadd, dof = bases[op].dst + dadd;
-  for (int k = D.rank - 1; k >= 0; --k) {
-    const unsigned q = r / D.shape[k], i = r - q * D.shape[k];
-    r = q;
-    so += static_cast<long long>(i) * D.ss[k];
-    dof += static_cast<long long>(i) * D.ds[k];
-  }
-  const void* sp = reinterpret_cast<const void*>(static_cast<uintptr_t>(so) * dt_size(D.sdt));
-  void* dp = reinterpret_cast<void*>(static_cast<uintptr_t>(dof) * dt_size(D.ddt));
+__device__ __forceinline__ void element(const void* sp, void* dp, const StmtDesc& D, const Fn& fn) {
   if (D.mode == 0) {
     switch (dt_size(D.sdt)) {
       case 8: wr<uint64_t>(dp, rd<uint64_t>(sp)); break;
@@ -152,6 +143,93 @@ extern "C" __global__ void ce_stmt(const Base* __restrict__ bases, long long tot
     dyn_apply(sp, D.sdt, dp, D.ddt, fn);
   }
 }
+
+// Element conversion for statements: from the descriptor at run time ...
+struct DynConv {
+  const StmtDesc& D;
+  const Fn& fn;
+  __device__ __forceinline__ void operator()(const void* sp, void* dp) const { element(sp, dp, D, fn); }
+};
+
+// ... or compiled for one dtype pair (kMode 0: raw copy, 1: cast, 2: apply),
+// for the common pairs where the run-time dispatch would dominate.
+template <class Dt, class St, int kMode>
+struct TypedConv {
+  const Fn& fn;
+  __device__ __forceinline__ void operator()(const void* sp, void* dp) const {
+    const St x = rd<St>(sp);
+    if constexpr (kMode == 0) wr<Dt>(dp, x);
+    else wr<Dt>(dp, convert<Dt, St, kMode == 1>(x, fn));
+  }
+};
+
+// Grid: x covers one statement's elements (vec per thread), y the statements
+// (strided when there are more than gridDim.y), so indexing stays 32-bit.
+template <class Conv>
+__device__ __forceinline__ void stmt_body(const Base* __restrict__ bases, long long count, const StmtDesc& D,
+                                          long long sadd, long long dadd, int ssz, int dsz, Conv conv) {
+  const unsigned e = (blockIdx.x * blockDim.x + threadIdx.x) * static_cast<unsigned>(D.vec);
+  if (e >= D.numel) return;
+  const long long sstep = D.rank > 0 ? D.ss[D.rank - 1] : 0;
+  for (long long op = blockIdx.y; op < count; op += gridDim.y) {
+    unsigned r = e;
+    long long so = bases[op].src + sadd, dof = bases[op].dst + dadd;
+    for (int k = D.rank - 1; k >= 0; --k) {
+      const unsigned q = (__umulhi(r, D.magic[k]) + r) >> D.shift[k], i = r - q * D.shape[k];
+      r = q;
+      so += static_cast<long long>(i) * D.ss[k];
+      dof += static_cast<long long>(i) * D.ds[k];
+    }
+    if (D.vec == 1) {
+      conv(reinterpret_cast<const void*>(static_cast<uintptr_t>(so) * ssz),
+           reinterpret_cast<void*>(static_cast<uintptr_t>(dof) * dsz));
+      continue;
+    }
+    alignas(16) unsigned char buf[16];
+    for (int k = 0; k < D.vec; ++k)
+      conv(reinterpret_cast<const void*>(static_cast<uintptr_t>(so + k * sstep) * ssz), buf + k * dsz);
+    void* dp = reinterpret_cast<void*>(static_cast<uintptr_t>(dof) * dsz);
+    switch (D.vec * dsz) {
+      case 16: wr<uint4>(dp, *reinterpret_cast<const uint4*>(buf)); break;
+      case 8: wr<uint2>(dp, *reinterpret_cast<const uint2*>(buf)); break;
+      case 4: wr<uint32_t>(dp, *reinterpret_cast<const uint32_t*>(buf)); break;
+      default: wr<uint16_t>(dp, *reinterpret_cast<const uint16_t*>(buf)); break;
+    }
+  }
+}
+
+extern "C" __global__ void ce_stmt(const Base* __restrict__ bases, long long count, StmtDesc D, Fn fn, long long sadd,
+                                   long long dadd) {
+  stmt_body(bases, count, D, sadd, dadd, dt_size(D.sdt), dt_size(D.ddt), DynConv{D, fn});
+}
+
+#define CE_STMT(name, Dt, St, mode)                                                                    \
+  extern "C" __global__ void ce_stmt_##name(const Base* __restrict__ bases, long long count, StmtDesc D, Fn fn, \
+                                            long long sadd, long long dadd) {                          \
+    stmt_body(bases, count, D, sadd, dadd, sizeof(St), sizeof(Dt), TypedConv<Dt, St, mode>{fn});       \
+  }
+CE_STMT(b1, uint8_t, uint8_t, 0)
+CE_STMT(b2, uint16_t, uint16_t, 0)
+CE_STMT(b4, uint32_t, uint32_t, 0)
+CE_STMT(b8, uint64_t, uint64_t, 0)
+CE_STMT(cast_f32_f16, half_t, float, 1)
+CE_STMT(cast_f32_bf16, bf16_t, float, 1)
+CE_STMT(cast_f16_f32, float, half_t, 1)
+CE_STMT(cast_bf16_f32, float, bf16_t, 1)
+CE_STMT(cast_f16_bf16, bf16_t, half_t, 1)
+CE_STMT(cast_bf16_f16, half_t, bf16_t, 1)
+CE_STMT(cast_i8_f16, half_t, int8_t, 1)
+CE_STMT(cast_i8_bf16, bf16_t, int8_t, 1)
+CE_STMT(cast_i8_f32, float, int8_t, 1)
+CE_STMT(cast_u8_f16, half_t, uint8_t, 1)
+CE_STMT(cast_u8_bf16, bf16_t, uint8_t, 1)
+CE_STMT(cast_u8_f32, float, uint8_t, 1)
+CE_STMT(apply_i8_f16, half_t, int8_t, 2)
+CE_STMT(apply_i8_bf16, bf16_t, int8_t, 2)
+CE_STMT(apply_i8_f32, float, int8_t, 2)
+CE_STMT(apply_f16_i8, int8_t, half_t, 2)
+CE_STMT(apply_bf16_i8, int8_t, bf16_t, 2)
+CE_STMT(apply_f32_i8, int8_t, float, 2)
 
 // The same statements when the destination's contiguous dimension `a` is not
 // the source's `b` (transposes): 32x32 tiles through shared memory, read

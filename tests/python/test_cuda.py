@@ -441,3 +441,40 @@ def test_kernel_vector_and_scalar_paths_agree_with_host(pair, fn):
         ce.Engine(prior_only=True).copy_(want, base[so:so + n * rows].view(rows, n), fn=fn)  # host conversion
         bits = {1: torch.int8, 2: torch.int16, 4: torch.int32, 8: torch.int64}[want.element_size()]
         assert torch.equal(dst.cpu().view(bits), want.view(bits)), (so, do, n, rows)
+
+
+@pytest.mark.parametrize("sdt,ddt,fn", [
+    (torch.uint8, torch.uint8, None), (torch.int16, torch.int16, None), (torch.float32, torch.float32, None),
+    (torch.float64, torch.float64, None), (torch.float32, torch.float16, None), (torch.bfloat16, torch.float32, None),
+    (torch.int8, torch.float16, ce.Elementwise(scale=0.25)), (torch.float32, torch.int8, ce.Elementwise(scale=3.0, round=True, clamp=(-127, 127))),
+    (torch.int32, torch.float64, None),  # no specialization: run-time dispatch
+])
+@pytest.mark.parametrize("shape", [(7, 13, 4), (5, 3, 8), (11, 1, 6)])
+def test_fused_statements_match_host(sdt, ddt, fn, shape):
+    a, b, c = shape
+    g = torch.Generator().manual_seed(2)
+    src_h = (torch.randn(a, 1, c, generator=g) * 40).to(sdt)
+    want = torch.zeros(a, b, c, dtype=ddt)
+    ce.Engine(prior_only=True).copy_(want, src_h.expand(a, b, c), fn=fn)  # host conversion
+    src = src_h.to(DEV)
+    for off in (0, 1):  # off=1: destination bases not vector-aligned
+        buf = torch.zeros(a * b * c + off, dtype=ddt, device=DEV)
+        dst = buf[off:].view(a, b, c)
+        e = ce.Engine(prior_only=True)
+        with e.scope():
+            for i in range(a):  # one statement per row: a fused batch
+                e.copy_(dst[i], src[i].expand(b, c), fn=fn)
+        bits = {1: torch.int8, 2: torch.int16, 4: torch.int32, 8: torch.int64}[want.element_size()]
+        assert torch.equal(dst.cpu().view(bits), want.view(bits)), (off, e.stats()["last"]["strategies"])
+
+
+def test_fused_more_statements_than_one_grid_row():
+    n = 70000  # > 65535: the kernel strides over statements
+    src = torch.arange(n, dtype=torch.float32, device=DEV).view(n, 1)
+    dst = torch.zeros(n, 4, device=DEV)
+    e = ce.Engine(prior_only=True)
+    with e.scope():
+        for i in range(n):
+            e.copy_(dst[i], src[i].expand(4))
+    assert e.stats()["last"]["strategies"] == ["fused"]
+    torch.testing.assert_close(dst, src.expand(n, 4), rtol=0, atol=0)

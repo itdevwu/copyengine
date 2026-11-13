@@ -76,10 +76,21 @@ struct Raw {
 // Mirror the kernel's structured-statement parameters (kernels.cu).
 struct StmtDesc {
   int rank, sdt, ddt, mode;
+  int vec;  // destination elements per thread (innermost dim)
   unsigned numel;
   unsigned shape[6];
+  unsigned magic[6], shift[6];  // division by shape[k] as multiply + shift (see kernels.cu)
   long long ss[6], ds[6];
 };
+
+// Magic number and shift such that n / d == (umulhi(n, magic) + n) >> shift
+// for every n < 2^31 (the divider PyTorch's IntDivider uses).
+void int_divider(unsigned d, unsigned* magic, unsigned* shift) {
+  unsigned s = 0;
+  while (s < 32 && (uint64_t{1} << s) < d) ++s;
+  *shift = s;
+  *magic = static_cast<unsigned>(((uint64_t{1} << 32) * ((uint64_t{1} << s) - d)) / d + 1);
+}
 
 struct Base {
   long long src, dst;
@@ -645,6 +656,23 @@ class CudaExecutor final : public Executor {
 
   // ---- kernels ------------------------------------------------------------------------
 
+  // A kernel the fatbin may not have (specializations): null if missing.
+  CUfunction find_function(Dev& s, const std::string& name) {
+    auto it = s.fns.find(name);
+    if (it != s.fns.end()) return it->second;
+    CUfunction f{};
+    if (d_->cuModuleGetFunction(&f, s.mod, name.c_str()) != CUDA_SUCCESS) f = nullptr;
+    s.fns.emplace(name, f);
+    return f;
+  }
+
+  // The specialized ce_stmt for this dtype pair and mode, if compiled.
+  static std::string stmt_kernel(const StmtDesc& d) {
+    const DType sd = static_cast<DType>(d.sdt), dd = static_cast<DType>(d.ddt);
+    if (d.mode == 0) return "ce_stmt_b" + std::to_string(itemsize(sd));
+    return std::string("ce_stmt_") + (d.mode == 1 ? "cast_" : "apply_") + short_name(sd) + "_" + short_name(dd);
+  }
+
   CUfunction function(Dev& s, const std::string& name) {
     auto it = s.fns.find(name);
     if (it != s.fns.end()) return it->second;
@@ -734,6 +762,22 @@ class CudaExecutor final : public Executor {
     sl.used = true;
   }
 
+  // Destination elements one thread of ce_stmt stores at once: the innermost
+  // dimension is contiguous on the destination, divisible by the width, and
+  // every statement's destination base (plus `dadd`) is aligned to it.
+  static int vector_width(const FusedBatch& b, long long dadd) {
+    const StmtDesc& d = b.desc;
+    if (d.rank == 0 || d.ds[d.rank - 1] != 1 || b.tile_a >= 0) return 1;
+    const int dsz = static_cast<int>(itemsize(static_cast<DType>(d.ddt)));
+    for (int v = 16 / dsz; v >= 2; v /= 2) {
+      if (d.shape[d.rank - 1] % v != 0) continue;
+      bool ok = true;
+      for (const Base& x : b.bases) ok = ok && ((x.dst + dadd) % v) == 0;
+      if (ok) return v;
+    }
+    return 1;
+  }
+
   // Destination and source each have a unit-stride dimension, and they
   // differ (a transpose): the tiled kernel keeps both sides coalesced.
   static void transpose_dims(const Form& f, int* a, int* b) {
@@ -750,7 +794,8 @@ class CudaExecutor final : public Executor {
     if (table.count == 0) return;
     const StmtDesc& desc = batch.desc;
     const bool tiled = batch.tile_a >= 0;
-    CUfunction f = function(s, tiled ? "ce_stmt_tile" : "ce_stmt");
+    CUfunction f = tiled ? function(s, "ce_stmt_tile") : find_function(s, stmt_kernel(desc));
+    if (!f) f = function(s, "ce_stmt");
     CUdeviceptr t = table.ptr;
     StmtDesc dcopy = desc;
     cv::Fn fcopy = fn;
@@ -763,11 +808,13 @@ class CudaExecutor final : public Executor {
       const unsigned gz = static_cast<unsigned>(std::min<long long>(count, 65535));
       check(d_->cuLaunchKernel(f, gx, gy, gz, 32, 8, 1, 0, st, args, nullptr), "cuLaunchKernel ce_stmt_tile");
     } else {
-      long long total = static_cast<long long>(table.count) * desc.numel;
-      void* args[] = {&t, &total, &dcopy, &fcopy, &sadd, &dadd};
+      long long count = static_cast<long long>(table.count);
+      void* args[] = {&t, &count, &dcopy, &fcopy, &sadd, &dadd};
       const unsigned threads = 256;
-      const unsigned blocks = static_cast<unsigned>((total + threads - 1) / threads);
-      check(d_->cuLaunchKernel(f, blocks, 1, 1, threads, 1, 1, 0, st, args, nullptr), "cuLaunchKernel ce_stmt");
+      const unsigned per = (desc.numel + desc.vec - 1) / desc.vec;
+      const unsigned gx = (per + threads - 1) / threads;
+      const unsigned gy = static_cast<unsigned>(std::min<long long>(count, 65535));
+      check(d_->cuLaunchKernel(f, gx, gy, 1, threads, 1, 1, 0, st, args, nullptr), "cuLaunchKernel ce_stmt");
     }
   }
 
@@ -793,16 +840,20 @@ class CudaExecutor final : public Executor {
         FusedBatch b;
         b.desc.rank = f.rank, b.desc.sdt = static_cast<int>(f.sdt), b.desc.ddt = static_cast<int>(f.ddt);
         b.desc.mode = mode, b.desc.numel = static_cast<unsigned>(f.numel);
-        for (int k = 0; k < f.rank; ++k)
+        for (int k = 0; k < f.rank; ++k) {
           b.desc.shape[k] = static_cast<unsigned>(f.shape[k]), b.desc.ss[k] = f.ss[k], b.desc.ds[k] = f.ds[k];
+          int_divider(b.desc.shape[k], &b.desc.magic[k], &b.desc.shift[k]);
+        }
         b.link_size = static_cast<i64>(itemsize(P.h2d ? f.sdt : f.ddt));
         transpose_dims(f, &b.tile_a, &b.tile_b);
+        b.desc.vec = 1;
         P.batches.push_back(std::move(b));
       }
       batch_of[i] = j;
       P.batches[j].bases.push_back({f.s_base, f.d_base});
     }
     if (!P.cross) {
+      for (FusedBatch& b : P.batches) b.desc.vec = vector_width(b, 0);
       P.ok = true;
       return P;
     }
@@ -845,6 +896,9 @@ class CudaExecutor final : public Executor {
       const size_t k = static_cast<size_t>(std::upper_bound(iv.start.begin(), iv.start.end(), byte) - iv.start.begin()) - 1;
       link = (off[k] + (byte - iv.start[k])) / b.link_size;
     }
+    // D2H writes into staging (based at 256-byte aligned addresses); H2D's
+    // destination keeps its own alignment.
+    for (FusedBatch& b : P.batches) b.desc.vec = vector_width(b, 0);
     P.ok = true;
     return P;
   }

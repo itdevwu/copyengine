@@ -33,8 +33,10 @@ struct I64Arg {
 };
 
 I64Arg i64_arg(nb::handle obj) {
-  static nb::object asarray = nb::module_::import_("numpy").attr("ascontiguousarray");
-  nb::object a = asarray(obj, "dtype"_a = "int64").attr("reshape")(-1);
+  // Leaked on purpose: a static nb::object would be destroyed after the
+  // interpreter has finalized.
+  static PyObject* asarray = nb::object(nb::module_::import_("numpy").attr("ascontiguousarray")).release().ptr();
+  nb::object a = nb::handle(asarray)(obj, "dtype"_a = "int64").attr("reshape")(-1);
   return {a, nb::cast<I64In>(a)};
 }
 
@@ -53,16 +55,19 @@ NB_MODULE(_core, m) {
   m.attr("ABI_VERSION") = ce_abi_version();
 
   // ---- errors ----
-  static nb::object base_exc = nb::steal(PyErr_NewException("copyengine.CopyEngineError", PyExc_RuntimeError, nullptr));
-  static nb::object materialize_exc = nb::steal(PyErr_NewException("copyengine.NeedsMaterialize", base_exc.ptr(), nullptr));
-  static nb::object unsafe_exc = nb::steal(PyErr_NewException("copyengine.UnsafeCopy", base_exc.ptr(), nullptr));
-  static nb::object unsupported_exc = nb::steal(PyErr_NewException("copyengine.Unsupported", base_exc.ptr(), nullptr));
-  static nb::object backend_exc = nb::steal(PyErr_NewException("copyengine.BackendError", base_exc.ptr(), nullptr));
-  m.attr("CopyEngineError") = base_exc;
-  m.attr("NeedsMaterialize") = materialize_exc;
-  m.attr("UnsafeCopy") = unsafe_exc;
-  m.attr("Unsupported") = unsupported_exc;
-  m.attr("BackendError") = backend_exc;
+  // Exception types are held as raw pointers for the life of the process: the
+  // translator may run during shutdown, and static nb::objects would be
+  // destroyed after the interpreter has finalized.
+  static PyObject* base_exc = PyErr_NewException("copyengine.CopyEngineError", PyExc_RuntimeError, nullptr);
+  static PyObject* materialize_exc = PyErr_NewException("copyengine.NeedsMaterialize", base_exc, nullptr);
+  static PyObject* unsafe_exc = PyErr_NewException("copyengine.UnsafeCopy", base_exc, nullptr);
+  static PyObject* unsupported_exc = PyErr_NewException("copyengine.Unsupported", base_exc, nullptr);
+  static PyObject* backend_exc = PyErr_NewException("copyengine.BackendError", base_exc, nullptr);
+  m.attr("CopyEngineError") = nb::handle(base_exc);
+  m.attr("NeedsMaterialize") = nb::handle(materialize_exc);
+  m.attr("UnsafeCopy") = nb::handle(unsafe_exc);
+  m.attr("Unsupported") = nb::handle(unsupported_exc);
+  m.attr("BackendError") = nb::handle(backend_exc);
   nb::register_exception_translator([](const std::exception_ptr& p, void*) {
     try {
       std::rethrow_exception(p);
@@ -70,10 +75,10 @@ NB_MODULE(_core, m) {
       PyObject* type = PyExc_ValueError;
       switch (e.code()) {
         case ce::Errc::invalid_argument: type = PyExc_ValueError; break;
-        case ce::Errc::needs_materialize: type = materialize_exc.ptr(); break;
-        case ce::Errc::unsafe_copy: type = unsafe_exc.ptr(); break;
-        case ce::Errc::unsupported: type = unsupported_exc.ptr(); break;
-        case ce::Errc::backend: type = backend_exc.ptr(); break;
+        case ce::Errc::needs_materialize: type = materialize_exc; break;
+        case ce::Errc::unsafe_copy: type = unsafe_exc; break;
+        case ce::Errc::unsupported: type = unsupported_exc; break;
+        case ce::Errc::backend: type = backend_exc; break;
       }
       PyErr_SetString(type, e.what());
     }

@@ -29,13 +29,14 @@ struct EngineOptions {
   bool tune = true;                      // explore candidates per bucket, then lock
   int tune_trials = 3;                   // samples per candidate before locking
   int tune_topk = 3;                     // candidates explored (plus passthrough)
-  bool allow_async = false;              // scope exit may return before copies finish
+  bool allow_async = false;              // scope exit may return before host-side copies finish
+  bool sync_always = false;              // wait after every flush, also device-only (CE_SYNC; debugging)
   bool disable = false;                  // run every op as submitted (CE_DISABLE)
   bool log_plan = false;                 // print plans to stderr (CE_LOG=plan)
   int host_threads = 0;                  // 0: min(hardware threads, 8)
   int plan_cache = 4096;                 // max cached plans
 
-  // Applies CE_DISABLE, CE_LOG, CE_STAGING_MB, CE_TUNE on top of `base`.
+  // Applies CE_DISABLE, CE_LOG, CE_STAGING_MB, CE_TUNE, CE_SYNC on top of `base`.
   static EngineOptions from_env(EngineOptions base);
   static EngineOptions from_env();
 };
@@ -67,9 +68,11 @@ class Engine {
             const Hints& hints = {}, uintptr_t stream = 0);
 
   void begin_scope();
-  void end_scope();     // flushes at depth 0, then waits unless allow_async
+  // Flushes at depth 0. Copies are ordered on the caller's stream; the call
+  // waits only when host memory is involved (unless allow_async).
+  void end_scope();
   void flush();         // plan + issue everything queued
-  void synchronize();   // wait for issued work
+  void synchronize();   // wait for all issued work, device-only copies included
   int depth() const;
   size_t queued() const;
 

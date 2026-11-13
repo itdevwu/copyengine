@@ -69,9 +69,11 @@ C and C++ callers use `include/copyengine/copyengine.h` (stable C ABI) or
 - Each destination element is written once per copy; duplicate scatter indices
   and overlapping source/destination raise `UnsafeCopy`.
 - Buffers used inside a scope must not be touched by other code until the scope
-  exits (or `barrier()`); on exit all copies have completed unless the engine
-  was created with `allow_async=True`.
-- CUDA work is ordered on the caller's current stream (torch's, if any).
+  exits (or `barrier()`).
+- CUDA work is ordered on the caller's current stream (torch's, if any), like
+  torch's own copies: device-to-device copies are not waited for. Copies that
+  touch host memory have completed when the copy or scope returns, unless the
+  engine was created with `allow_async=True`.
 - Host and GPU conversions produce identical bits; see `include/copyengine/types.hpp`.
 
 ## Environment
@@ -82,5 +84,6 @@ C and C++ callers use `include/copyengine/copyengine.h` (stable C ABI) or
 | `CE_LOG=plan` | print plans to stderr |
 | `CE_STAGING_MB` | device staging budget (default 256) |
 | `CE_TUNE=0` | use the prior ranking only, never measure |
+| `CE_SYNC=1` | wait for every copy, device-to-device included (debugging) |
 
 Licensed under Apache-2.0.

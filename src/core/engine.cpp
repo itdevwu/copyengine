@@ -1,5 +1,6 @@
 #include "copyengine/engine.hpp"
 
+#include <algorithm>
 #include <bit>
 #include <chrono>
 #include <cstdio>
@@ -36,6 +37,7 @@ EngineOptions EngineOptions::from_env(EngineOptions o) {
   if (env("CE_LOG").find("plan") != std::string::npos) o.log_plan = true;
   if (auto v = env("CE_STAGING_MB"); !v.empty()) o.staging_budget = std::stoll(v) << 20;
   if (auto v = env("CE_TUNE"); !v.empty()) o.tune = truthy(v);
+  if (truthy(env("CE_SYNC"))) o.sync_always = true;
   return o;
 }
 
@@ -67,8 +69,10 @@ struct Engine::Impl {
   HostExecutor host;
   std::unique_ptr<Executor> cuda;
   std::string cuda_error;
-  bool cuda_pending = false;
-  uintptr_t cuda_stream = 0;
+  // Streams with issued, unfinished CUDA work, and whether any of it touches
+  // host memory (only then must the host wait before returning or reading).
+  std::vector<uintptr_t> cuda_streams;
+  bool host_pending = false;
   FlushStats last;
   int64_t total_flushes = 0, total_ops = 0, total_calls = 0, total_bytes = 0, plan_hits = 0;
   std::shared_ptr<std::vector<Op>> last_ops;
@@ -173,7 +177,7 @@ struct Engine::Impl {
     queue.push_back(std::move(op));
     if (depth == 0) {
       flush();
-      if (!opt.allow_async) synchronize();
+      finish();
     }
   }
 
@@ -245,19 +249,17 @@ struct Engine::Impl {
   void run_group(const Group& g, Strategy s, const std::vector<Op>& ops, uintptr_t strm, bool measure,
                  FlushStats* st) {
     Executor& ex = exec_for(g.src, g.dst);
-    if (&ex == &host && cuda_pending) {
-      cuda->sync(cuda_stream);  // host work may read what earlier CUDA work wrote
-      cuda_pending = false;
-    }
+    if (&ex == &host && host_pending) synchronize();  // host work may touch what CUDA work still uses
     const auto t0 = Clock::now();
     const int64_t calls = ex.run(s, g, ops, strm);
     if (measure) {
-      ex.sync(strm);
+      const uintptr_t one[] = {strm};
+      ex.sync(one);
       tuner.report(g.bucket, s, std::chrono::duration<double>(Clock::now() - t0).count());
     }
     if (ex.async()) {
-      cuda_pending = true;
-      cuda_stream = strm;
+      if (std::find(cuda_streams.begin(), cuda_streams.end(), strm) == cuda_streams.end()) cuda_streams.push_back(strm);
+      if (g.src.device.kind == DeviceKind::host || g.dst.device.kind == DeviceKind::host) host_pending = true;
     }
     if (st) {
       st->calls += calls;
@@ -311,10 +313,16 @@ struct Engine::Impl {
   }
 
   void synchronize() {
-    if (cuda_pending) {
-      cuda->sync(cuda_stream);
-      cuda_pending = false;
-    }
+    if (cuda_streams.empty()) return;
+    cuda->sync(cuda_streams);
+    cuda_streams.clear();
+    host_pending = false;
+  }
+
+  // End of a top-level copy or scope. Device-only work stays queued on the
+  // caller's stream, which orders it like torch's own copies.
+  void finish() {
+    if (opt.sync_always || (host_pending && !opt.allow_async)) synchronize();
   }
 };
 
@@ -350,7 +358,7 @@ void Engine::end_scope() {
   if (impl_->depth == 0) fail(Errc::invalid_argument, "end_scope without begin_scope");
   if (--impl_->depth == 0) {
     impl_->flush();
-    if (!impl_->opt.allow_async) impl_->synchronize();
+    impl_->finish();
   }
 }
 
@@ -440,7 +448,7 @@ class FrozenImpl final : public Frozen {
     const auto& groups = ran_.plan->groups;
     for (size_t i = 0; i < groups.size(); ++i)
       eng_->run_group(groups[i], ran_.strategies[i], *ops_, stream, false, nullptr);
-    if (!eng_->opt.allow_async) eng_->synchronize();
+    eng_->finish();
   }
 
  private:

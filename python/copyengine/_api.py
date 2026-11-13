@@ -35,8 +35,9 @@ class Engine:
 
     Copies issued inside ``with engine.scope():`` are queued; at scope exit they
     are planned together (dependency waves, cross-copy merging, 2-D recovery),
-    issued with the best measured strategy, and waited for. Outside a scope every
-    copy runs immediately.
+    issued with the best measured strategy on the current stream. Outside a scope
+    every copy is issued immediately. Like torch, device-to-device copies are not
+    waited for; copies touching host memory are complete when the call returns.
 
     Buffers touched inside a scope must not be read or written by other code
     until the scope exits (or :meth:`barrier` is called).

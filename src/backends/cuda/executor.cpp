@@ -4,7 +4,6 @@
 #include <array>
 #include <cstring>
 #include <mutex>
-#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -218,7 +217,6 @@ class CudaExecutor final : public Executor {
     const int di = device_of(g);
     Dev& s = state(di);
     Push push(*d_, s.ctx);
-    pending_.insert(di);
     const CUstream st = reinterpret_cast<CUstream>(stream);
     switch (strat) {
       case Strategy::passthrough: return passthrough(s, g, ops, st);
@@ -232,12 +230,17 @@ class CudaExecutor final : public Executor {
     }
   }
 
-  void sync(uintptr_t stream) override {
-    for (int di : pending_) {
-      Push push(*d_, devs_[di].ctx);
-      check(d_->cuStreamSynchronize(reinterpret_cast<CUstream>(stream)), "cuStreamSynchronize");
+  // A stream handle names its own context; stream 0 is each device's legacy
+  // stream, so it is synchronized on every device in use.
+  void sync(std::span<const uintptr_t> streams) override {
+    bool first = true;
+    for (Dev& s : devs_) {
+      if (!s.init) continue;
+      Push push(*d_, s.ctx);
+      for (uintptr_t st : streams)
+        if (st == 0 || first) check(d_->cuStreamSynchronize(reinterpret_cast<CUstream>(st)), "cuStreamSynchronize");
+      first = false;
     }
-    pending_.clear();
   }
 
   bool async() const override { return true; }
@@ -961,7 +964,6 @@ class CudaExecutor final : public Executor {
   EngineOptions opt_;
   const Driver* d_ = nullptr;
   std::vector<Dev> devs_;
-  std::set<int> pending_;
 };
 
 }  // namespace

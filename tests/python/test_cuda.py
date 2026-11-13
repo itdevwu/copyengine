@@ -13,7 +13,7 @@ DEV = "cuda"
 
 def explore(fn, rounds=8, check=None):
     """Run fn(engine) with exploration so every candidate strategy executes; check each round."""
-    e = ce.Engine(tune=True, tune_trials=1, tune_topk=4)
+    e = ce.Engine(tune_trials=1, tune_topk=4)
     seen = set()
     for _ in range(rounds):
         fn(e)
@@ -44,9 +44,9 @@ def test_h2d_and_d2h_strided(pinned):
         e.copy_(view_d, view_s)
 
     _, seen = explore(body, check=lambda: torch.testing.assert_close(view_d.cpu(), view_s, rtol=0, atol=0))
-    assert "passthrough" in seen
+    assert "native" in seen  # torch's own copy is the baseline
     back = host((16, 4, 32), pinned=pinned, fill=False)
-    ce.Engine(tune=False).copy_(back, view_d)
+    ce.Engine(prior_only=True).copy_(back, view_d)
     torch.testing.assert_close(back, view_s, rtol=0, atol=0)
 
 
@@ -70,7 +70,7 @@ def test_layer_block_loop_merges():
     e, seen = explore(body, check=check)
     st = e.stats()["last"]
     assert st["ops"] == L * B
-    assert seen >= {"batch", "runs", "passthrough"}
+    assert seen >= {"batch", "runs", "native"}
 
 
 def test_d2d_gather_kernel_and_batch():
@@ -88,7 +88,7 @@ def test_d2d_gather_kernel_and_batch():
 
 def test_default_stream_ordering():
     # src is produced by a torch kernel on the legacy default stream right before the copy.
-    e = ce.Engine(tune=True, tune_trials=1, tune_topk=4)
+    e = ce.Engine(tune_trials=1, tune_topk=4)
     for _ in range(8):
         base = torch.randn((256, 1024), device=DEV)
         src = base * 3 + 1
@@ -107,7 +107,7 @@ def test_side_stream():
     src = host((1024, 64), pinned=True)
     dst = torch.zeros((1024, 64), device=DEV)
     with torch.cuda.stream(s):
-        e = ce.Engine(tune=False)
+        e = ce.Engine(prior_only=True)
         with e.scope():
             for r in range(0, 1024, 32):
                 e.copy_(dst[r:r + 16], src[r:r + 16])
@@ -123,7 +123,7 @@ def test_side_stream():
 def test_d2d_cast_matches_torch(dt):
     x = torch.randn(10000, device=DEV) * 1000
     out = torch.empty(10000, device=DEV, dtype=dt)
-    ce.Engine(tune=False).copy_(out, x)
+    ce.Engine(prior_only=True).copy_(out, x)
     if dt.is_floating_point:
         torch.testing.assert_close(out, x.to(dt), rtol=0, atol=0)
     else:
@@ -137,7 +137,7 @@ def test_staged_cast_and_quantize(pinned, direction):
     x = (rng.standard_normal((300, 70)) * 5).astype(np.float32)
     fn = ce.Elementwise(scale=8.0, round=True, clamp=(-127, 127))
     want = np.empty(x.shape, np.int8)
-    ce.Engine(tune=False).copy_(want, x, fn=fn)        # host reference (same conversion code)
+    ce.Engine(prior_only=True).copy_(want, x, fn=fn)        # host reference (same conversion code)
     xt = torch.from_numpy(x)
     if direction == "h2d":
         src = xt.pin_memory() if pinned else xt
@@ -147,7 +147,7 @@ def test_staged_cast_and_quantize(pinned, direction):
         dst = torch.zeros(x.shape, dtype=torch.int8)
         dst = dst.pin_memory() if pinned else dst
     sel = (slice(None, None, 3), slice(5, 60))
-    ce.Engine(tune=False, staging_budget_mb=1).copy_(dst[sel], src[sel], fn=fn)
+    ce.Engine(prior_only=True, staging_budget_mb=1).copy_(dst[sel], src[sel], fn=fn)
     got = dst.cpu().numpy()
     np.testing.assert_array_equal(got[sel], want[sel])
     assert not got[1].any()
@@ -159,16 +159,16 @@ def test_host_and_device_conversions_agree():
                         [0.0, -0.0, np.inf, -np.inf, 65504.0, 65520.0, 1e-8]]).astype(np.float32)
     for dt, tdt in [("float16", torch.float16), ("bfloat16", torch.bfloat16)]:
         dev_out = torch.empty(x.size, device=DEV, dtype=tdt)
-        ce.Engine(tune=False).copy_(dev_out, torch.from_numpy(x).to(DEV))
+        ce.Engine(prior_only=True).copy_(dev_out, torch.from_numpy(x).to(DEV))
         host_out = torch.empty(x.size, dtype=tdt)
-        ce.Engine(tune=False).copy_(host_out, torch.from_numpy(x))
+        ce.Engine(prior_only=True).copy_(host_out, torch.from_numpy(x))
         assert torch.equal(dev_out.cpu().view(torch.int16), host_out.view(torch.int16)), dt
 
 
 def test_large_staged_copy_is_chunked():
     x = torch.randn(3 << 20)                          # 12 MB > 1 MB staging
     out = torch.empty(3 << 20, device=DEV, dtype=torch.float16)
-    e = ce.Engine(tune=False, staging_budget_mb=1)
+    e = ce.Engine(prior_only=True, staging_budget_mb=1)
     e.copy_(out, x)
     torch.testing.assert_close(out.cpu(), x.half(), rtol=0, atol=0)
     assert e.stats()["last"]["strategies"] == ["staged"]
@@ -180,7 +180,7 @@ def test_large_staged_copy_is_chunked():
 def test_freeze_replay_cuda():
     src = host((32, 256), pinned=True)
     dst = torch.zeros((32, 256), device=DEV)
-    e = ce.Engine(tune=False)
+    e = ce.Engine(prior_only=True)
     with e.scope():
         for i in range(32):
             e.copy_(dst[31 - i], src[i])
@@ -194,7 +194,7 @@ def test_freeze_replay_cuda():
 def test_cuda_scatter_rejects_duplicates():
     dst = torch.zeros((8, 4), device=DEV)
     with pytest.raises(ce.UnsafeCopy):
-        ce.Engine(tune=False).scatter_(dst, [1, 1], torch.ones((2, 4), device=DEV))
+        ce.Engine(prior_only=True).scatter_(dst, [1, 1], torch.ones((2, 4), device=DEV))
 
 
 def test_mixed_host_and_cuda_waves():
@@ -202,7 +202,7 @@ def test_mixed_host_and_cuda_waves():
     src = torch.randn((4096,), device=DEV)
     mid = torch.zeros((4096,)).pin_memory()
     out = np.zeros(4096, np.float32)
-    e = ce.Engine(tune=False)
+    e = ce.Engine(prior_only=True)
     with e.scope():
         e.copy_(mid, src)
         e.copy_(out, mid.numpy())
@@ -232,7 +232,7 @@ def test_pageable_fragments_use_bounce(direction):
 
 
 def test_stats_report_admission():
-    st = ce.Engine(tune=False).stats()
+    st = ce.Engine(prior_only=True).stats()
     dev0 = st["cuda"][0]
     assert dev0["kernels"] is True and dev0["batch"] is True
 
@@ -244,7 +244,7 @@ def test_dense_permute_h2d_moves_once_and_permutes_on_device(pinned, dtype):
     x = x.pin_memory() if pinned else x
     for src in (x.permute(1, 0, 2), x.transpose(1, 2)):      # 256-byte rows, then 2-4 byte elements
         dst = torch.empty(src.shape, dtype=dtype, device=DEV)
-        e = ce.Engine(tune=False)
+        e = ce.Engine(prior_only=True)
         e.copy_(dst, src)
         torch.testing.assert_close(dst.cpu(), src.contiguous(), rtol=0, atol=0)
         # 256-byte rows go through staging + chunk kernel; single elements through the fused kernel
@@ -256,7 +256,7 @@ def test_dense_permute_d2h_with_cast():
     x = torch.randn(32, 16, 64, device=DEV)
     src = x.permute(2, 0, 1)
     dst = torch.empty(src.shape, dtype=torch.float16)
-    e = ce.Engine(tune=False)
+    e = ce.Engine(prior_only=True)
     e.copy_(dst, src)
     torch.testing.assert_close(dst, src.cpu().half(), rtol=0, atol=0)
 
@@ -264,7 +264,7 @@ def test_dense_permute_d2h_with_cast():
 def test_gap_filling_stays_correct():
     src = torch.randn(4096)
     dst = torch.full((4096,), -1.0, device=DEV)
-    e = ce.Engine(tune=False)
+    e = ce.Engine(prior_only=True)
     with e.scope():
         for i in range(0, 4096, 64):                      # every other 128-byte block
             e.copy_(dst[i:i + 32], src[i:i + 32])
@@ -292,7 +292,7 @@ def test_broadcast_and_element_transpose_kernels():
     # element-level transpose on device with a cast
     x = torch.randn(33, 65, device=DEV)
     out = torch.empty(65, 33, device=DEV, dtype=torch.bfloat16)
-    ce.Engine(tune=False).copy_(out, x.t())
+    ce.Engine(prior_only=True).copy_(out, x.t())
     torch.testing.assert_close(out, x.t().bfloat16(), rtol=0, atol=0)
 
 
@@ -320,7 +320,7 @@ def test_fused_qscale_mixed_head_counts():
 
     e, seen = explore(body, check=check)
     assert "fused" in seen
-    e2 = ce.Engine(tune=False)
+    e2 = ce.Engine(prior_only=True)
     body(e2)
     check()
     st = e2.stats()["last"]
@@ -332,7 +332,7 @@ def test_fused_d2h_dense_and_h2d_flip_with_fn(pinned):
     x = torch.randn(40, 24, device=DEV)
     out = torch.empty(24, 40, dtype=torch.float16)
     out = out.pin_memory() if pinned else out
-    e = ce.Engine(tune=False)
+    e = ce.Engine(prior_only=True)
     e.copy_(out, x.t())                                  # D2H, element transpose + cast
     assert e.stats()["last"]["strategies"] == ["fused"]
     torch.testing.assert_close(out, x.t().cpu().half(), rtol=0, atol=0)
@@ -343,14 +343,14 @@ def test_fused_d2h_dense_and_h2d_flip_with_fn(pinned):
     fn = ce.Elementwise(scale=20.0, round=True, clamp=(-127, 127))
     e.copy_(q, h.t().flip(0), fn=fn)                     # H2D, negative stride + quantize
     want = torch.empty(40, 24, dtype=torch.int8)
-    ce.Engine(tune=False).copy_(want, h.t().flip(0), fn=fn)
+    ce.Engine(prior_only=True).copy_(want, h.t().flip(0), fn=fn)
     assert torch.equal(q.cpu(), want)
 
 
 def test_fused_d2d_broadcast_and_strided_dst():
     src = torch.randn(64, 1, device=DEV)
     dst = torch.full((64, 32), -1.0, device=DEV)
-    e = ce.Engine(tune=False)
+    e = ce.Engine(prior_only=True)
     e.copy_(dst[:, ::2], src.expand(64, 16))             # strided destination keeps its holes
     assert e.stats()["last"]["strategies"] == ["fused"]
     want = torch.full((64, 32), -1.0, device=DEV)
@@ -361,9 +361,36 @@ def test_fused_d2d_broadcast_and_strided_dst():
 def test_d2h_with_holes_does_not_use_fused():
     src = torch.randn(64, 16, device=DEV)
     dst = torch.full((64, 32), -1.0)
-    e = ce.Engine(tune=False)
+    e = ce.Engine(prior_only=True)
     e.copy_(dst[:, ::2], src)                            # host gaps must survive
     assert "fused" not in e.stats()["last"]["strategies"]
     want = torch.full((64, 32), -1.0)
     want[:, ::2] = src.cpu()
     torch.testing.assert_close(dst, want, rtol=0, atol=0)
+
+
+# The native baseline is offered only where torch's copy_ gives ce's exact bits.
+_SRC = [torch.int8, torch.uint8, torch.int16, torch.int32, torch.int64,
+        torch.float16, torch.bfloat16, torch.float32, torch.float64]
+_DST = [torch.float16, torch.bfloat16, torch.float32, torch.float64]
+
+
+@pytest.mark.parametrize("sdt", _SRC)
+@pytest.mark.parametrize("ddt", _DST)
+def test_native_eligible_casts_match_torch_bits(sdt, ddt):
+    g = torch.Generator().manual_seed(0)
+    if sdt.is_floating_point:
+        x = torch.randn(1 << 14, generator=g, dtype=torch.float64) * 10.0 ** torch.randint(-12, 12, (1 << 14,), generator=g)
+        x = torch.cat([x, torch.tensor([0.0, -0.0, float("inf"), -float("inf"), float("nan"), 65504.0, 65520.0, 3e38, 1e-40])])
+    else:
+        info = torch.iinfo(sdt)
+        x = torch.randint(info.min, info.max, (1 << 14,), generator=g, dtype=torch.int64)
+        x = torch.cat([x, torch.tensor([info.min, info.max, 0, 2049, 16777217, 2 ** 24 + 1])
+                       .clamp(info.min, info.max)])
+    src = x.to(sdt).to(DEV)
+    want = torch.empty(src.shape, dtype=ddt, device=DEV).copy_(src)
+    got = torch.empty_like(want)
+    ce.Engine(prior_only=True).copy_(got, src)
+    bits = {2: torch.int16, 4: torch.int32, 8: torch.int64}[want.element_size()]
+    assert torch.equal(got.view(bits), want.view(bits)) or torch.equal(got.isnan(), want.isnan()) and \
+        torch.equal(got.view(bits)[~want.isnan()], want.view(bits)[~want.isnan()])

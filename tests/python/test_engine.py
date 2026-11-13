@@ -1,4 +1,5 @@
 import json
+import time
 
 import numpy as np
 import pytest
@@ -7,7 +8,7 @@ import copyengine as ce
 
 
 def engine(**kw):
-    kw.setdefault("tune", False)
+    kw.setdefault("prior_only", True)
     return ce.Engine(**kw)
 
 
@@ -241,8 +242,8 @@ def test_disable_runs_passthrough():
 def test_tuner_locks_and_profile_round_trip():
     src = np.arange(1 << 20, dtype=np.float32)
     dst = np.zeros_like(src)
-    e = ce.Engine(tune=True, tune_trials=2)
-    for _ in range(10):
+    e = ce.Engine(tune_trials=2, ab_pairs=4, ab_max_pairs=8)
+    for _ in range(40):  # explore runs_parallel, then A/B it against the dominance-safe merge
         with e.scope():
             for i in range(16):
                 e.segments(src, dst, [i * 65536], [i * 65536], [65536])
@@ -250,7 +251,7 @@ def test_tuner_locks_and_profile_round_trip():
     assert prof["hardware"] == ce.hardware_fingerprint()
     locked = [b["locked"] for b in prof["buckets"].values()]
     assert locked and all(locked)
-    e2 = ce.Engine(tune=True)
+    e2 = ce.Engine()
     e2.load_profile(e.dump_profile())
     assert json.loads(e2.dump_profile())["buckets"] == prof["buckets"]
     prof["hardware"] = "elsewhere"
@@ -323,3 +324,88 @@ def test_lazy_views_compose():
     dst = np.zeros((10, 3, 4), np.float32)
     engine().copy_(ce.lazy(dst).index_select(0, [2, 5]).transpose(1, 2), cache[:2])
     np.testing.assert_array_equal(dst[[2, 5]].transpose(0, 2, 1), cache[:2])
+
+
+# ---- native baseline -------------------------------------------------------------------
+
+
+def test_slow_native_baseline_loses_to_ce():
+    src = np.arange(1 << 16, dtype=np.float32)
+    dst = np.zeros_like(src)
+    e = ce.Engine(tune_trials=1, ab_pairs=8, ab_max_pairs=16)
+
+    def slow(d, s):
+        time.sleep(0.002)
+        np.copyto(d, s)
+
+    e._native = slow
+    for _ in range(60):
+        e.copy_(dst, src)
+    assert e.stats()["last"]["strategies"] != ["native"]
+    assert e.stats()["native_ops"] == 0
+    np.testing.assert_array_equal(dst, src)
+
+
+def test_fast_native_baseline_wins_and_runs_at_interception():
+    src = np.arange(1 << 22, dtype=np.float32)
+    dst = np.zeros_like(src)
+    calls = []
+    e = ce.Engine(tune_trials=1, ab_pairs=8, ab_max_pairs=16)
+    e._native = lambda d, s: calls.append(1)  # free, so it must win
+    for _ in range(60):
+        e.copy_(dst, src)
+    st = e.stats()
+    assert st["native_ops"] > 0  # locked native: later lone copies skip the queue entirely
+    n = len(calls)
+    e.copy_(dst, src)
+    assert len(calls) == n + 1 and e.stats()["native_ops"] == st["native_ops"] + 1
+
+
+def test_disable_runs_natively_in_program_order():
+    a = np.arange(64, dtype=np.float32)
+    b = np.zeros(64, np.float32)
+    c = np.zeros(64, np.float32)
+    e = ce.Engine(disable=True)
+    with e.scope():
+        e.segments(a, b, [0], [0], [64])  # no native form: queued
+        e.copy_(c, b)                     # native now: must see the queued write to b first
+        e.copy_(a, c[::-1].copy())        # native, overwrites what the queued copy reads
+    np.testing.assert_array_equal(b, np.arange(64, dtype=np.float32))
+    np.testing.assert_array_equal(c, np.arange(64, dtype=np.float32))
+    assert e.stats()["native_ops"] == 2
+
+
+def test_explore_off_takes_baseline_and_records_uncovered_buckets():
+    src = np.arange(4096, dtype=np.float32).reshape(64, 64)
+    dst = np.zeros((64, 64), np.float32)
+    e = ce.Engine(explore=False)
+    e.copy_(dst, src.T)
+    np.testing.assert_array_equal(dst, src.T)
+    assert e.stats()["native_ops"] == 0 and e.stats()["last"]["strategies"] == ["native"]
+    prof = json.loads(e.dump_profile())
+    assert prof["uncovered"] and not prof["buckets"]
+    e2 = ce.Engine()
+    e2.load_profile(e.dump_profile())
+    assert json.loads(e2.dump_profile())["uncovered"] == prof["uncovered"]
+
+
+def test_fence_flushes_only_conflicting_queued_copies():
+    src = np.arange(256, dtype=np.float32)
+    dst = np.zeros(256, np.float32)
+    other = np.zeros(16, np.float32)
+    e = engine()
+
+    def rng(x):
+        p = x.__array_interface__["data"][0]
+        return ("host", 0, p, p + x.nbytes)
+
+    with e.scope():
+        e.copy_(dst, src)
+        e._e.fence([rng(other)], [rng(other)])
+        assert e._e.queued == 1
+        e._e.fence([rng(dst)], [])  # reads what the queue writes
+        assert e._e.queued == 0
+        np.testing.assert_array_equal(dst, src)
+        e.copy_(dst, src)
+        e._e.fence([], [rng(src)])  # overwrites what the queue reads
+        assert e._e.queued == 0

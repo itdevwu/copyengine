@@ -71,7 +71,7 @@ typedef struct ce_elementwise {
 typedef struct ce_engine_options {
   uint32_t struct_size; /* sizeof(ce_engine_options), for forward compatibility */
   int64_t staging_budget;
-  int32_t tune, tune_trials, tune_topk;
+  int32_t tune, tune_trials, tune_topk; /* tune: explore (measure against the baseline; 0 = loaded profile only) */
   int32_t allow_async, disable, log_plan;
   int32_t host_threads;
 } ce_engine_options;

@@ -22,6 +22,13 @@ class Executor {
   virtual void sync(std::span<const uintptr_t> streams) = 0;
   // Whether run() may return before the copy is complete.
   virtual bool async() const = 0;
+  // Timing without blocking: mark() records a point on `stream` of `device`'s
+  // queue (-1: nothing to time, the backend is synchronous); elapsed() is the
+  // microseconds between two marks once both have completed, else -1. Marks
+  // are released by elapsed() returning a value, or by release().
+  virtual int64_t mark(uintptr_t /*stream*/, int /*device*/) { return -1; }
+  virtual double elapsed(int64_t /*a*/, int64_t /*b*/) { return 0; }
+  virtual void release(int64_t /*m*/) {}
   // Admission results etc. for stats().
   virtual Json info() { return Json(true); }
 };

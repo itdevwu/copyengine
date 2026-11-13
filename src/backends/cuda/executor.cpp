@@ -143,6 +143,13 @@ class CudaExecutor final : public Executor {
   }
 
   ~CudaExecutor() override {
+    for (Mark& m : marks_) {
+      if (!m.ev) continue;
+      d_->cuCtxPushCurrent(devs_[m.dev].ctx);
+      d_->cuEventDestroy(m.ev);
+      CUcontext dummy{};
+      d_->cuCtxPopCurrent(&dummy);
+    }
     for (size_t i = 0; i < devs_.size(); ++i) {
       Dev& s = devs_[i];
       if (!s.init) continue;
@@ -244,6 +251,45 @@ class CudaExecutor final : public Executor {
   }
 
   bool async() const override { return true; }
+
+  int64_t mark(uintptr_t stream, int device) override {
+    Dev& s = state(device);
+    Push push(*d_, s.ctx);
+    int64_t id;
+    if (!free_marks_.empty()) {
+      id = free_marks_.back();
+      free_marks_.pop_back();
+    } else {
+      id = static_cast<int64_t>(marks_.size());
+      marks_.push_back({});
+    }
+    Mark& m = marks_[id];
+    if (!m.ev || m.dev != device) {
+      if (m.ev) d_->cuEventDestroy(m.ev);
+      m.ev = nullptr;
+      check(d_->cuEventCreate(&m.ev, CU_EVENT_DEFAULT), "cuEventCreate");
+      m.dev = device;
+    }
+    check(d_->cuEventRecord(m.ev, reinterpret_cast<CUstream>(stream)), "cuEventRecord");
+    return id;
+  }
+
+  double elapsed(int64_t a, int64_t b) override {
+    if (a < 0 || b < 0) return 0;
+    Push push(*d_, devs_[marks_[b].dev].ctx);
+    const CUresult q = d_->cuEventQuery(marks_[b].ev);
+    if (q == CUDA_ERROR_NOT_READY) return -1;
+    check(q, "cuEventQuery");
+    float ms = 0;
+    check(d_->cuEventElapsedTime(&ms, marks_[a].ev, marks_[b].ev), "cuEventElapsedTime");
+    release(a);
+    release(b);
+    return static_cast<double>(ms) * 1000.0;
+  }
+
+  void release(int64_t m) override {
+    if (m >= 0) free_marks_.push_back(m);
+  }
 
   Json info() override {
     Json devs = Json::array();
@@ -960,6 +1006,13 @@ class CudaExecutor final : public Executor {
     }
     return calls;
   }
+
+  struct Mark {
+    CUevent ev = nullptr;
+    int dev = -1;
+  };
+  std::vector<Mark> marks_;
+  std::vector<int64_t> free_marks_;
 
   EngineOptions opt_;
   const Driver* d_ = nullptr;

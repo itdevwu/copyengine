@@ -29,6 +29,30 @@ from ._tensor import (
 Elementwise = _core.Elementwise
 _IDENTITY = _core.Elementwise()
 
+if torch is not None:
+    _FLOATS = (torch.float16, torch.bfloat16, torch.float32, torch.float64)
+
+
+def _same_bits(dst, src, fn) -> bool:
+    """Whether the framework's own copy gives the same bits as ce.
+
+    The engine then measures that copy as the baseline and runs it when ce is not
+    significantly faster.
+    """
+    if fn is not None and fn is not _IDENTITY:
+        return False
+    if is_tensor(dst) and is_tensor(src):
+        return dst.dtype == src.dtype or (dst.dtype in _FLOATS and src.dtype != torch.bool)
+    return isinstance(dst, np.ndarray) and isinstance(src, np.ndarray) and dst.dtype == src.dtype
+
+
+def native_copy(dst, src) -> None:
+    """The framework's own copy: the baseline ce must beat."""
+    if is_tensor(dst):
+        dst.copy_(src, non_blocking=True)
+    else:
+        np.copyto(dst, src)
+
 
 class Engine:
     """A lazy copy queue.
@@ -43,19 +67,27 @@ class Engine:
     until the scope exits (or :meth:`barrier` is called).
     """
 
-    def __init__(self, *, staging_budget_mb: int = 256, tune: bool = True, tune_trials: int = 3,
-                 tune_topk: int = 3, allow_async: bool = False, host_threads: int = 0,
-                 disable: bool = False):
+    def __init__(self, *, staging_budget_mb: int = 256, explore: bool = True, tune_trials: int = 3,
+                 tune_topk: int = 3, ab_pairs: int = 20, ab_max_pairs: int = 50, allow_async: bool = False,
+                 host_threads: int = 0, disable: bool = False, prior_only: bool = False):
+        """``explore=False`` uses only a loaded profile (uncovered buckets take the
+        baseline). ``prior_only`` is for tests: always the prior's first strategy,
+        no measurement and no no-regression guarantee."""
         o = _core.EngineOptions()
         o.staging_budget = int(staging_budget_mb) << 20
-        o.tune = tune
+        o.explore = explore
+        o.prior_only = prior_only
         o.tune_trials = tune_trials
         o.tune_topk = tune_topk
+        o.ab_pairs = ab_pairs
+        o.ab_max_pairs = ab_max_pairs
         o.allow_async = allow_async
         o.host_threads = host_threads
         o.disable = disable
         self._opts = _core.EngineOptions.from_env(o)  # CE_* environment variables win
         self._e = _core.Engine(self._opts)
+        self._e.set_native(True)
+        self._native = native_copy  # replaceable in tests
         self._held: list[Any] = []
         self._lock = threading.RLock()
 
@@ -100,14 +132,16 @@ class Engine:
             sep, ss, sst, soff, scuda = torch_parts(src)
             stream = raw_stream(dst if dcuda else src) if (dcuda or scuda) else 0
             with self._lock:
-                self._e.copy_strided(sep, dep, ss, sst, soff, ds, dst_, doff, fn or _IDENTITY, stream)
+                self._e.copy_strided(sep, dep, ss, sst, soff, ds, dst_, doff, fn or _IDENTITY, stream,
+                                     (self._native, dst, src) if _same_bits(dst, src, fn) else None)
                 self._after(src, dst)
             return dst
         d, s = view(dst, writable=True), view(src)
         sacc = broadcast_to(s.access, list(d.access.shape))
         stmt = _core.Stmt(d.access, sacc)
         with self._lock:
-            self._e.copy_stmt(s.endpoint, d.endpoint, stmt, fn or _IDENTITY, ctx=ctx, stream=current_stream(d, s))
+            self._e.copy_stmt(s.endpoint, d.endpoint, stmt, fn or _IDENTITY, ctx=ctx, stream=current_stream(d, s),
+                              native=(self._native, dst, src) if _same_bits(dst, src, fn) else None)
             self._after(s.obj, d.obj)
         return dst
 

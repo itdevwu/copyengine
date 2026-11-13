@@ -36,7 +36,7 @@ EngineOptions EngineOptions::from_env(EngineOptions o) {
   if (truthy(env("CE_DISABLE"))) o.disable = true;
   if (env("CE_LOG").find("plan") != std::string::npos) o.log_plan = true;
   if (auto v = env("CE_STAGING_MB"); !v.empty()) o.staging_budget = std::stoll(v) << 20;
-  if (auto v = env("CE_TUNE"); !v.empty()) o.tune = truthy(v);
+  if (auto v = env("CE_EXPLORE"); !v.empty()) o.explore = truthy(v);
   if (truthy(env("CE_SYNC"))) o.sync_always = true;
   return o;
 }
@@ -55,6 +55,46 @@ struct Ran {
 
 using Clock = std::chrono::steady_clock;
 
+double us_since(Clock::time_point t0) { return std::chrono::duration<double, std::micro>(Clock::now() - t0).count(); }
+
+int lg2(int64_t x) { return x > 0 ? 63 - std::countl_zero(static_cast<uint64_t>(x)) : -1; }
+
+// An allocation touched by queued work.
+struct Alloc {
+  Device device;
+  int64_t lo, hi;
+};
+
+bool overlaps(const std::vector<Alloc>& set, Device d, int64_t lo, int64_t hi) {
+  for (const Alloc& a : set)
+    if (a.device == d && a.lo < hi && lo < a.hi) return true;
+  return false;
+}
+
+void add_alloc(std::vector<Alloc>& set, Device d, int64_t lo, int64_t hi) {
+  for (Alloc& a : set)
+    if (a.device == d && a.lo <= hi && lo <= a.hi) {  // overlapping or touching: widen
+      a.lo = std::min(a.lo, lo), a.hi = std::max(a.hi, hi);
+      return;
+    }
+  set.push_back({d, lo, hi});
+}
+
+// What interception has learned about one op class.
+struct KeyStat {
+  int64_t seen = 0, merged = 0;  // ops flushed; of those, in a group with others
+  int single = -1;               // a lone op's locked choice: -1 unknown, 0 ce, 1 native
+};
+
+// A timed run whose GPU part is still in flight.
+struct PendingSample {
+  std::string bucket;
+  Strategy strategy;
+  double host;
+  int64_t a, b;
+  Executor* ex;
+};
+
 }  // namespace
 
 struct Engine::Impl {
@@ -66,6 +106,11 @@ struct Engine::Impl {
   std::unordered_map<Hash128, std::shared_ptr<const Plan>, Hash128Hasher> plans;
   std::unordered_set<Hash128, Hash128Hasher> safe;
   Tuner tuner;
+  std::shared_ptr<NativeRunner> native;
+  std::unordered_map<Hash128, KeyStat, Hash128Hasher> keys;
+  std::vector<Alloc> q_reads, q_writes;  // allocations the queue reads / writes
+  std::vector<PendingSample> samples;
+  int64_t native_ops = 0;  // ops run natively at interception
   HostExecutor host;
   std::unique_ptr<Executor> cuda;
   std::string cuda_error;
@@ -80,7 +125,7 @@ struct Engine::Impl {
 
   explicit Impl(EngineOptions o)
       : opt(o),
-        tuner(o.tune ? o.tune_trials : 0, o.tune_topk),
+        tuner(TunerConfig{o.explore, o.prior_only, o.tune_trials, o.tune_topk, o.ab_pairs, o.ab_max_pairs}),
         host(o.host_threads > 0 ? o.host_threads
                                 : static_cast<int>(std::min(8u, std::max(1u, std::thread::hardware_concurrency())))) {
 #if CE_WITH_CUDA
@@ -126,6 +171,8 @@ struct Engine::Impl {
     op.ctx = hints.ctx;
     op.src_lo = static_cast<int64_t>(src.base);
     op.src_hi = static_cast<int64_t>(src.base) + src.nbytes;
+    op.dst_lo = static_cast<int64_t>(dst.base);
+    op.dst_hi = static_cast<int64_t>(dst.base) + dst.nbytes;
     // Absolute element indices. Pure copies become bytes so any dtypes merge.
     const bool pure = fn.identity() && src.dtype == dst.dtype;
     const i64 scale = pure ? ssz : 1;
@@ -143,6 +190,12 @@ struct Engine::Impl {
     exec_for(op.src, op.dst);  // fail early when the platform is missing
     op.form = std::move(form);
     op.fp = fingerprint(op);
+    Hasher kh;
+    kh.add(fingerprint_sides(op));
+    kh.add(static_cast<uint64_t>(lg2(op.runs().total() * static_cast<int64_t>(itemsize(op.src.dtype)))));
+    kh.add(static_cast<uint64_t>(lg2(static_cast<int64_t>(op.runs().size()))));
+    kh.add(uint64_t{op.form != nullptr});
+    op.key = kh.done();
     if (!safe.count(op.fp)) {
       check_safe(op);
       if (static_cast<int>(safe.size()) >= opt.plan_cache * 4) safe.clear();
@@ -170,10 +223,62 @@ struct Engine::Impl {
     return std::make_shared<const Form>(f);
   }
 
+  // Adjacent to the queue's last op on both allocations: merging it is a
+  // dominance-safe transform, so it always queues.
+  bool merges_with_tail(const Op& op) const {
+    if (queue.empty()) return false;
+    const Op& t = queue.back();
+    if (!(t.src == op.src && t.dst == op.dst && t.fn == op.fn && t.ctx == op.ctx && t.src_lo == op.src_lo &&
+          t.dst_lo == op.dst_lo))
+      return false;
+    const Runs &a = t.runs(), &b = op.runs();
+    return a.dst.back() + a.len.back() == b.dst.front() || a.src.back() + a.len.back() == b.src.front();
+  }
+
+  // Interception-time decision: run natively now instead of queueing. Only
+  // for an op class whose lone ops were measured slower in ce and that rarely
+  // merges (so its first op is not the head of a mergeable run).
+  bool native_now(const Op& op) const {
+    if (!op.native || !native || opt.prior_only) return false;
+    if (opt.disable) return true;
+    if (merges_with_tail(op)) return false;
+    auto it = keys.find(op.key);
+    if (it == keys.end() || it->second.single != 1) return false;
+    return depth == 0 || (it->second.seen >= 16 && it->second.merged * 10 < it->second.seen);
+  }
+
+  bool conflicts(Device sd, int64_t slo, int64_t shi, Device dd, int64_t dlo, int64_t dhi) const {
+    return overlaps(q_writes, sd, slo, shi) || overlaps(q_writes, dd, dlo, dhi) || overlaps(q_reads, dd, dlo, dhi);
+  }
+
+  void note_pending(const Side& s, const Side& d, uintptr_t strm) {
+    if (s.device.kind == DeviceKind::host && d.device.kind == DeviceKind::host) return;
+    if (std::find(cuda_streams.begin(), cuda_streams.end(), strm) == cuda_streams.end()) cuda_streams.push_back(strm);
+    if (s.device.kind == DeviceKind::host || d.device.kind == DeviceKind::host) host_pending = true;
+  }
+
+  void run_native_now(const Op& op, uintptr_t strm) {
+    if (!queue.empty() && (strm != stream || conflicts(op.src.device, op.src_lo, op.src_hi, op.dst.device, op.dst_lo,
+                                                      op.dst_hi)))
+      flush();
+    const bool host_only = op.src.device.kind == DeviceKind::host && op.dst.device.kind == DeviceKind::host;
+    if (host_only && host_pending) synchronize();  // host work may touch what CUDA work still uses
+    native->run(op.native, strm);
+    note_pending(op.src, op.dst, strm);
+    ++native_ops;
+    if (depth == 0) finish();
+  }
+
   void push(Op op, uintptr_t strm) {
     if (op.runs().empty()) return;
+    if (native_now(op)) {
+      run_native_now(op, strm);
+      return;
+    }
     if (!queue.empty() && strm != stream) flush();
     stream = strm;
+    add_alloc(q_reads, op.src.device, op.src_lo, op.src_hi);
+    add_alloc(q_writes, op.dst.device, op.dst_lo, op.dst_hi);
     queue.push_back(std::move(op));
     if (depth == 0) {
       flush();
@@ -182,8 +287,26 @@ struct Engine::Impl {
   }
 
   void enqueue(const Endpoint& src, const Endpoint& dst, Runs runs, const Elementwise& fn, const Hints& hints,
-               uintptr_t strm) {
-    push(make_op(src, dst, std::move(runs), fn, hints), strm);
+               uintptr_t strm, Clock::time_point t0) {
+    Op op = make_op(src, dst, std::move(runs), fn, hints);
+    op.native = hints.native;
+    op.enqueue_us = us_since(t0);
+    push(std::move(op), strm);
+  }
+
+  void fence(std::span<const Range> reads, std::span<const Range> writes) {
+    if (queue.empty()) return;
+    bool hit = false, host_side = false;
+    for (const Range& r : reads)
+      if (overlaps(q_writes, r.device, static_cast<int64_t>(r.lo), static_cast<int64_t>(r.hi)))
+        hit = true, host_side |= r.device.kind == DeviceKind::host;
+    for (const Range& r : writes)
+      if (overlaps(q_writes, r.device, static_cast<int64_t>(r.lo), static_cast<int64_t>(r.hi)) ||
+          overlaps(q_reads, r.device, static_cast<int64_t>(r.lo), static_cast<int64_t>(r.hi)))
+        hit = true, host_side |= r.device.kind == DeviceKind::host;
+    if (!hit) return;
+    flush();
+    if (host_side) synchronize();  // the CPU is about to touch memory queued CUDA work uses
   }
 
   // Statement cache: an identical copy (same buffers, layouts, tables,
@@ -209,7 +332,7 @@ struct Engine::Impl {
   }
 
   void enqueue_stmt(const Endpoint& src, const Endpoint& dst, const Stmt& stmt, const Elementwise& fn,
-                    const Hints& hints, uintptr_t strm) {
+                    const Hints& hints, uintptr_t strm, Clock::time_point t0) {
     Hasher h;
     add_endpoint(h, src);
     add_endpoint(h, dst);
@@ -226,13 +349,18 @@ struct Engine::Impl {
     h.add(std::span<const i64>(hints.valid_len));
     const Hash128 key = h.done();
     if (auto it = stmt_cache.find(key); it != stmt_cache.end()) {
-      push(it->second, strm);
+      Op op = it->second;
+      op.native = hints.native;
+      op.enqueue_us = us_since(t0);
+      push(std::move(op), strm);
       return;
     }
     std::shared_ptr<const Form> form = hints.has_valid ? nullptr : make_form(src, dst, stmt);
     Op op = make_op(src, dst, lower(stmt), fn, hints, std::move(form));
     if (static_cast<int>(stmt_cache.size()) >= opt.plan_cache * 4) stmt_cache.clear();
     stmt_cache.emplace(key, op);
+    op.native = hints.native;
+    op.enqueue_us = us_since(t0);
     push(std::move(op), strm);
   }
 
@@ -246,21 +374,58 @@ struct Engine::Impl {
     }
   }
 
+  static int device_of(const Group& g) {
+    return g.src.device.kind == DeviceKind::cuda ? g.src.device.index : g.dst.device.index;
+  }
+
+  // Dominance-safe: merged runs that at least halve the call count. On the
+  // host a 2-D block is the same row copies, issued once; on CUDA a 2-D DMA can
+  // be slower than its rows, so only 1-D merges qualify there.
+  static bool dominance_safe(const Group& g) {
+    const bool host_only = g.src.device.kind == DeviceKind::host && g.dst.device.kind == DeviceKind::host;
+    return g.pure() && (host_only || !g.rects.has_2d()) && g.rects.size() * 2 <= g.ops.size();
+  }
+
+  Choice choice_for(const Group& g, const std::vector<Op>& ops) const {
+    Choice c;
+    c.cands = g.candidates;
+    const bool nat = native && std::all_of(g.ops.begin(), g.ops.end(), [&](int k) { return ops[k].native != nullptr; });
+    c.baseline = nat ? Strategy::native : Strategy::passthrough;
+    if (dominance_safe(g)) c.safe = Strategy::runs;
+    return c;
+  }
+
+  // Reports every timed run whose GPU part has finished.
+  void poll_samples() {
+    std::erase_if(samples, [&](const PendingSample& p) {
+      const double gpu = p.ex->elapsed(p.a, p.b);
+      if (gpu < 0) return false;
+      tuner.report(p.bucket, p.strategy, {p.host, gpu});
+      return true;
+    });
+  }
+
   void run_group(const Group& g, Strategy s, const std::vector<Op>& ops, uintptr_t strm, bool measure,
                  FlushStats* st) {
     Executor& ex = exec_for(g.src, g.dst);
     if (&ex == &host && host_pending) synchronize();  // host work may touch what CUDA work still uses
+    const int64_t a = measure ? ex.mark(strm, device_of(g)) : -1;
     const auto t0 = Clock::now();
-    const int64_t calls = ex.run(s, g, ops, strm);
+    int64_t calls = 0;
+    if (s == Strategy::native) {
+      for (int k : g.ops) native->run(ops[k].native, strm);
+      calls = static_cast<int64_t>(g.ops.size());
+    } else {
+      calls = ex.run(s, g, ops, strm);
+    }
     if (measure) {
-      const uintptr_t one[] = {strm};
-      ex.sync(one);
-      tuner.report(g.bucket, s, std::chrono::duration<double>(Clock::now() - t0).count());
+      double host_us = us_since(t0);
+      if (s != Strategy::native)  // ce also paid for submitting the ops; native would not have
+        for (int k : g.ops) host_us += ops[k].enqueue_us;
+      const int64_t b = ex.mark(strm, device_of(g));
+      samples.push_back({g.bucket, s, host_us, a, b, &ex});
     }
-    if (ex.async()) {
-      if (std::find(cuda_streams.begin(), cuda_streams.end(), strm) == cuda_streams.end()) cuda_streams.push_back(strm);
-      if (g.src.device.kind == DeviceKind::host || g.dst.device.kind == DeviceKind::host) host_pending = true;
-    }
+    note_pending(g.src, g.dst, strm);
     if (st) {
       st->calls += calls;
       st->bytes += g.bytes();
@@ -270,8 +435,11 @@ struct Engine::Impl {
 
   void flush() {
     if (queue.empty()) return;
+    poll_samples();
     std::vector<Op> ops;
     ops.swap(queue);
+    q_reads.clear();
+    q_writes.clear();
     Hasher h;
     for (const Op& op : ops) h.add(op.fp.a), h.add(op.fp.b);
     const Hash128 key = h.done();
@@ -296,12 +464,23 @@ struct Engine::Impl {
     st.plan_hit = hit;
     Ran ran{pp, {}};
     ran.strategies.reserve(plan.groups.size());
+    bool any_native = false;
     for (const Group& g : plan.groups) {
-      const Strategy s = opt.disable ? Strategy::passthrough : tuner.pick(g.bucket, g.candidates);
-      const bool measure = !opt.disable && tuner.exploring(g.bucket);
-      run_group(g, s, ops, stream, measure, &st);
-      ran.strategies.push_back(s);
+      const Choice c = choice_for(g, ops);
+      Tuner::Pick p{c.baseline, false};
+      if (!opt.disable) p = tuner.pick(g.bucket, c);
+      run_group(g, p.strategy, ops, stream, p.measure, &st);
+      ran.strategies.push_back(p.strategy);
+      any_native |= p.strategy == Strategy::native;
+      for (int k : g.ops) {
+        KeyStat& ks = keys[ops[k].key];
+        ++ks.seen;
+        ks.merged += g.ops.size() > 1;
+      }
+      if (g.ops.size() == 1 && tuner.locked(g.bucket)) keys[ops[g.ops[0]].key].single = p.strategy == Strategy::native;
     }
+    if (!any_native)  // only a frozen native replay needs the frontend's payloads
+      for (Op& op : ops) op.native.reset();
     last = st;
     ++total_flushes;
     total_ops += st.ops;
@@ -317,6 +496,7 @@ struct Engine::Impl {
     cuda->sync(cuda_streams);
     cuda_streams.clear();
     host_pending = false;
+    poll_samples();
   }
 
   // End of a top-level copy or scope. Device-only work stays queued on the
@@ -338,14 +518,27 @@ Engine::~Engine() {
 
 void Engine::copy(const Endpoint& src, const Endpoint& dst, const Runs& runs, const Elementwise& fn,
                   const Hints& hints, uintptr_t stream) {
+  const auto t0 = Clock::now();
   std::lock_guard lk(impl_->mu);
-  impl_->enqueue(src, dst, runs, fn, hints, stream);
+  impl_->enqueue(src, dst, runs, fn, hints, stream, t0);
 }
 
 void Engine::copy(const Endpoint& src, const Endpoint& dst, const Stmt& stmt, const Elementwise& fn,
                   const Hints& hints, uintptr_t stream) {
+  const auto t0 = Clock::now();
   std::lock_guard lk(impl_->mu);
-  impl_->enqueue_stmt(src, dst, stmt, fn, hints, stream);
+  impl_->enqueue_stmt(src, dst, stmt, fn, hints, stream, t0);
+}
+
+void Engine::set_native(std::shared_ptr<NativeRunner> runner) {
+  std::lock_guard lk(impl_->mu);
+  impl_->flush();  // queued payloads belong to the previous runner
+  impl_->native = std::move(runner);
+}
+
+void Engine::fence(std::span<const Range> reads, std::span<const Range> writes) {
+  std::lock_guard lk(impl_->mu);
+  impl_->fence(reads, writes);
 }
 
 void Engine::begin_scope() {
@@ -409,6 +602,7 @@ std::string Engine::stats_json() const {
       .set("calls", m.total_calls)
       .set("bytes", m.total_bytes)
       .set("plan_hits", m.plan_hits)
+      .set("native_ops", m.native_ops)
       .set("plans", static_cast<uint64_t>(m.plans.size()))
       .set("buckets", static_cast<uint64_t>(m.tuner.size()))
       .set("cuda", m.cuda ? m.cuda->info() : Json(m.cuda_error))
@@ -417,10 +611,12 @@ std::string Engine::stats_json() const {
 
 std::string Engine::dump_profile() const {
   std::lock_guard lk(impl_->mu);
+  Json t = impl_->tuner.dump();
   return Json::object()
-      .set("copyengine_profile", 1)
+      .set("copyengine_profile", 2)
       .set("hardware", hardware_fingerprint())
-      .set("buckets", impl_->tuner.dump())
+      .set("buckets", t["buckets"])
+      .set("uncovered", t["uncovered"])
       .dump();
 }
 
@@ -432,10 +628,12 @@ void Engine::load_profile(const std::string& text) {
     fail(Errc::invalid_argument, std::string("profile: ") + e.what());
   }
   if (j["copyengine_profile"].is_null()) fail(Errc::invalid_argument, "profile: not a copyengine profile");
+  if (!j["copyengine_profile"].is_number() || j["copyengine_profile"].num() != 2)
+    fail(Errc::invalid_argument, "profile: unsupported version (re-run warmup)");
   if (!j["hardware"].is_string() || j["hardware"].str() != hardware_fingerprint())
     fail(Errc::invalid_argument, "profile: recorded on different hardware");
   std::lock_guard lk(impl_->mu);
-  impl_->tuner.load(j["buckets"]);
+  impl_->tuner.load(j);
 }
 
 namespace {

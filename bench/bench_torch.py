@@ -35,9 +35,9 @@ def timeit(fn, reps: int) -> float:
     return statistics.median(ts) * 1e6
 
 
-def tuned_engine(body, rounds: int = 24) -> ce.Engine:
-    """An engine whose buckets for `body` are explored and locked."""
-    e = ce.Engine(tune=True, tune_trials=3, tune_topk=4)
+def tuned_engine(body, rounds: int = 80) -> ce.Engine:
+    """An engine whose buckets for `body` are explored, A/B tested against the baseline and locked."""
+    e = ce.Engine(tune_trials=3, tune_topk=4)
     for _ in range(rounds):
         body(e)
     torch.cuda.synchronize()

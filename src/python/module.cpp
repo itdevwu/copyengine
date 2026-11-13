@@ -1,9 +1,12 @@
+#include <atomic>
+
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/pair.h>
 #include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/string.h>
+#include <nanobind/stl/tuple.h>
 #include <nanobind/stl/vector.h>
 
 #include "copyengine/copyengine.h"
@@ -47,12 +50,45 @@ nb::object to_numpy(std::vector<i64> v) {
   return nb::cast(I64Out(heap->data(), {heap->size()}, owner), nb::rv_policy::move);
 }
 
+// Native baseline implemented in Python. Each payload is a tuple
+// (fn, *args) and runs as fn(*args). The engine holds no Python object of its
+// own, so it never keeps a reference cycle alive that the GC cannot see.
+class PyNative final : public ce::NativeRunner {
+ public:
+  void run(const std::shared_ptr<void>& payload, uintptr_t) override {
+    nb::gil_scoped_acquire gil;
+    PyObject* t = static_cast<PyObject*>(payload.get());
+    nb::object args = nb::steal(PyTuple_GetSlice(t, 1, PyTuple_Size(t)));
+    if (!args.is_valid()) throw nb::python_error();
+    nb::object r = nb::steal(PyObject_Call(PyTuple_GetItem(t, 0), args.ptr(), nullptr));
+    if (!r.is_valid()) throw nb::python_error();
+  }
+};
+
+// Set by Py_AtExit, which runs at the very end of finalization. Before that
+// (module teardown included) releasing a reference is still safe, although
+// Py_IsInitialized() already reports false.
+std::atomic<bool> g_python_gone{false};
+
+std::shared_ptr<void> py_payload(nb::handle obj) {
+  if (obj.is_none()) return nullptr;
+  PyObject* p = obj.ptr();
+  Py_INCREF(p);
+  return std::shared_ptr<void>(p, [](void* q) {
+    if (g_python_gone.load()) return;  // the interpreter is gone: nothing to release
+    const PyGILState_STATE g = PyGILState_Ensure();
+    Py_DECREF(static_cast<PyObject*>(q));
+    PyGILState_Release(g);
+  });
+}
+
 }  // namespace
 
 NB_MODULE(_core, m) {
   const std::string_view v = ce::version_string();
   m.attr("__version__") = nb::str(v.data(), v.size());
   m.attr("ABI_VERSION") = ce_abi_version();
+  Py_AtExit([] { g_python_gone.store(true); });
 
   // ---- errors ----
   // Exception types are held as raw pointers for the life of the process: the
@@ -207,10 +243,14 @@ NB_MODULE(_core, m) {
   nb::class_<ce::EngineOptions>(m, "EngineOptions")
       .def(nb::init<>())
       .def_rw("staging_budget", &ce::EngineOptions::staging_budget)
-      .def_rw("tune", &ce::EngineOptions::tune)
+      .def_rw("explore", &ce::EngineOptions::explore)
+      .def_rw("prior_only", &ce::EngineOptions::prior_only)
       .def_rw("tune_trials", &ce::EngineOptions::tune_trials)
       .def_rw("tune_topk", &ce::EngineOptions::tune_topk)
+      .def_rw("ab_pairs", &ce::EngineOptions::ab_pairs)
+      .def_rw("ab_max_pairs", &ce::EngineOptions::ab_max_pairs)
       .def_rw("allow_async", &ce::EngineOptions::allow_async)
+      .def_rw("sync_always", &ce::EngineOptions::sync_always)
       .def_rw("disable", &ce::EngineOptions::disable)
       .def_rw("log_plan", &ce::EngineOptions::log_plan)
       .def_rw("host_threads", &ce::EngineOptions::host_threads)
@@ -254,22 +294,41 @@ NB_MODULE(_core, m) {
       }, "src"_a, "dst"_a, "src_idx"_a, "dst_idx"_a, "fn"_a, "ctx"_a = "", "stream"_a = 0)
       .def("copy_stmt", [make_hints](ce::Engine& e, const ce::Endpoint& src, const ce::Endpoint& dst, const ce::Stmt& stmt,
                                      const ce::Elementwise& fn, nb::handle valid_start, nb::handle valid_len,
-                                     const std::string& ctx, uintptr_t stream) {
+                                     const std::string& ctx, uintptr_t stream, nb::handle native) {
         ce::Hints h = make_hints(valid_start, valid_len, ctx);
+        h.native = py_payload(native);
         nb::gil_scoped_release release;
         e.copy(src, dst, stmt, fn, h, stream);
       }, "src"_a, "dst"_a, "stmt"_a, "fn"_a, "valid_start"_a = nb::none(), "valid_len"_a = nb::none(),
-         "ctx"_a = "", "stream"_a = 0)
+         "ctx"_a = "", "stream"_a = 0, "native"_a = nb::none())
       .def("copy_strided", [](ce::Engine& e, const ce::Endpoint& src, const ce::Endpoint& dst,
                               const std::vector<i64>& s_shape, const std::vector<i64>& s_strides, i64 s_off,
                               const std::vector<i64>& d_shape, const std::vector<i64>& d_strides, i64 d_off,
-                              const ce::Elementwise& fn, uintptr_t stream) {
+                              const ce::Elementwise& fn, uintptr_t stream, nb::handle native) {
         ce::Access da = ce::Access::strided(d_shape, d_strides, d_off);
         ce::Access sa = ce::broadcast_to(ce::Access::strided(s_shape, s_strides, s_off), d_shape);
         ce::Stmt stmt(std::move(da), std::move(sa));
+        ce::Hints h;
+        h.native = py_payload(native);
         nb::gil_scoped_release release;
-        e.copy(src, dst, stmt, fn, {}, stream);
-      })
+        e.copy(src, dst, stmt, fn, h, stream);
+      }, "src"_a, "dst"_a, "s_shape"_a, "s_strides"_a, "s_off"_a, "d_shape"_a, "d_strides"_a, "d_off"_a, "fn"_a,
+         "stream"_a, "native"_a = nb::none())
+      .def("set_native", [](ce::Engine& e, bool on) { e.set_native(on ? std::make_shared<PyNative>() : nullptr); },
+           "enabled"_a)
+      .def("fence", [](ce::Engine& e, const std::vector<std::tuple<std::string, int, uintptr_t, uintptr_t>>& reads,
+                       const std::vector<std::tuple<std::string, int, uintptr_t, uintptr_t>>& writes) {
+        auto conv = [](const auto& v) {
+          std::vector<ce::Range> out;
+          for (auto& [kind, index, lo, hi] : v)
+            out.push_back({kind == "cuda" ? ce::Device{ce::DeviceKind::cuda, index} : ce::Device{ce::DeviceKind::host, 0},
+                           lo, hi});
+          return out;
+        };
+        const auto r = conv(reads), w = conv(writes);
+        nb::gil_scoped_release release;
+        e.fence(r, w);
+      }, "reads"_a, "writes"_a)
       .def("begin_scope", &ce::Engine::begin_scope)
       .def("end_scope", &ce::Engine::end_scope, nb::call_guard<nb::gil_scoped_release>())
       .def("flush", &ce::Engine::flush, nb::call_guard<nb::gil_scoped_release>())

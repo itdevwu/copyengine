@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -62,6 +63,9 @@ struct Hints {
   bool has_valid = false;
   // Bucketing context for the tuner, e.g. "tp=2".
   std::string ctx;
+  // Frontend handle that runs this copy natively (see NativeRunner); null
+  // when the frontend has no equivalent with identical results.
+  std::shared_ptr<void> native;
 };
 
 }  // namespace ce

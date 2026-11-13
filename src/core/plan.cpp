@@ -41,6 +41,19 @@ static void add_side(Hasher& h, const Side& s) {
         (static_cast<uint64_t>(s.dtype) << 1) | (s.pinned ? 1u : 0u));
 }
 
+uint64_t fingerprint_sides(const Op& op) {
+  Hasher h;
+  add_side(h, op.src);
+  add_side(h, op.dst);
+  h.add(std::bit_cast<uint32_t>(op.fn.scale));
+  h.add(std::bit_cast<uint32_t>(op.fn.bias));
+  h.add((op.fn.round ? 1u : 0u) | (op.fn.clamp ? 2u : 0u));
+  h.add(std::bit_cast<uint32_t>(op.fn.lo));
+  h.add(std::bit_cast<uint32_t>(op.fn.hi));
+  h.add(op.ctx);
+  return h.done().a;
+}
+
 Hash128 fingerprint(const Op& op) {
   Hasher h;
   add_side(h, op.src);

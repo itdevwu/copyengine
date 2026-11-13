@@ -72,6 +72,11 @@ struct Op {
   Elementwise fn;
   std::string ctx;
   int64_t src_lo = 0, src_hi = 0;  // the source allocation, absolute bytes: reads may widen within it
+  int64_t dst_lo = 0, dst_hi = 0;  // the destination allocation, absolute bytes
+  Hash128 key;                     // op class for interception-time decisions (sides, fn, size buckets)
+  // per submission, not part of the cached op
+  std::shared_ptr<void> native;    // frontend payload for the native baseline, or null
+  double enqueue_us = 0;           // host time spent submitting it
   std::shared_ptr<const Form> form;  // null when the statement has tables or came in as runs
   Hash128 fp;  // content fingerprint
   // byte-interval read / write sets (absolute addresses), computed lazily
@@ -80,6 +85,8 @@ struct Op {
 };
 
 Hash128 fingerprint(const Op& op);
+// Sides, function and context only: the part of an op's class that is not size.
+uint64_t fingerprint_sides(const Op& op);
 
 // Rejects ops whose result would depend on write order or need memmove.
 void check_safe(const Op& op);

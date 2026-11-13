@@ -82,7 +82,7 @@ void ce_engine_options_default(ce_engine_options* o) {
   const ce::EngineOptions d = ce::EngineOptions::from_env();
   o->struct_size = sizeof(ce_engine_options);
   o->staging_budget = d.staging_budget;
-  o->tune = d.tune, o->tune_trials = d.tune_trials, o->tune_topk = d.tune_topk;
+  o->tune = d.explore, o->tune_trials = d.tune_trials, o->tune_topk = d.tune_topk;
   o->allow_async = d.allow_async, o->disable = d.disable, o->log_plan = d.log_plan;
   o->host_threads = d.host_threads;
 }
@@ -94,7 +94,7 @@ ce_status ce_engine_create(const ce_engine_options* o, ce_engine** out) {
     if (o) {
       if (o->struct_size < sizeof(ce_engine_options)) ce::fail(ce::Errc::invalid_argument, "options struct_size too small");
       opt.staging_budget = o->staging_budget;
-      opt.tune = o->tune, opt.tune_trials = o->tune_trials, opt.tune_topk = o->tune_topk;
+      opt.explore = o->tune != 0, opt.tune_trials = o->tune_trials, opt.tune_topk = o->tune_topk;
       opt.allow_async = o->allow_async, opt.disable = o->disable, opt.log_plan = o->log_plan;
       opt.host_threads = o->host_threads;
     }

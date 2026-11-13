@@ -14,8 +14,14 @@ dependencies, merging across tensors, 2-D structure recovery), and issued with
 the strategy measured fastest on this machine: merged DMA, batched DMA
 (`cuMemcpyBatchAsync`), 2-D copies, table-driven copy kernels that also cast and
 scale, dense link copies with the layout change done on the GPU, or pinned
-bounce buffers for pageable memory. The unmerged original is always a candidate,
-so tuning cannot make a copy slower than issuing it as written.
+bounce buffers for pageable memory.
+
+The framework's own copy (torch's `copy_`, numpy's `copyto`) is the baseline.
+Merges that at least halve the number of calls are applied directly; every
+other strategy is measured against the baseline in paired runs, including the
+host time ce spends planning and submitting, and kept only if it is
+significantly faster. Otherwise the baseline runs, and a lone copy whose class
+loses runs natively without entering the queue.
 
 ## Install
 
@@ -80,10 +86,10 @@ C and C++ callers use `include/copyengine/copyengine.h` (stable C ABI) or
 
 | Variable | Effect |
 |---|---|
-| `CE_DISABLE=1` | run every copy exactly as submitted |
+| `CE_DISABLE=1` | run every copy natively (as submitted where there is no native equivalent) |
 | `CE_LOG=plan` | print plans to stderr |
 | `CE_STAGING_MB` | device staging budget (default 256) |
-| `CE_TUNE=0` | use the prior ranking only, never measure |
+| `CE_EXPLORE=0` | never measure: use the loaded profile; buckets it does not cover take the baseline and are listed in the profile for the next warmup |
 | `CE_SYNC=1` | wait for every copy, device-to-device included (debugging) |
 
 Licensed under Apache-2.0.

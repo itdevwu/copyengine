@@ -1,0 +1,33 @@
+[build-system]
+requires = ["scikit-build-core>=0.10", "nanobind>=2.4"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "copyengine"
+dynamic = ["version"]
+description = "A software copy planner for ML infra: batches, fuses and schedules tensor copies."
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[tool.scikit-build]
+minimum-version = "build-system.requires"
+cmake.version = ">=3.26"
+wheel.packages = ["python/copyengine"]
+wheel.py-api = "cp312"
+build-dir = "build/{wheel_tag}"
+
+[tool.scikit-build.cmake.define]
+CE_BUILD_TESTS = "OFF"
+
+[tool.scikit-build.metadata.version]
+provider = "scikit_build_core.metadata.regex"
+input = "CMakeLists.txt"
+regex = 'project\(copyengine VERSION (?P<value>[0-9.]+)'
+
+[tool.pytest.ini_options]
+testpaths = ["tests/python"]

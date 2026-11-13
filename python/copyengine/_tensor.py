@@ -42,7 +42,72 @@ def is_tensor(x) -> bool:
     return torch is not None and isinstance(x, torch.Tensor)
 
 
+class Lazy:
+    """A tensor plus data-movement ops recorded as Access algebra, not executed.
+
+    ``ce.lazy(cache).index_select(0, ids).permute(0, 2, 1, 3)`` describes a view
+    torch cannot express without materializing; the engine copies it in one pass.
+    """
+
+    def __init__(self, base: View, access: _core.Access):
+        self._base, self._access = base, access
+
+    def _with(self, access) -> "Lazy":
+        return Lazy(self._base, access)
+
+    @property
+    def shape(self) -> tuple:
+        return tuple(self._access.shape)
+
+    def permute(self, *dims):
+        dims = dims[0] if len(dims) == 1 and isinstance(dims[0], (list, tuple)) else dims
+        return self._with(self._access.permute(list(dims)))
+
+    def transpose(self, a: int, b: int):
+        p = list(range(len(self.shape)))
+        p[a], p[b] = p[b], p[a]
+        return self.permute(p)
+
+    def index_select(self, dim: int, index):
+        return self._with(self._access.index_select(dim, index_array(index)))
+
+    def slice(self, dim: int, start=None, stop=None, step: int = 1):
+        return self._with(self._access.slice(dim, start, stop, step))
+
+    def select(self, dim: int, index: int):
+        return self._with(self._access.select(dim, index))
+
+    def flip(self, dim: int):
+        return self._with(self._access.flip(dim))
+
+    def unsqueeze(self, dim: int):
+        return self._with(self._access.unsqueeze(dim))
+
+    def expand(self, *shape):
+        shape = shape[0] if len(shape) == 1 and isinstance(shape[0], (list, tuple)) else shape
+        return self._with(broadcast_to(self._access, list(shape)))
+
+    def reshape(self, *shape):
+        shape = shape[0] if len(shape) == 1 and isinstance(shape[0], (list, tuple)) else shape
+        return self._with(self._access.reshape(list(shape)))
+
+    def as_view(self) -> View:
+        b = self._base
+        return View(b.obj, b.endpoint, self._access, b.is_cuda, b.device_index)
+
+
+def lazy(x) -> Lazy:
+    if isinstance(x, Lazy):
+        return x
+    v = view(x)
+    return Lazy(v, v.access)
+
+
 def view(x, *, writable: bool = False) -> View:
+    if isinstance(x, Lazy):
+        if writable and not is_tensor(x._base.obj) and not x._base.obj.flags.writeable:
+            raise ValueError("destination array is read-only")
+        return x.as_view()
     if is_tensor(x):
         return _torch_view(x)
     if isinstance(x, np.ndarray):

@@ -271,3 +271,15 @@ def test_dependent_copies_split_into_waves():
     assert e.stats()["last"]["waves"] == 3
     np.testing.assert_array_equal(c, np.arange(16, dtype=np.float32))
     np.testing.assert_array_equal(a[:8], np.arange(8, 16, dtype=np.float32))
+
+
+def test_lazy_views_compose():
+    cache = np.arange(10 * 4 * 3, dtype=np.float32).reshape(10, 4, 3)
+    ids = [7, 1, 1, 4]
+    src = ce.lazy(cache).index_select(0, ids).permute(0, 2, 1).flip(2)
+    out = np.empty(src.shape, np.float16)
+    engine().copy_(out, src)
+    np.testing.assert_array_equal(out, cache[ids].transpose(0, 2, 1)[:, :, ::-1].astype(np.float16))
+    dst = np.zeros((10, 3, 4), np.float32)
+    engine().copy_(ce.lazy(dst).index_select(0, [2, 5]).transpose(1, 2), cache[:2])
+    np.testing.assert_array_equal(dst[[2, 5]].transpose(0, 2, 1), cache[:2])

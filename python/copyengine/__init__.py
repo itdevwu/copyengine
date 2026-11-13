@@ -5,6 +5,8 @@ import json as _json
 from . import _core
 from ._api import (
     Elementwise,
+    Lazy,
+    lazy,
     Engine,
     FrozenPlan,
     barrier,
@@ -36,7 +38,7 @@ from ._core import (
 __all__ = [
     "ABI_VERSION", "Access", "BackendError", "CopyEngineError", "Elementwise", "Engine", "FrozenPlan",
     "NeedsMaterialize", "Rects", "Runs", "Stmt", "Unsupported", "UnsafeCopy", "__version__", "barrier",
-    "copy_", "default_engine", "gather", "hardware_fingerprint", "indices", "lower", "probe", "scatter_",
+    "copy_", "default_engine", "gather", "hardware_fingerprint", "indices", "lazy", "Lazy", "lower", "probe", "scatter_",
     "scope", "segments", "stats",
 ]
 

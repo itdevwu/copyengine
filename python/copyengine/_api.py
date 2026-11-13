@@ -11,7 +11,9 @@ import numpy as np
 
 from . import _core
 from ._tensor import (
+    Lazy,
     View,
+    lazy,
     broadcast_to,
     current_stream,
     flat_endpoint,

@@ -30,6 +30,11 @@ pip install .                      # needs CMake >= 3.26, a C++20 compiler
                                    # CUDA backend: CUDA toolkit headers + nvcc at build time
 ```
 
+With torch 2.9 or newer importable at build time (`pip install --no-build-isolation .`),
+the explicit copy API is also built as torch custom ops on torch's stable ABI,
+so one binary works with every later torch; without it the same API runs
+through Python.
+
 The CUDA driver is loaded at runtime; nothing links against `libcuda` or
 `cudart`, and one build runs on CUDA 12.x and 13.x drivers.
 

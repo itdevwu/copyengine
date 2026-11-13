@@ -394,3 +394,31 @@ def test_native_eligible_casts_match_torch_bits(sdt, ddt):
     bits = {2: torch.int16, 4: torch.int32, 8: torch.int64}[want.element_size()]
     assert torch.equal(got.view(bits), want.view(bits)) or torch.equal(got.isnan(), want.isnan()) and \
         torch.equal(got.view(bits)[~want.isnan()], want.view(bits)[~want.isnan()])
+
+
+# ---- the stable-ABI torch extension ---------------------------------------------------------
+
+
+def test_torch_ops_translate_errors():
+    if ce._torch_ops.copy_ is None:
+        pytest.skip(ce._torch_ops.error)
+    x = torch.arange(64.0, device=DEV)
+    with pytest.raises(ce.UnsafeCopy):
+        ce.Engine().copy_(x[1:], x[:-1])
+    with pytest.raises(ce.Unsupported):
+        ce.Engine().copy_(torch.zeros(4, dtype=torch.complex64, device=DEV), torch.zeros(4, dtype=torch.complex64, device=DEV))
+
+
+@pytest.mark.parametrize("pinned", [False, True])
+def test_torch_ops_host_tensors_and_python_fallback(pinned, monkeypatch):
+    src = host((256, 64), pinned=pinned)
+    for path in ("ops", "python"):
+        if path == "python":
+            monkeypatch.setattr(ce._torch_ops, "copy_", None)
+        dst = torch.zeros((64, 256), device=DEV)
+        e = ce.Engine(prior_only=True)
+        e.copy_(dst, src.t())
+        torch.testing.assert_close(dst.cpu(), src.t(), rtol=0, atol=0)
+        back = host((256, 64), pinned=pinned, fill=False)
+        e.copy_(back, dst.t(), fn=ce.Elementwise(scale=2.0))
+        torch.testing.assert_close(back, src * 2, rtol=0, atol=0)

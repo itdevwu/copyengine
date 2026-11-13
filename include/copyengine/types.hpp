@@ -56,6 +56,15 @@ struct Elementwise {
   bool operator==(const Elementwise&) const = default;
 };
 
+// One copy as the framework itself would run it (for torch: aten::copy_), the
+// no-regression baseline. Implemented by each frontend.
+class NativeOp {
+ public:
+  virtual ~NativeOp() = default;
+  // Runs the copy on `stream`, ordered like any other work on it.
+  virtual void run(uintptr_t stream) = 0;
+};
+
 struct Hints {
   // Only these source ranges (elements, relative to the source base) hold data;
   // the rest need not be copied. Empty means everything is valid.
@@ -63,9 +72,9 @@ struct Hints {
   bool has_valid = false;
   // Bucketing context for the tuner, e.g. "tp=2".
   std::string ctx;
-  // Frontend handle that runs this copy natively (see NativeRunner); null
-  // when the frontend has no equivalent with identical results.
-  std::shared_ptr<void> native;
+  // The frontend's own implementation of this copy (see NativeOp); null when
+  // the frontend has no equivalent with identical results.
+  std::shared_ptr<NativeOp> native;
 };
 
 }  // namespace ce

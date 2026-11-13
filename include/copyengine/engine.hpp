@@ -60,15 +60,6 @@ struct FlushStats {
 
 class Frozen;
 
-// The frontend's own implementation of a copy (for torch: aten::copy_), used as
-// the no-regression baseline. Each op carries its payload in Hints::native.
-class NativeRunner {
- public:
-  virtual ~NativeRunner() = default;
-  // Runs one op on `stream`, ordered like any other work on it.
-  virtual void run(const std::shared_ptr<void>& payload, uintptr_t stream) = 0;
-};
-
 // A byte range of one allocation, for fence().
 struct Range {
   Device device;
@@ -90,9 +81,6 @@ class Engine {
   // L3 entry: structured statement; offsets relative to the endpoints' bases.
   void copy(const Endpoint& src, const Endpoint& dst, const Stmt& stmt, const Elementwise& fn = {},
             const Hints& hints = {}, uintptr_t stream = 0);
-
-  // Enables the native baseline for ops whose Hints::native is set.
-  void set_native(std::shared_ptr<NativeRunner> runner);
 
   // Before other work reads `reads` and writes `writes` (whole allocations):
   // issues queued copies that conflict with them. Free when nothing is queued.

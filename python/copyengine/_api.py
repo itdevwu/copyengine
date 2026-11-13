@@ -9,7 +9,7 @@ from typing import Any, Iterator, Optional, Sequence
 
 import numpy as np
 
-from . import _core
+from . import _core, _torch_ops
 from ._tensor import (
     Lazy,
     View,
@@ -86,7 +86,7 @@ class Engine:
         o.disable = disable
         self._opts = _core.EngineOptions.from_env(o)  # CE_* environment variables win
         self._e = _core.Engine(self._opts)
-        self._e.set_native(True)
+        self._handle = self._e.handle
         self._native = native_copy  # replaceable in tests
         self._held: list[Any] = []
         self._lock = threading.RLock()
@@ -128,6 +128,19 @@ class Engine:
     def copy_(self, dst, src, *, fn: Optional[Elementwise] = None, ctx: str = "") -> Any:
         """``dst[...] = fn(src)`` for any strided views; ``src`` broadcasts to ``dst``."""
         if not ctx and torch_fast(dst) and torch_fast(src):
+            if _torch_ops.copy_ is not None:  # descriptors and the native baseline in C++
+                with self._lock:
+                    try:
+                        if fn is None or fn is _IDENTITY:
+                            _torch_ops.copy_(dst, src, self._handle)
+                        else:
+                            lo, hi = fn.clamp or (0.0, 0.0)
+                            _torch_ops.copy_fn_(dst, src, self._handle, fn.scale, fn.bias, fn.round,
+                                                fn.clamp is not None, lo, hi)
+                    except RuntimeError as e:
+                        raise _torch_ops.translate(e) from None
+                    self._after(src, dst)
+                return dst
             dep, ds, dst_, doff, dcuda = torch_parts(dst)
             sep, ss, sst, soff, scuda = torch_parts(src)
             stream = raw_stream(dst if dcuda else src) if (dcuda or scuda) else 0

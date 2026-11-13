@@ -46,6 +46,7 @@ namespace ce::cuda {
   X(cuMemcpy2DAsync)            \
   X(cuStreamWaitEvent)          \
   X(cuEventQuery)               \
+  X(cuPointerGetAttribute)      \
   X(cuModuleLoadData)           \
   X(cuModuleGetFunction)        \
   X(cuLaunchKernel)

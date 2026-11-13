@@ -13,6 +13,7 @@
 #include "copyengine/copyengine.hpp"
 #include "copyengine/engine.hpp"
 #include "copyengine/error.hpp"
+#include "copyengine/frontend.hpp"
 #include "copyengine/ir.hpp"
 #include "copyengine/probe.hpp"
 
@@ -50,36 +51,37 @@ nb::object to_numpy(std::vector<i64> v) {
   return nb::cast(I64Out(heap->data(), {heap->size()}, owner), nb::rv_policy::move);
 }
 
-// Native baseline implemented in Python. Each payload is a tuple
-// (fn, *args) and runs as fn(*args). The engine holds no Python object of its
-// own, so it never keeps a reference cycle alive that the GC cannot see.
-class PyNative final : public ce::NativeRunner {
- public:
-  void run(const std::shared_ptr<void>& payload, uintptr_t) override {
-    nb::gil_scoped_acquire gil;
-    PyObject* t = static_cast<PyObject*>(payload.get());
-    nb::object args = nb::steal(PyTuple_GetSlice(t, 1, PyTuple_Size(t)));
-    if (!args.is_valid()) throw nb::python_error();
-    nb::object r = nb::steal(PyObject_Call(PyTuple_GetItem(t, 0), args.ptr(), nullptr));
-    if (!r.is_valid()) throw nb::python_error();
-  }
-};
-
 // Set by Py_AtExit, which runs at the very end of finalization. Before that
 // (module teardown included) releasing a reference is still safe, although
 // Py_IsInitialized() already reports false.
 std::atomic<bool> g_python_gone{false};
 
-std::shared_ptr<void> py_payload(nb::handle obj) {
-  if (obj.is_none()) return nullptr;
-  PyObject* p = obj.ptr();
-  Py_INCREF(p);
-  return std::shared_ptr<void>(p, [](void* q) {
+// Native baseline implemented in Python: a tuple (fn, *args) run as fn(*args).
+// The engine holds the tuple only while the op is queued or frozen.
+class PyNativeOp final : public ce::NativeOp {
+ public:
+  explicit PyNativeOp(PyObject* t) : t_(t) { Py_INCREF(t_); }
+  ~PyNativeOp() override {
     if (g_python_gone.load()) return;  // the interpreter is gone: nothing to release
     const PyGILState_STATE g = PyGILState_Ensure();
-    Py_DECREF(static_cast<PyObject*>(q));
+    Py_DECREF(t_);
     PyGILState_Release(g);
-  });
+  }
+  void run(uintptr_t) override {
+    nb::gil_scoped_acquire gil;
+    nb::object args = nb::steal(PyTuple_GetSlice(t_, 1, PyTuple_Size(t_)));
+    if (!args.is_valid()) throw nb::python_error();
+    nb::object r = nb::steal(PyObject_Call(PyTuple_GetItem(t_, 0), args.ptr(), nullptr));
+    if (!r.is_valid()) throw nb::python_error();
+  }
+
+ private:
+  PyObject* t_;
+};
+
+std::shared_ptr<ce::NativeOp> py_payload(nb::handle obj) {
+  if (obj.is_none()) return nullptr;
+  return std::make_shared<PyNativeOp>(obj.ptr());
 }
 
 }  // namespace
@@ -314,8 +316,7 @@ NB_MODULE(_core, m) {
         e.copy(src, dst, stmt, fn, h, stream);
       }, "src"_a, "dst"_a, "s_shape"_a, "s_strides"_a, "s_off"_a, "d_shape"_a, "d_strides"_a, "d_off"_a, "fn"_a,
          "stream"_a, "native"_a = nb::none())
-      .def("set_native", [](ce::Engine& e, bool on) { e.set_native(on ? std::make_shared<PyNative>() : nullptr); },
-           "enabled"_a)
+      .def_prop_ro("handle", [](ce::Engine& e) { return reinterpret_cast<uintptr_t>(&e); })
       .def("fence", [](ce::Engine& e, const std::vector<std::tuple<std::string, int, uintptr_t, uintptr_t>>& reads,
                        const std::vector<std::tuple<std::string, int, uintptr_t, uintptr_t>>& writes) {
         auto conv = [](const auto& v) {
@@ -341,4 +342,7 @@ NB_MODULE(_core, m) {
       .def("freeze", &ce::Engine::freeze);
 
   m.def("hardware_fingerprint", &ce::hardware_fingerprint);
+  m.def("host_is_pinned", &ce::host_is_pinned, "ptr"_a);
+  // Address of the FrontendApi table handed to copyengine._torch.
+  m.def("_frontend_api", [] { return reinterpret_cast<uintptr_t>(ce::frontend_api()); });
 }

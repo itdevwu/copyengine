@@ -75,7 +75,7 @@ struct Op {
   int64_t dst_lo = 0, dst_hi = 0;  // the destination allocation, absolute bytes
   Hash128 key;                     // op class for interception-time decisions (sides, fn, size buckets)
   // per submission, not part of the cached op
-  std::shared_ptr<void> native;    // frontend payload for the native baseline, or null
+  std::shared_ptr<NativeOp> native;  // the frontend's own implementation (the baseline), or null
   double enqueue_us = 0;           // host time spent submitting it
   std::shared_ptr<const Form> form;  // null when the statement has tables or came in as runs
   Hash128 fp;  // content fingerprint

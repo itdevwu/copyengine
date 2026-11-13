@@ -106,7 +106,6 @@ struct Engine::Impl {
   std::unordered_map<Hash128, std::shared_ptr<const Plan>, Hash128Hasher> plans;
   std::unordered_set<Hash128, Hash128Hasher> safe;
   Tuner tuner;
-  std::shared_ptr<NativeRunner> native;
   std::unordered_map<Hash128, KeyStat, Hash128Hasher> keys;
   std::vector<Alloc> q_reads, q_writes;  // allocations the queue reads / writes
   std::vector<PendingSample> samples;
@@ -239,7 +238,7 @@ struct Engine::Impl {
   // for an op class whose lone ops were measured slower in ce and that rarely
   // merges (so its first op is not the head of a mergeable run).
   bool native_now(const Op& op) const {
-    if (!op.native || !native || opt.prior_only) return false;
+    if (!op.native || opt.prior_only) return false;
     if (opt.disable) return true;
     if (merges_with_tail(op)) return false;
     auto it = keys.find(op.key);
@@ -263,7 +262,7 @@ struct Engine::Impl {
       flush();
     const bool host_only = op.src.device.kind == DeviceKind::host && op.dst.device.kind == DeviceKind::host;
     if (host_only && host_pending) synchronize();  // host work may touch what CUDA work still uses
-    native->run(op.native, strm);
+    op.native->run(strm);
     note_pending(op.src, op.dst, strm);
     ++native_ops;
     if (depth == 0) finish();
@@ -389,7 +388,7 @@ struct Engine::Impl {
   Choice choice_for(const Group& g, const std::vector<Op>& ops) const {
     Choice c;
     c.cands = g.candidates;
-    const bool nat = native && std::all_of(g.ops.begin(), g.ops.end(), [&](int k) { return ops[k].native != nullptr; });
+    const bool nat = std::all_of(g.ops.begin(), g.ops.end(), [&](int k) { return ops[k].native != nullptr; });
     c.baseline = nat ? Strategy::native : Strategy::passthrough;
     if (dominance_safe(g)) c.safe = Strategy::runs;
     return c;
@@ -413,7 +412,7 @@ struct Engine::Impl {
     const auto t0 = Clock::now();
     int64_t calls = 0;
     if (s == Strategy::native) {
-      for (int k : g.ops) native->run(ops[k].native, strm);
+      for (int k : g.ops) ops[k].native->run(strm);
       calls = static_cast<int64_t>(g.ops.size());
     } else {
       calls = ex.run(s, g, ops, strm);
@@ -528,12 +527,6 @@ void Engine::copy(const Endpoint& src, const Endpoint& dst, const Stmt& stmt, co
   const auto t0 = Clock::now();
   std::lock_guard lk(impl_->mu);
   impl_->enqueue_stmt(src, dst, stmt, fn, hints, stream, t0);
-}
-
-void Engine::set_native(std::shared_ptr<NativeRunner> runner) {
-  std::lock_guard lk(impl_->mu);
-  impl_->flush();  // queued payloads belong to the previous runner
-  impl_->native = std::move(runner);
 }
 
 void Engine::fence(std::span<const Range> reads, std::span<const Range> writes) {

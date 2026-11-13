@@ -376,4 +376,29 @@ Json probe(const ProbeOptions& opt) {
   return out;
 }
 
+std::string fingerprint() {
+  std::string err;
+  const Driver* d = driver(&err);
+  if (!d) return "cuda=none";
+  int version = 0, count = 0;
+  if (d->cuDriverGetVersion(&version) != CUDA_SUCCESS || d->cuDeviceGetCount(&count) != CUDA_SUCCESS)
+    return "cuda=none";
+  std::string fp = "driver=" + std::to_string(version);
+  for (int i = 0; i < count; ++i) {
+    CUdevice dev{};
+    char name[256] = {}, bus[32] = {};
+    int major = 0, minor = 0;
+    if (d->cuDeviceGet(&dev, i) != CUDA_SUCCESS) continue;
+    d->cuDeviceGetName(name, sizeof name, dev);
+    d->cuDeviceGetAttribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, dev);
+    d->cuDeviceGetAttribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, dev);
+    d->cuDeviceGetPCIBusId(bus, sizeof bus, dev);
+    Json p = probe_pcie(bus);
+    std::string link = "pcie?";
+    if (p.flag("ok")) link = "pcie" + p["gen_current"].dump() + "x" + p["width_current"].dump();
+    fp += ";gpu" + std::to_string(i) + "=" + name + "/" + std::to_string(major) + "." + std::to_string(minor) + "/" + link;
+  }
+  return fp;
+}
+
 }  // namespace ce::cuda

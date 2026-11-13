@@ -14,4 +14,8 @@ struct ProbeOptions {
 // never silently treated as absent.
 std::string probe_json(const ProbeOptions& options = {});
 
+// Stable identity of the hardware a tuning profile applies to: CPU model,
+// GPU models and compute capabilities, PCIe link, driver version.
+std::string hardware_fingerprint();
+
 }  // namespace ce

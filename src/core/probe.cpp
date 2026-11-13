@@ -14,8 +14,7 @@
 namespace ce {
 namespace {
 
-Json probe_host() {
-  Json j = Json::object();
+std::string cpu_model() {
   std::string model;
   std::ifstream cpuinfo("/proc/cpuinfo");
   for (std::string line; std::getline(cpuinfo, line);) {
@@ -24,6 +23,12 @@ Json probe_host() {
       break;
     }
   }
+  return model;
+}
+
+Json probe_host() {
+  Json j = Json::object();
+  const std::string model = cpu_model();
   j.set("cpu", model.empty() ? Json(nullptr) : Json(model));
   j.set("logical_cpus", std::thread::hardware_concurrency());
   return j;
@@ -42,6 +47,14 @@ std::string probe_json(const ProbeOptions& options) {
   out.set("cuda", Json::object().set("available", false).set("reason", "built without CUDA support"));
 #endif
   return out.dump();
+}
+
+std::string hardware_fingerprint() {
+  std::string fp = "cpu=" + cpu_model() + ";threads=" + std::to_string(std::thread::hardware_concurrency());
+#if CE_WITH_CUDA
+  fp += ";" + cuda::fingerprint();
+#endif
+  return fp;
 }
 
 }  // namespace ce

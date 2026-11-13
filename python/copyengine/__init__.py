@@ -3,6 +3,20 @@
 import json as _json
 
 from . import _core
+from ._api import (
+    Elementwise,
+    Engine,
+    FrozenPlan,
+    barrier,
+    copy_,
+    default_engine,
+    gather,
+    indices,
+    scatter_,
+    scope,
+    segments,
+    stats,
+)
 from ._core import (
     ABI_VERSION,
     Access,
@@ -15,23 +29,15 @@ from ._core import (
     Unsupported,
     UnsafeCopy,
     __version__,
+    hardware_fingerprint,
     lower,
 )
 
 __all__ = [
-    "ABI_VERSION",
-    "Access",
-    "BackendError",
-    "CopyEngineError",
-    "NeedsMaterialize",
-    "Rects",
-    "Runs",
-    "Stmt",
-    "Unsupported",
-    "UnsafeCopy",
-    "__version__",
-    "lower",
-    "probe",
+    "ABI_VERSION", "Access", "BackendError", "CopyEngineError", "Elementwise", "Engine", "FrozenPlan",
+    "NeedsMaterialize", "Rects", "Runs", "Stmt", "Unsupported", "UnsafeCopy", "__version__", "barrier",
+    "copy_", "default_engine", "gather", "hardware_fingerprint", "indices", "lower", "probe", "scatter_",
+    "scope", "segments", "stats",
 ]
 
 

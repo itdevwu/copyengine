@@ -19,14 +19,23 @@ option(CE_BUILD_PYTHON "Build the Python extension" ${_ce_python_default})
 
 configure_file(src/core/config.hpp.in ${CMAKE_CURRENT_BINARY_DIR}/generated/copyengine/config.hpp @ONLY)
 
-# Planner core + C ABI. Platform backends are added as separate sources later.
+# Planner core, host backend and C ABI. Platform backends are added below.
 add_library(copyengine
   src/core/version.cpp
   src/core/probe.cpp
   src/core/ir.cpp
+  src/core/types.cpp
+  src/core/plan.cpp
+  src/core/tuner.cpp
+  src/core/engine.cpp
+  src/backends/host/host.cpp
   src/capi/capi.cpp
 )
 add_library(copyengine::copyengine ALIAS copyengine)
+# Host and device conversions must agree bit for bit: no FMA contraction.
+set_source_files_properties(src/backends/host/host.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+find_package(Threads REQUIRED)
+target_link_libraries(copyengine PRIVATE Threads::Threads)
 target_include_directories(copyengine
   PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -51,7 +60,8 @@ if(NOT CE_CUDA STREQUAL "OFF")
   endif()
 endif()
 if(CE_WITH_CUDA)
-  target_sources(copyengine PRIVATE src/backends/cuda/driver.cpp src/backends/cuda/probe.cpp)
+  target_sources(copyengine PRIVATE src/backends/cuda/driver.cpp src/backends/cuda/probe.cpp
+    src/backends/cuda/executor.cpp)
   target_include_directories(copyengine SYSTEM PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
   target_link_libraries(copyengine PRIVATE ${CMAKE_DL_LIBS})
 endif()

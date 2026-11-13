@@ -1,6 +1,8 @@
 #pragma once
 
+#include <cctype>
 #include <cstdint>
+#include <stdexcept>
 #include <cstdio>
 #include <memory>
 #include <string>
@@ -45,6 +47,29 @@ class Json {
   }
 
   bool is_null() const { return std::holds_alternative<std::monostate>(v_); }
+  bool is_object() const { return std::holds_alternative<std::shared_ptr<Object>>(v_); }
+  bool is_array() const { return std::holds_alternative<std::shared_ptr<Array>>(v_); }
+  bool is_string() const { return std::holds_alternative<std::string>(v_); }
+  bool is_number() const { return std::holds_alternative<int64_t>(v_) || std::holds_alternative<double>(v_); }
+
+  const Object& items() const { return *std::get<std::shared_ptr<Object>>(v_); }
+  const Array& elements() const { return *std::get<std::shared_ptr<Array>>(v_); }
+  const std::string& str() const { return std::get<std::string>(v_); }
+  double num() const {
+    if (auto* i = std::get_if<int64_t>(&v_)) return static_cast<double>(*i);
+    return std::get<double>(v_);
+  }
+  // Member lookup; null Json if absent or not an object.
+  const Json& operator[](std::string_view key) const {
+    static const Json null;
+    if (!is_object()) return null;
+    for (auto& [k, v] : items())
+      if (k == key) return v;
+    return null;
+  }
+
+  // Strict parser for the documents copyengine writes. Throws std::runtime_error.
+  static Json parse(std::string_view text);
 
   // True iff this is an object whose `key` holds boolean true.
   bool flag(std::string_view key) const {
@@ -73,7 +98,7 @@ class Json {
       void operator()(int64_t i) const { o += std::to_string(i); }
       void operator()(double d) const {
         char buf[32];
-        std::snprintf(buf, sizeof buf, "%.6g", d);
+        std::snprintf(buf, sizeof buf, "%.9g", d);
         o += buf;
       }
       void operator()(const std::string& s) const { escape(o, s); }
@@ -98,6 +123,8 @@ class Json {
     };
     std::visit(V{o}, v_);
   }
+
+  struct Parser;
 
   static void escape(std::string& o, std::string_view s) {
     o += '"';
@@ -124,5 +151,119 @@ class Json {
                std::shared_ptr<Object>>
       v_;
 };
+
+struct Json::Parser {
+  std::string_view s;
+  size_t i = 0;
+
+  [[noreturn]] void error(const char* what) {
+    throw std::runtime_error(std::string("json: ") + what + " at offset " + std::to_string(i));
+  }
+  void ws() {
+    while (i < s.size() && (s[i] == ' ' || s[i] == '\n' || s[i] == '\t' || s[i] == '\r')) ++i;
+  }
+  bool eat(char c) {
+    ws();
+    if (i < s.size() && s[i] == c) {
+      ++i;
+      return true;
+    }
+    return false;
+  }
+  void expect(char c) {
+    if (!eat(c)) error("unexpected character");
+  }
+  bool lit(std::string_view w) {
+    if (s.substr(i, w.size()) == w) {
+      i += w.size();
+      return true;
+    }
+    return false;
+  }
+  std::string string() {
+    expect('"');
+    std::string out;
+    while (i < s.size() && s[i] != '"') {
+      char c = s[i++];
+      if (c == '\\') {
+        if (i >= s.size()) error("bad escape");
+        char e = s[i++];
+        switch (e) {
+          case 'n': out += '\n'; break;
+          case 't': out += '\t'; break;
+          case 'r': out += '\r'; break;
+          case 'b': out += '\b'; break;
+          case 'f': out += '\f'; break;
+          case 'u': {
+            if (i + 4 > s.size()) error("bad \\u escape");
+            unsigned cp = static_cast<unsigned>(std::stoul(std::string(s.substr(i, 4)), nullptr, 16));
+            i += 4;
+            if (cp < 0x80) out += static_cast<char>(cp);
+            else if (cp < 0x800) out += static_cast<char>(0xC0 | (cp >> 6)), out += static_cast<char>(0x80 | (cp & 0x3F));
+            else out += static_cast<char>(0xE0 | (cp >> 12)), out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F)),
+                 out += static_cast<char>(0x80 | (cp & 0x3F));
+            break;
+          }
+          default: out += e;
+        }
+      } else {
+        out += c;
+      }
+    }
+    if (i >= s.size()) error("unterminated string");
+    ++i;
+    return out;
+  }
+  Json value() {
+    ws();
+    if (i >= s.size()) error("unexpected end");
+    char c = s[i];
+    if (c == '{') {
+      ++i;
+      Json o = Json::object();
+      if (eat('}')) return o;
+      do {
+        ws();
+        std::string k = string();
+        expect(':');
+        o.set(std::move(k), value());
+      } while (eat(','));
+      expect('}');
+      return o;
+    }
+    if (c == '[') {
+      ++i;
+      Json a = Json::array();
+      if (eat(']')) return a;
+      do a.push(value());
+      while (eat(','));
+      expect(']');
+      return a;
+    }
+    if (c == '"') return Json(string());
+    if (lit("true")) return Json(true);
+    if (lit("false")) return Json(false);
+    if (lit("null")) return Json(nullptr);
+    size_t start = i;
+    bool real = false;
+    while (i < s.size() && (std::isdigit(static_cast<unsigned char>(s[i])) || s[i] == '-' || s[i] == '+' ||
+                            s[i] == '.' || s[i] == 'e' || s[i] == 'E')) {
+      real |= s[i] == '.' || s[i] == 'e' || s[i] == 'E';
+      ++i;
+    }
+    if (start == i) error("unexpected character");
+    std::string num(s.substr(start, i - start));
+    if (real) return Json(std::stod(num));
+    return Json(static_cast<int64_t>(std::stoll(num)));
+  }
+};
+
+inline Json Json::parse(std::string_view text) {
+  Parser p{text};
+  Json v = p.value();
+  p.ws();
+  if (p.i != text.size()) p.error("trailing characters");
+  return v;
+}
 
 }  // namespace ce

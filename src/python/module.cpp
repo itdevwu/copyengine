@@ -2,11 +2,13 @@
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/pair.h>
+#include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
 
 #include "copyengine/copyengine.h"
 #include "copyengine/copyengine.hpp"
+#include "copyengine/engine.hpp"
 #include "copyengine/error.hpp"
 #include "copyengine/ir.hpp"
 #include "copyengine/probe.hpp"
@@ -163,4 +165,106 @@ NB_MODULE(_core, m) {
       .def_prop_ro("domain", &ce::Stmt::domain);
 
   m.def("lower", &ce::lower, "stmt"_a, nb::call_guard<nb::gil_scoped_release>());
+
+  // ---- engine ----
+  nb::class_<ce::Endpoint>(m, "Endpoint")
+      .def("__init__", [](ce::Endpoint* e, const std::string& kind, int index, uintptr_t base, int64_t nbytes,
+                          const std::string& dtype, bool pinned) {
+        ce::Device dev;
+        if (kind == "host" || kind == "cpu") dev = {ce::DeviceKind::host, 0};
+        else if (kind == "cuda") dev = {ce::DeviceKind::cuda, index};
+        else throw ce::Error(ce::Errc::unsupported, "unsupported device kind: " + kind);
+        new (e) ce::Endpoint{dev, base, nbytes, ce::parse_dtype(dtype), pinned};
+      }, "kind"_a, "index"_a, "base"_a, "nbytes"_a, "dtype"_a, "pinned"_a = false)
+      .def_prop_ro("base", [](const ce::Endpoint& e) { return e.base; })
+      .def_prop_ro("nbytes", [](const ce::Endpoint& e) { return e.nbytes; })
+      .def_prop_ro("dtype", [](const ce::Endpoint& e) { return std::string(ce::dtype_name(e.dtype)); });
+
+  nb::class_<ce::Elementwise>(m, "Elementwise")
+      .def("__init__", [](ce::Elementwise* f, float scale, float bias, bool round, std::optional<std::pair<float, float>> clamp) {
+        new (f) ce::Elementwise{scale, bias, round, clamp.has_value(), clamp ? clamp->first : 0.f, clamp ? clamp->second : 0.f};
+      }, "scale"_a = 1.0f, "bias"_a = 0.0f, "round"_a = false, "clamp"_a = nb::none())
+      .def_ro("scale", &ce::Elementwise::scale)
+      .def_ro("bias", &ce::Elementwise::bias)
+      .def_ro("round", &ce::Elementwise::round)
+      .def_prop_ro("clamp", [](const ce::Elementwise& f) -> std::optional<std::pair<float, float>> {
+        if (!f.clamp) return std::nullopt;
+        return std::make_pair(f.lo, f.hi);
+      })
+      .def_prop_ro("identity", &ce::Elementwise::identity)
+      .def("__repr__", [](const ce::Elementwise& f) {
+        std::string r = "Elementwise(scale=" + std::to_string(f.scale) + ", bias=" + std::to_string(f.bias);
+        if (f.round) r += ", round=True";
+        if (f.clamp) r += ", clamp=(" + std::to_string(f.lo) + ", " + std::to_string(f.hi) + ")";
+        return r + ")";
+      });
+
+  nb::class_<ce::EngineOptions>(m, "EngineOptions")
+      .def(nb::init<>())
+      .def_rw("staging_budget", &ce::EngineOptions::staging_budget)
+      .def_rw("tune", &ce::EngineOptions::tune)
+      .def_rw("tune_trials", &ce::EngineOptions::tune_trials)
+      .def_rw("tune_topk", &ce::EngineOptions::tune_topk)
+      .def_rw("allow_async", &ce::EngineOptions::allow_async)
+      .def_rw("disable", &ce::EngineOptions::disable)
+      .def_rw("log_plan", &ce::EngineOptions::log_plan)
+      .def_rw("host_threads", &ce::EngineOptions::host_threads)
+      .def_rw("plan_cache", &ce::EngineOptions::plan_cache)
+      .def_static("from_env", [](ce::EngineOptions base) { return ce::EngineOptions::from_env(base); }, "base"_a);
+
+  nb::class_<ce::Frozen>(m, "Frozen")
+      .def("run", &ce::Frozen::run, "stream"_a = 0, nb::call_guard<nb::gil_scoped_release>());
+
+  auto make_hints = [](nb::handle valid_start, nb::handle valid_len, const std::string& ctx) {
+    ce::Hints h;
+    h.ctx = ctx;
+    if (!valid_start.is_none()) {
+      auto a = i64_arg(valid_start), b = i64_arg(valid_len);
+      h.valid_start.assign(a.span().begin(), a.span().end());
+      h.valid_len.assign(b.span().begin(), b.span().end());
+      h.has_valid = true;
+    }
+    return h;
+  };
+
+  nb::class_<ce::Engine>(m, "Engine")
+      .def(nb::init<ce::EngineOptions>(), "options"_a)
+      .def("copy_runs", [make_hints](ce::Engine& e, const ce::Endpoint& src, const ce::Endpoint& dst, nb::handle so,
+                                     nb::handle d_o, nb::handle n, const ce::Elementwise& fn, nb::handle valid_start,
+                                     nb::handle valid_len, const std::string& ctx, uintptr_t stream) {
+        auto a = i64_arg(so), b = i64_arg(d_o), c = i64_arg(n);
+        ce::Runs runs = ce::Runs::of(a.span(), b.span(), c.span());
+        ce::Hints h = make_hints(valid_start, valid_len, ctx);
+        nb::gil_scoped_release release;
+        e.copy(src, dst, runs, fn, h, stream);
+      }, "src"_a, "dst"_a, "src_off"_a, "dst_off"_a, "length"_a, "fn"_a, "valid_start"_a = nb::none(),
+         "valid_len"_a = nb::none(), "ctx"_a = "", "stream"_a = 0)
+      .def("copy_indices", [make_hints](ce::Engine& e, const ce::Endpoint& src, const ce::Endpoint& dst, nb::handle si,
+                                        nb::handle di, const ce::Elementwise& fn, const std::string& ctx, uintptr_t stream) {
+        auto a = i64_arg(si), b = i64_arg(di);
+        ce::Runs runs = ce::Runs::from_indices(a.span(), b.span());
+        ce::Hints h = make_hints(nb::none(), nb::none(), ctx);
+        nb::gil_scoped_release release;
+        e.copy(src, dst, runs, fn, h, stream);
+      }, "src"_a, "dst"_a, "src_idx"_a, "dst_idx"_a, "fn"_a, "ctx"_a = "", "stream"_a = 0)
+      .def("copy_stmt", [make_hints](ce::Engine& e, const ce::Endpoint& src, const ce::Endpoint& dst, const ce::Stmt& stmt,
+                                     const ce::Elementwise& fn, nb::handle valid_start, nb::handle valid_len,
+                                     const std::string& ctx, uintptr_t stream) {
+        ce::Hints h = make_hints(valid_start, valid_len, ctx);
+        nb::gil_scoped_release release;
+        e.copy(src, dst, stmt, fn, h, stream);
+      }, "src"_a, "dst"_a, "stmt"_a, "fn"_a, "valid_start"_a = nb::none(), "valid_len"_a = nb::none(),
+         "ctx"_a = "", "stream"_a = 0)
+      .def("begin_scope", &ce::Engine::begin_scope)
+      .def("end_scope", &ce::Engine::end_scope, nb::call_guard<nb::gil_scoped_release>())
+      .def("flush", &ce::Engine::flush, nb::call_guard<nb::gil_scoped_release>())
+      .def("synchronize", &ce::Engine::synchronize, nb::call_guard<nb::gil_scoped_release>())
+      .def_prop_ro("depth", &ce::Engine::depth)
+      .def_prop_ro("queued", &ce::Engine::queued)
+      .def("stats_json", &ce::Engine::stats_json)
+      .def("dump_profile", &ce::Engine::dump_profile)
+      .def("load_profile", &ce::Engine::load_profile)
+      .def("freeze", &ce::Engine::freeze);
+
+  m.def("hardware_fingerprint", &ce::hardware_fingerprint);
 }

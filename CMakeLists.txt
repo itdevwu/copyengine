@@ -176,8 +176,9 @@ if(CE_BUILD_PYTHON)
       install(TARGETS copyengine_torch LIBRARY DESTINATION copyengine)
       message(STATUS "copyengine: stable-ABI torch extension ON")
 
-      # The interception shim, prebuilt for the build-time torch and stamped
-      # with the key the runtime checks (python/copyengine/_shim_key.py).
+      # The interception shim, prebuilt for the build-time torch, under the key
+      # the runtime looks up (python/copyengine/_shim_key.py). CI adds shims
+      # for other torch releases next to it.
       execute_process(COMMAND "${Python_EXECUTABLE}" -c "import torch; print(int(torch._C._GLIBCXX_USE_CXX11_ABI), end='')"
                       OUTPUT_VARIABLE _torch_abi)
       execute_process(COMMAND "${Python_EXECUTABLE}" ${CMAKE_CURRENT_SOURCE_DIR}/python/copyengine/_shim_key.py
@@ -191,9 +192,7 @@ if(CE_BUILD_PYTHON)
         target_compile_definitions(copyengine_shim PRIVATE _GLIBCXX_USE_CXX11_ABI=${_torch_abi})
         target_link_libraries(copyengine_shim PRIVATE ${CE_TORCH_C10} ${CE_TORCH_CPU} ${CE_TORCH_LIB} ${CMAKE_DL_LIBS})
         set_target_properties(copyengine_shim PROPERTIES PREFIX "" OUTPUT_NAME "libcopyengine_shim" CXX_VISIBILITY_PRESET hidden)
-        file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/libcopyengine_shim.key "${_shim_key}")
-        install(TARGETS copyengine_shim LIBRARY DESTINATION copyengine)
-        install(FILES ${CMAKE_CURRENT_BINARY_DIR}/libcopyengine_shim.key DESTINATION copyengine)
+        install(TARGETS copyengine_shim LIBRARY DESTINATION copyengine/shims/${_shim_key})
       endif()
     elseif(CE_TORCH STREQUAL "ON")
       message(FATAL_ERROR "CE_TORCH=ON but torch >= 2.9 is not importable: ${_torch_err}")

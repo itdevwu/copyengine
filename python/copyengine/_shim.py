@@ -67,11 +67,14 @@ def build(out: Path) -> None:
             os.unlink(tmp)
 
 
+def shim_key() -> str:
+    return _key(_SRC, _core.__version__)
+
+
 def _locate() -> Path:
-    k = _key(_SRC, _core.__version__)
-    pre = _HERE / "libcopyengine_shim.so"
-    stamp = _HERE / "libcopyengine_shim.key"
-    if pre.exists() and stamp.exists() and stamp.read_text() == k:
+    k = shim_key()
+    pre = _HERE / "shims" / k / "libcopyengine_shim.so"  # prebuilt ones ship in the wheel
+    if pre.exists():
         return pre
     out = cache_dir() / k / "libcopyengine_shim.so"
     if out.exists():

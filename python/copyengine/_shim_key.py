@@ -27,7 +27,10 @@ def key(src_dir: Path, ce_version: str) -> str:
         h.update(p.read_bytes())
     git = (getattr(torch.version, "git_version", None) or "nogit")[:12]
     abi = int(torch._C._GLIBCXX_USE_CXX11_ABI)
-    return f"torch{torch.__version__}-{git}-abi{abi}-ce{ce_version}-{h.hexdigest()[:12]}"
+    # The local suffix (+cpu, +cu128) names the CUDA variant, which the shim's
+    # C++ API does not depend on: one build serves every variant of a release.
+    release = torch.__version__.split("+")[0]
+    return f"torch{release}-{git}-abi{abi}-ce{ce_version}-{h.hexdigest()[:12]}"
 
 
 if __name__ == "__main__":

@@ -3,12 +3,17 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+env:
+  TORCH_CPU_INDEX: https://download.pytorch.org/whl/cpu
+
 jobs:
-  build-and-test:
+  # Core, C ABI and the numpy path: no torch.
+  core:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     strategy:
@@ -24,3 +29,98 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y ninja-build
       - run: pip install scikit-build-core nanobind pytest
       - run: just test
+
+  # Per torch release: the stable-ABI ops and the interception shim built for
+  # it, the whole suite with the shim and again with the Python mode (the same
+  # semantics must hold), and the shim exported for the release wheel.
+  torch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        torch: ["2.9.1", "2.10.0", "2.11.0"]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - uses: taiki-e/install-action@just
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - run: pip install scikit-build-core nanobind pytest numpy
+      - run: pip install "torch==${{ matrix.torch }}" --index-url "$TORCH_CPU_INDEX"
+      - run: just test
+      - name: Same suite, Python interception mode
+        run: CE_SHIM=0 pytest -q
+      - name: Check both torch layers loaded
+        working-directory: /tmp
+        run: python -c "import copyengine as ce; assert ce._torch_ops.copy_ is not None, ce._torch_ops.error; assert ce._shim.lib is not None, ce._shim.error"
+      - name: Export the shim for this torch
+        working-directory: /tmp
+        run: |
+          python - <<'EOF'
+          import pathlib, shutil
+          import copyengine._shim as s
+          out = pathlib.Path("/tmp/shim-out") / s.shim_key()
+          out.mkdir(parents=True)
+          shutil.copy(s.lib._name, out / "libcopyengine_shim.so")
+          print(out)
+          EOF
+      - uses: actions/upload-artifact@v5
+        with:
+          name: shim-torch${{ matrix.torch }}
+          path: /tmp/shim-out
+
+  # The stable ABI claim and the compile-on-import path: built with the newest
+  # torch, run with the oldest supported one.
+  cross-torch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - run: pip install scikit-build-core nanobind pytest numpy
+      - run: pip install "torch==2.11.0" --index-url "$TORCH_CPU_INDEX"
+      - run: pip wheel --no-build-isolation --no-deps . -w dist
+      - run: pip install "torch==2.9.1" --index-url "$TORCH_CPU_INDEX"
+      - run: pip install --no-deps dist/*.whl
+      - name: Stable ops load on older torch; the shim compiles on import
+        working-directory: /tmp
+        run: python -c "import copyengine as ce; assert ce._torch_ops.copy_ is not None, ce._torch_ops.error; assert ce._shim.lib is not None, ce._shim.error; print(ce._shim.lib._name)"
+      - run: pytest -q
+
+  # Release wheel: CUDA kernels compiled, plus the shim of every torch release
+  # above, so matching installs never compile on import.
+  wheel:
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    needs: [torch]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    container: nvidia/cuda:12.9.1-devel-ubuntu24.04
+    steps:
+      - run: apt-get update && apt-get install -y git python3 python3-venv python3-dev ninja-build cmake g++
+      - uses: actions/checkout@v6
+      - run: python3 -m venv /venv
+      - run: /venv/bin/pip install scikit-build-core nanobind numpy wheel "torch==2.11.0" --index-url "$TORCH_CPU_INDEX" --extra-index-url https://pypi.org/simple
+      - run: /venv/bin/pip wheel --no-build-isolation --no-deps . -w dist
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: shim-torch*
+          path: shims
+          merge-multiple: true
+      - name: Add every torch release's shim to the wheel
+        run: |
+          /venv/bin/python -m wheel unpack dist/*.whl -d unpacked
+          pkg=$(echo unpacked/*/copyengine)
+          mkdir -p "$pkg/shims"
+          cp -rn shims/* "$pkg/shims/"
+          ls "$pkg/shims"
+          rm dist/*.whl
+          /venv/bin/python -m wheel pack unpacked/* -d dist
+      - uses: actions/upload-artifact@v5
+        with:
+          name: wheel
+          path: dist/*.whl

@@ -80,6 +80,11 @@ class CudaExecutor final : public Executor {
         if (sl.dev) d_->cuMemFree(sl.dev);
         if (sl.done) d_->cuEventDestroy(sl.done);
       }
+      for (Bounce& b : s.bounce) {
+        if (b.used) d_->cuEventSynchronize(b.done);
+        if (b.host) d_->cuMemFreeHost(b.host);
+        if (b.done) d_->cuEventDestroy(b.done);
+      }
       if (s.staging_used) d_->cuEventSynchronize(s.staging_done);
       if (s.staging) d_->cuMemFree(s.staging);
       for (CUevent e : {s.ev_in, s.ev_out, s.staging_done})
@@ -107,6 +112,7 @@ class CudaExecutor final : public Executor {
       } else {
         const bool host_ok = (src_cuda || g.src.pinned) && (dst_cuda || g.dst.pinned);
         if (s.batch && host_ok) c.push_back(Strategy::batch);
+        if (!host_ok && !(src_cuda && dst_cuda)) c.push_back(Strategy::staged);  // pinned bounce
         c.push_back(Strategy::runs);
         if (rects <= 2) std::reverse(c.begin(), c.end());
       }
@@ -131,7 +137,7 @@ class CudaExecutor final : public Executor {
       case Strategy::runs: return runs(g, st);
       case Strategy::batch: return batch(s, g.src, g.dst, rows_raw(g), st);
       case Strategy::kernel: return kernel(s, g, st);
-      case Strategy::staged: return staged(s, g, st);
+      case Strategy::staged: return g.pure() ? bounce(s, g.src, g.dst, rows_raw(g), st) : staged(s, g, st);
       default: fail(Errc::unsupported, "CUDA backend cannot run strategy " + std::string(strategy_name(strat)));
     }
   }
@@ -146,10 +152,29 @@ class CudaExecutor final : public Executor {
 
   bool async() const override { return true; }
 
+  Json info() override {
+    Json devs = Json::array();
+    for (size_t i = 0; i < devs_.size(); ++i) {
+      Dev& s = state(static_cast<int>(i));
+      devs.push(Json::object()
+                    .set("index", static_cast<int>(i))
+                    .set("kernels", s.kernels ? Json(true) : Json(s.kernel_error))
+                    .set("batch", s.batch ? Json(true) : Json(s.batch_error)));
+    }
+    return devs;
+  }
+
  private:
   struct Slot {
     void* host = nullptr;
     CUdeviceptr dev = 0;
+    size_t cap = 0;
+    CUevent done = nullptr;
+    bool used = false;
+  };
+
+  struct Bounce {
+    void* host = nullptr;
     size_t cap = 0;
     CUevent done = nullptr;
     bool used = false;
@@ -173,6 +198,7 @@ class CudaExecutor final : public Executor {
     CUevent staging_done{};
     CUstream staging_stream{};
     bool staging_used = false;
+    std::array<Bounce, 2> bounce;
   };
 
   struct Push {
@@ -376,11 +402,88 @@ class CudaExecutor final : public Executor {
 
   void copy_raws(Dev& s, const Side& src, const Side& dst, const std::vector<Raw>& raws, CUstream st) {
     const bool host_ok = (src.device.kind == DeviceKind::cuda || src.pinned) && (dst.device.kind == DeviceKind::cuda || dst.pinned);
+    if (!host_ok && raws.size() > 2) {
+      bounce(s, src, dst, raws, st);
+      return;
+    }
     if (s.batch && host_ok && raws.size() > 2) {
       batch(s, src, dst, raws, st);
       return;
     }
     for (const Raw& r : raws) copy1d(src, dst, r.src, r.dst, r.bytes, st);
+  }
+
+  // Pageable host side: pack runs into pinned double buffers on the host and
+  // move each buffer with batched DMA, overlapping packing with transfers.
+  // D2H must wait for each buffer before unpacking, so it blocks like any
+  // pageable D2H does.
+  int64_t bounce(Dev& s, const Side& src, const Side& dst, const std::vector<Raw>& raws, CUstream st) {
+    const bool h2d = dst.device.kind == DeviceKind::cuda;
+    // The CPU is about to touch host memory that earlier work on this stream may still use.
+    check(d_->cuStreamSynchronize(st), "cuStreamSynchronize");
+    const size_t cap = static_cast<size_t>(std::clamp<int64_t>(opt_.staging_budget / 2, 1 << 20, 64 << 20));
+    for (Bounce& b : s.bounce) {
+      if (b.cap >= cap) continue;
+      if (b.used) check(d_->cuEventSynchronize(b.done), "cuEventSynchronize");
+      if (b.host) d_->cuMemFreeHost(b.host);
+      b.host = nullptr;
+      check(d_->cuMemHostAlloc(&b.host, cap, 0), "cuMemHostAlloc (bounce)");
+      if (!b.done) check(d_->cuEventCreate(&b.done, CU_EVENT_DISABLE_TIMING), "cuEventCreate");
+      b.cap = cap, b.used = false;
+    }
+    const Side pinned_host{{DeviceKind::host, 0}, DType::u8, true};
+    struct Pending {
+      int buf;
+      std::vector<Raw> unpack;  // D2H: bounce -> pageable
+    };
+    std::vector<Pending> pending;
+    auto drain = [&](Pending& p) {
+      check(d_->cuEventSynchronize(s.bounce[p.buf].done), "cuEventSynchronize");
+      for (const Raw& r : p.unpack) std::memcpy(reinterpret_cast<void*>(r.dst), reinterpret_cast<const void*>(r.src), r.bytes);
+    };
+    int64_t calls = 0;
+    int k = 0;
+    size_t i = 0;
+    while (i < raws.size()) {
+      Bounce& b = s.bounce[k % 2];
+      if (!pending.empty() && pending.front().buf == k % 2) {
+        drain(pending.front());
+        pending.erase(pending.begin());
+      } else if (b.used) {
+        check(d_->cuEventSynchronize(b.done), "cuEventSynchronize");
+      }
+      std::vector<Raw> dev_raws, unpack;
+      size_t off = 0;
+      for (; i < raws.size(); ++i) {
+        const Raw& r = raws[i];
+        if (r.bytes > cap) {  // a single huge run: plain async copy, the driver stages it
+          if (off) break;
+          copy1d(src, dst, r.src, r.dst, r.bytes, st);
+          ++calls;
+          continue;
+        }
+        if (off + r.bytes > cap) break;
+        const uintptr_t at = reinterpret_cast<uintptr_t>(b.host) + off;
+        if (h2d) {
+          std::memcpy(reinterpret_cast<void*>(at), reinterpret_cast<const void*>(r.src), r.bytes);
+          dev_raws.push_back({at, r.dst, r.bytes});
+        } else {
+          dev_raws.push_back({r.src, at, r.bytes});
+          unpack.push_back({at, r.dst, r.bytes});
+        }
+        off += r.bytes;
+      }
+      if (dev_raws.empty()) continue;
+      if (h2d) copy_raws(s, pinned_host, dst, dev_raws, st);
+      else copy_raws(s, src, pinned_host, dev_raws, st);
+      check(d_->cuEventRecord(b.done, st), "cuEventRecord");
+      b.used = true;
+      ++calls;
+      if (!h2d) pending.push_back({k % 2, std::move(unpack)});
+      ++k;
+    }
+    for (Pending& p : pending) drain(p);
+    return calls;
   }
 
   // ---- kernels ------------------------------------------------------------------------

@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "copyengine/engine.hpp"
+#include "core/json.hpp"
 #include "core/plan.hpp"
 
 namespace ce {
@@ -20,6 +21,8 @@ class Executor {
   virtual void sync(uintptr_t stream) = 0;
   // Whether run() may return before the copy is complete.
   virtual bool async() const = 0;
+  // Admission results etc. for stats().
+  virtual Json info() { return Json(true); }
 };
 
 }  // namespace ce

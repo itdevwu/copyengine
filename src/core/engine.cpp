@@ -315,7 +315,7 @@ std::string Engine::stats_json() const {
       .set("plan_hits", m.plan_hits)
       .set("plans", static_cast<uint64_t>(m.plans.size()))
       .set("buckets", static_cast<uint64_t>(m.tuner.size()))
-      .set("cuda", m.cuda ? Json(true) : Json(m.cuda_error))
+      .set("cuda", m.cuda ? m.cuda->info() : Json(m.cuda_error))
       .dump();
 }
 

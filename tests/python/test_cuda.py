@@ -207,3 +207,31 @@ def test_mixed_host_and_cuda_waves():
         e.copy_(mid, src)
         e.copy_(out, mid.numpy())
     np.testing.assert_array_equal(out, src.cpu().numpy())
+
+
+@pytest.mark.parametrize("direction", ["h2d", "d2h"])
+def test_pageable_fragments_use_bounce(direction):
+    n_blocks, blk = 512, 256
+    if direction == "h2d":
+        src, dst = torch.randn(n_blocks, blk), torch.zeros(n_blocks, blk, device=DEV)
+    else:
+        src, dst = torch.randn(n_blocks, blk, device=DEV), torch.zeros(n_blocks, blk)
+    perm = torch.randperm(n_blocks).tolist()
+
+    def body(e):
+        dst.zero_()
+        with e.scope():
+            for i, j in enumerate(perm):
+                e.copy_(dst[j], src[i])
+
+    def check():
+        torch.testing.assert_close(dst[perm].cpu(), src.cpu(), rtol=0, atol=0)
+
+    _, seen = explore(body, check=check, rounds=6)
+    assert "staged" in seen
+
+
+def test_stats_report_admission():
+    st = ce.Engine(tune=False).stats()
+    dev0 = st["cuda"][0]
+    assert dev0["kernels"] is True and dev0["batch"] is True

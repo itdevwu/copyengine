@@ -35,15 +35,21 @@
 
 - Ops carry absolute element indices (address / itemsize); pure copies are
   normalized to bytes. Dependencies and merging rely on this.
-- Every Executor strategy must be correct for any group it is offered;
-  `passthrough` (each op as submitted) is always a candidate.
+- Every Executor strategy must be correct for any group it is offered.
+  `passthrough` (each op as submitted) is always correct, but it is measured
+  only when its call count is bounded: it is never a multi-second baseline.
 - New platform features are admitted only after a verified test copy.
 - Backend tables built per group go in `Group::exec_cache`; hot paths do not
   re-plan.
 - No regression: the framework's own copy is the baseline. Dominance-safe
   transforms apply directly; a speculative strategy is used only after it wins
   a paired A/B against the baseline that counts host and GPU time. Ties keep
-  the baseline.
+  the baseline. Where no native copy exists there is no original to protect:
+  candidates are explored alike and the fastest locks.
+- Measuring must not stall a run: hopeless candidates are dropped after one
+  sample, and online re-checks only run finalists within 2x of the locked one.
+- A group touches several allocations; no copy call, 2-D block or staged
+  interval may cross an allocation boundary (the driver rejects it).
 - The native baseline is offered only for dtype pairs whose bits match ce's,
   backed by a test.
 - Hot paths never synchronize; only warmup exploration and validation may.

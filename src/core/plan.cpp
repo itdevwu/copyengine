@@ -205,6 +205,7 @@ Plan build_plan(const std::vector<Op>& ops) {
       std::vector<i64> sc, dc, s_lo, s_len, d_lo, d_len;  // cuts; allocation ranges (run units)
       for (int k : g.ops) {
         const Op& op = ops[k];
+        g.op_runs += static_cast<int64_t>(op.runs().size());
         g.src_allocs.emplace_back(op.src_lo, op.src_hi);
         sc.push_back(op.src_lo / ss), sc.push_back(op.src_hi / ss);
         dc.push_back(op.dst_lo / ds), dc.push_back(op.dst_hi / ds);

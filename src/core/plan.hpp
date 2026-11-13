@@ -102,6 +102,7 @@ struct Group {
   std::string ctx;
   std::vector<int> ops;  // indices into the flushed queue (original order)
   Runs runs;             // merged, coalesced
+  int64_t op_runs = 0;   // runs of the ops as submitted: what passthrough issues
   Rects rects;           // structure recovered from runs
   // Allocation boundaries on each side, in run units: one copy call never
   // crosses them (separate allocations, even adjacent ones, are not one range

@@ -404,12 +404,22 @@ struct Engine::Impl {
     return g.pure() && (host_only || !g.rects.has_2d()) && g.rects.size() * 2 <= g.ops.size();
   }
 
+  // Passthrough issues every submitted run separately: beyond this many calls
+  // it is never worth measuring (a gather of 100k rows takes seconds).
+  static constexpr int64_t kPassthroughCalls = 4096;
+
   Choice choice_for(const Group& g, const std::vector<Op>& ops) const {
     Choice c;
     c.cands = g.candidates;
     const bool nat = std::all_of(g.ops.begin(), g.ops.end(), [&](int k) { return ops[k].native != nullptr; });
     c.baseline = nat ? Strategy::native : Strategy::passthrough;
     if (dominance_safe(g)) c.safe = Strategy::runs;
+    if (!nat && !c.safe && !c.cands.empty()) {
+      // No native copy: nothing the caller would otherwise run. The prior's
+      // first choice is the reference, passthrough a candidate if it is cheap.
+      c.lead = c.cands.front();
+      if (g.op_runs <= kPassthroughCalls) c.cands.push_back(Strategy::passthrough);
+    }
     return c;
   }
 
@@ -522,7 +532,6 @@ struct Engine::Impl {
     st.plan_hit = hit;
     Ran ran{pp, {}};
     ran.strategies.reserve(plan.groups.size());
-    bool any_native = false;
     memo.valid = false;
     for (const Group& g : plan.groups) {
       const Choice c = choice_for(g, ops);
@@ -534,7 +543,6 @@ struct Engine::Impl {
         memo = {true, ops.front().fp, pp, p.strategy, 0};
       run_group(g, p.strategy, ops, stream, p.measure, &st);
       ran.strategies.push_back(p.strategy);
-      any_native |= p.strategy == Strategy::native;
       for (int k : g.ops) {
         KeyStat& ks = keys[ops[k].key];
         ++ks.seen;
@@ -543,8 +551,14 @@ struct Engine::Impl {
       if (g.ops.size() == 1)
         if (auto l = tuner.locked_strategy(g.bucket)) keys[ops[g.ops[0]].key].single = *l == Strategy::native;
     }
-    if (!any_native)  // only a frozen native replay needs the frontend's payloads
-      for (Op& op : ops) op.native.reset();
+    // Payloads hold the frontend's tensors: release them where the decision
+    // is a ce strategy. Kept while undecided or native, so freeze() can replay
+    // the reference.
+    for (const Group& g : plan.groups) {
+      const auto l = tuner.locked_strategy(g.bucket);
+      if (l && *l != Strategy::native)
+        for (int k : g.ops) ops[k].native.reset();
+    }
     last = st;
     ++total_flushes;
     total_ops += st.ops;
@@ -719,7 +733,22 @@ class FrozenImpl final : public Frozen {
 std::shared_ptr<Frozen> Engine::freeze() const {
   std::lock_guard lk(impl_->mu);
   if (!impl_->last_ops) fail(Errc::invalid_argument, "freeze: nothing has been flushed yet");
-  return std::make_shared<FrozenImpl>(impl_.get(), impl_->last_ops, impl_->last_ran);
+  // What each group should run from now on, not what the last flush happened
+  // to run (an exploration or online sample): the locked strategy, else the
+  // reference, else what ran. Native needs every op's frontend payload.
+  const Impl& m = *impl_;
+  const auto& ops = *m.last_ops;
+  Ran ran = m.last_ran;
+  for (size_t i = 0; i < ran.plan->groups.size(); ++i) {
+    const Group& g = ran.plan->groups[i];
+    auto runnable = [&](Strategy s) {
+      return s != Strategy::native || std::all_of(g.ops.begin(), g.ops.end(), [&](int k) { return ops[k].native; });
+    };
+    const Choice c = m.choice_for(g, ops);
+    if (auto l = m.tuner.locked_strategy(g.bucket); l && runnable(*l)) ran.strategies[i] = *l;
+    else if (runnable(c.reference())) ran.strategies[i] = c.reference();
+  }
+  return std::make_shared<FrozenImpl>(impl_.get(), impl_->last_ops, std::move(ran));
 }
 
 }  // namespace ce

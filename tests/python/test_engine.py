@@ -444,25 +444,125 @@ def test_online_sampling_leaves_native_when_it_gets_slow():
     np.testing.assert_array_equal(dst, src)
 
 
+def _copy_seconds(dst, src, n=20):
+    np.copyto(dst, src)
+    t0 = time.perf_counter()
+    for _ in range(n):
+        np.copyto(dst, src)
+    return (time.perf_counter() - t0) / n
+
+
 def test_online_sampling_moves_to_native_when_it_gets_fast():
-    src = np.arange(1 << 16, dtype=np.float32)
+    # Just under 1 MB: still one memcpy on the host (no worker threads), and long
+    # enough that Python call overhead does not dominate the native side.
+    src = np.arange(250_000, dtype=np.float32)
     dst = np.zeros_like(src)
     e = _online_engine()
+    t = _copy_seconds(dst, src)
 
-    def slow(d, s):
-        time.sleep(0.002)
+    def slower(d, s):  # ~1.3-1.6x ce's copy: loses, but within 2x, so it keeps being re-checked
         np.copyto(d, s)
+        deadline = time.perf_counter() + 0.3 * t  # sleep() is too coarse at this scale
+        while time.perf_counter() < deadline:
+            pass
 
-    e._native = slow
+    e._native = slower
     for _ in range(60):
         e.copy_(dst, src)
     assert e.stats()["native_ops"] == 0
-    e._native = lambda d, s: np.copyto(d, s) if False else None  # now free
+    e._native = lambda d, s: None  # now free
     for _ in range(400):
         e.copy_(dst, src)
-    assert e.stats()["native_ops"] > 0
+    assert e.stats()["native_ops"] > 0, e.dump_profile()
     on = [b["online"] for b in json.loads(e.dump_profile())["buckets"].values()]
-    assert sum(o["flips"] for o in on) >= 1
+    assert sum(o["flips"] + o["reopens"] for o in on) >= 1  # flipped, or the locked side drifted and re-opened
+
+
+def test_online_sampling_never_runs_a_far_slower_finalist():
+    # Re-checking a side many times slower would stall the run it samples.
+    src = np.arange(1 << 16, dtype=np.float32)
+    dst = np.zeros_like(src)
+    e = _online_engine()
+    calls = []
+
+    def far(d, s):
+        calls.append(1)
+        time.sleep(0.01)
+        np.copyto(d, s)
+
+    e._native = far
+    for _ in range(60):
+        e.copy_(dst, src)
+    assert e.stats()["native_ops"] == 0
+    n = len(calls)
+    for _ in range(200):
+        e.copy_(dst, src)
+    assert len(calls) == n
+    assert sum(b["online"]["samples"] for b in json.loads(e.dump_profile())["buckets"].values()) > 0
+
+
+def test_ab_stops_early_when_one_side_is_far_faster():
+    src = np.arange(1 << 16, dtype=np.float32)
+    dst = np.zeros_like(src)
+    e = ce.Engine(tune_trials=1, ab_pairs=40, ab_max_pairs=80)
+    calls = []
+
+    def far(d, s):
+        calls.append(1)
+        time.sleep(0.01)
+        np.copyto(d, s)
+
+    e._native = far
+    for _ in range(40):
+        e.copy_(dst, src)
+    assert len(calls) <= 8  # locked after ~6 pairs, not 40
+
+
+def test_explicit_copies_without_native_never_run_a_huge_passthrough():
+    # A gather of many rows has no torch / numpy equivalent: passthrough would be
+    # one call per row, so it is neither the reference nor a candidate.
+    cache = np.arange(8192 * 3 * 16, dtype=np.float32).reshape(8192, 3, 16)
+    ids = np.random.default_rng(0).permutation(8192)
+    out = np.zeros((8192, 16, 3), np.float32)
+    e = ce.Engine(tune_trials=1, ab_pairs=4, ab_max_pairs=8, online_every=2)
+    seen = set()
+    for _ in range(40):
+        e.copy_(out, ce.lazy(cache).index_select(0, ids).permute(0, 2, 1))
+        seen.update(e.stats()["last"]["strategies"])
+    assert "passthrough" not in seen
+    np.testing.assert_array_equal(out, cache[ids].transpose(0, 2, 1))
+
+
+def test_freeze_replays_the_decision_not_the_last_sample():
+    src = np.arange(1 << 16, dtype=np.float32)
+    dst = np.zeros_like(src)
+    calls = []
+
+    def native(d, s):
+        calls.append(1)
+        np.copyto(d, s)
+
+    # During the A/B: the last flush may have run the challenger; freeze takes the reference (native).
+    e = ce.Engine(tune_trials=1, ab_pairs=40, ab_max_pairs=80)
+    e._native = native
+    for _ in range(4):
+        e.copy_(dst, src)
+        if e.stats()["last"]["strategies"] != ["native"]:
+            break
+    assert e.stats()["last"]["strategies"] != ["native"]
+    n = len(calls)
+    e.freeze().run()
+    assert len(calls) == n + 1
+    # Locked to native, but the last flush was an online sample of ce: still native.
+    e = ce.Engine(tune_trials=1, ab_pairs=4, ab_max_pairs=8, online_every=1)
+    e._native = lambda d, s: calls.append(1)  # free: native locks
+    for _ in range(200):
+        e.copy_(dst, src)
+        if e.stats()["native_ops"] and e.stats()["last"]["strategies"] not in (["native"], []):
+            break
+    n = len(calls)
+    e.freeze().run()
+    assert len(calls) == n + 1
 
 
 def test_online_sampling_off_never_times_locked_runs():

@@ -69,7 +69,8 @@ std::vector<Sample> parse_samples(const Json& arr) {
 }
 
 bool allowed(Strategy s, const Choice& c) {
-  return s == c.baseline || (c.safe && s == *c.safe) || std::find(c.cands.begin(), c.cands.end(), s) != c.cands.end();
+  return s == c.baseline || s == c.reference() || (c.safe && s == *c.safe) ||
+         std::find(c.cands.begin(), c.cands.end(), s) != c.cands.end();
 }
 }  // namespace
 
@@ -107,7 +108,7 @@ bool Tuner::challenger_wins(const std::vector<Sample>& c, const std::vector<Samp
 }
 
 Tuner::Pick Tuner::pick(const std::string& bucket, const Choice& c, int64_t runs) {
-  const Strategy reference = c.safe ? *c.safe : c.baseline;
+  const Strategy reference = c.reference();
   if (cfg_.prior_only) return {c.cands.empty() ? reference : c.cands.front(), false};
   auto it = table_.find(bucket);
   if (!cfg_.explore) {
@@ -121,8 +122,11 @@ Tuner::Pick Tuner::pick(const std::string& bucket, const Choice& c, int64_t runs
     const auto locked = static_cast<Strategy>(e.locked);
     if (cfg_.online_every <= 0 || (e.since += runs) < cfg_.online_every) return {locked, false};
     e.since = 0;
-    // An online sample: mostly the locked side, every alt_every-th the other finalist.
-    if (e.alt >= 0 && allowed(static_cast<Strategy>(e.alt), c) && ++e.taken % cfg_.alt_every == 0)
+    // An online sample: mostly the locked side, every alt_every-th the other
+    // finalist, if it was close enough to ever flip (a far slower one would
+    // stall the run it samples; drift of the locked side still re-opens).
+    ++e.taken;
+    if (e.alt >= 0 && e.alt_close && allowed(static_cast<Strategy>(e.alt), c) && e.taken % cfg_.alt_every == 0)
       return {static_cast<Strategy>(e.alt), true};
     return {locked, true};
   }
@@ -135,10 +139,15 @@ Tuner::Pick Tuner::pick(const std::string& bucket, const Choice& c, int64_t runs
 
 // Next run for an unlocked entry; may lock it.
 Strategy Tuner::decide(Entry& e, const Choice& c) {
-  const Strategy reference = c.safe ? *c.safe : c.baseline;
+  const Strategy reference = c.reference();
+  // With a baseline to protect (native, or a dominance-safe merge), the best
+  // speculative candidate must then beat it in the A/B. Without one (`lead`),
+  // every candidate is explored alike and the fastest locks: no A/B.
+  const bool protect = !c.lead;
   std::vector<Strategy> cands;
   for (Strategy s : c.cands)
-    if (s != reference) cands.push_back(s);
+    if (!protect || s != reference) cands.push_back(s);
+  if (!protect && std::find(cands.begin(), cands.end(), reference) == cands.end()) cands.insert(cands.begin(), reference);
   if (cands.empty()) {
     lock(e, static_cast<int>(reference), -1);
     return reference;
@@ -147,6 +156,23 @@ Strategy Tuner::decide(Entry& e, const Choice& c) {
     e.challenger = -1;
     // Round-robin, so clock or load changes during exploration hit every
     // candidate alike: the least-sampled one goes next (prior order on ties).
+    // A candidate already 4x slower than the best one is not sampled again.
+    double best_seen = 1e300;
+    for (Strategy s : cands) {
+      const auto& v = e.samples[static_cast<int>(s)];
+      if (v.empty()) continue;
+      std::vector<double> t;
+      for (const Sample& x : v) t.push_back(x.own());
+      best_seen = std::min(best_seen, median(t));
+    }
+    auto hopeless = [&](Strategy s) {
+      const auto& v = e.samples[static_cast<int>(s)];
+      if (v.empty()) return false;
+      std::vector<double> t;
+      for (const Sample& x : v) t.push_back(x.own());
+      return median(t) > 4 * best_seen;
+    };
+    std::erase_if(cands, hopeless);
     Strategy next = cands.front();
     int fewest = INT32_MAX;
     for (Strategy s : cands) {
@@ -154,14 +180,21 @@ Strategy Tuner::decide(Entry& e, const Choice& c) {
       if (have < fewest) next = s, fewest = have;
     }
     if (fewest < cfg_.trials) return next;
-    for (Strategy s : cands)
-      if (e.pending[static_cast<int>(s)] > 0) return reference;  // wait for outstanding samples
-    Strategy best = cands.front();
-    double best_t = 1e300;
-    for (Strategy s : cands) {
+    // By median own time; candidates still without a reported sample come last.
+    auto rank = [&](Strategy s) {
       std::vector<double> t;
       for (const Sample& x : e.samples[static_cast<int>(s)]) t.push_back(x.own());
-      if (median(t) < best_t) best = s, best_t = median(t);
+      return t.empty() ? 1e300 : median(t);
+    };
+    std::vector<Strategy> by = cands;
+    std::stable_sort(by.begin(), by.end(), [&](Strategy a, Strategy b) { return rank(a) < rank(b); });
+    for (Strategy s : cands)
+      if (e.pending[static_cast<int>(s)] > 0)  // wait for outstanding samples, running something cheap
+        return protect ? reference : by.front();
+    const Strategy best = by.front();
+    if (!protect) {
+      lock(e, static_cast<int>(best), by.size() > 1 ? static_cast<int>(by[1]) : -1);
+      return best;
     }
     e.challenger = static_cast<int>(best);
     e.samples[static_cast<int>(reference)].clear();  // A/B pairs start now
@@ -172,6 +205,18 @@ Strategy Tuner::decide(Entry& e, const Choice& c) {
   const auto& cs = e.samples[e.challenger];
   const auto& rs = e.samples[static_cast<int>(reference)];
   const int n = static_cast<int>(std::min(cs.size(), rs.size()));
+  // One side at least 2x faster in every pair so far: decided early, so warmup
+  // does not keep running a far slower side (6 of 6: sign test p ~ 1/64).
+  if (n >= 6 && n < cfg_.pairs) {
+    if (challenger_wins(cs, rs, 0.5)) {
+      lock(e, e.challenger, static_cast<int>(reference));
+      return ch;
+    }
+    if (challenger_wins(rs, cs, 0.5)) {
+      lock(e, static_cast<int>(reference), e.challenger);
+      return reference;
+    }
+  }
   if (n >= cfg_.pairs) {
     std::vector<double> ct, rt;
     for (int i = 0; i < n; ++i) ct.push_back(cs[i].total()), rt.push_back(rs[i].total());
@@ -193,6 +238,12 @@ void Tuner::lock(Entry& e, int winner, int other) {
   std::vector<double> t;
   for (const Sample& x : e.samples[winner]) t.push_back(x.total());
   e.lock_total = median(t);
+  e.alt_close = false;
+  if (other >= 0 && !e.samples[other].empty()) {
+    std::vector<double> a;
+    for (const Sample& x : e.samples[other]) a.push_back(x.total());
+    e.alt_close = e.lock_total > 0 && median(a) <= 2 * e.lock_total;
+  }
   e.since = e.taken = 0;
   e.on_locked.clear();
   e.on_alt.clear();
@@ -299,6 +350,11 @@ void Tuner::load(const Json& j) {
     if (v["lock_total"].is_number()) e.lock_total = v["lock_total"].num();
     if (v["samples"].is_object())
       for (auto& [name, arr] : v["samples"].items()) e.samples[static_cast<int>(parse_strategy(name))] = parse_samples(arr);
+    if (e.alt >= 0 && !e.samples[e.alt].empty() && e.lock_total > 0) {
+      std::vector<double> a;
+      for (const Sample& x : e.samples[e.alt]) a.push_back(x.total());
+      e.alt_close = median(a) <= 2 * e.lock_total;
+    }
     table_[k] = std::move(e);
     uncovered_.erase(k);
   }

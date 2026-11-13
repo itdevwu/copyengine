@@ -22,14 +22,20 @@ struct Sample {
   double own() const { return host - submit + gpu; }
 };
 
-// What a bucket may run. `baseline` is the reference implementation (the
-// frontend's native copy, else passthrough); `safe` is a dominance-safe
-// strategy applied without proof; `cands` are speculative strategies in prior
-// order.
+// What a bucket may run. `baseline` is what runs without copyengine's
+// choices (the frontend's native copy, else passthrough); `safe` is a
+// dominance-safe strategy applied without proof; `cands` are speculative
+// strategies in prior order. `lead` is set when no native copy exists: there
+// is no original to protect, so all candidates (lead first, passthrough only if
+// cheap) are explored alike and the fastest locks without an A/B; the lead is
+// what runs where nothing is measured. Otherwise the A/B reference is `safe`,
+// else the baseline.
 struct Choice {
   std::vector<Strategy> cands;
   Strategy baseline = Strategy::passthrough;
   std::optional<Strategy> safe;
+  std::optional<Strategy> lead;
+  Strategy reference() const { return lead ? *lead : safe ? *safe : baseline; }
 };
 
 struct TunerConfig {
@@ -98,6 +104,7 @@ class Tuner {
     std::array<int, kNumStrategies> pending{};  // issued, not yet reported
     // online, once locked
     int alt = -1;                          // the other finalist
+    bool alt_close = false;                // within 2x of the locked side: worth re-checking online
     double lock_total = 0;                 // locked side's median total when it locked (drift reference)
     int64_t since = 0, taken = 0;          // runs since the last online sample; online samples so far
     std::vector<Sample> on_locked, on_alt;  // recent online samples of each side

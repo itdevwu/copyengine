@@ -74,6 +74,36 @@ struct Raw {
   size_t bytes;
 };
 
+// Mirror the kernel's structured-statement parameters (kernels.cu).
+struct StmtDesc {
+  int rank, sdt, ddt, mode;
+  unsigned numel;
+  unsigned shape[6];
+  long long ss[6], ds[6];
+};
+
+struct Base {
+  long long src, dst;
+};
+
+struct FusedBatch {
+  StmtDesc desc{};
+  i64 link_size = 1;  // itemsize of the side that lives in staging (cross-device only)
+  std::vector<Base> bases;
+};
+
+// Structured statements grouped by structure; for cross-device groups the
+// link side is addressed relative to the staging base.
+struct FusedPlan {
+  bool ok = false;
+  bool cross = false, h2d = false;
+  size_t stg_bytes = 0;
+  std::vector<Raw> raws;
+  std::vector<FusedBatch> batches;
+};
+
+constexpr size_t kMaxFusedBatches = 64;
+
 constexpr int kSlots = 16;
 constexpr long long kTypedChunk = 4096;      // elements per warp
 constexpr long long kByteChunk = 16 << 10;   // bytes per warp
@@ -147,6 +177,11 @@ class CudaExecutor final : public Executor {
     const bool same_dev = src_cuda && dst_cuda && g.src.device.index == g.dst.device.index;
     const size_t rects = g.rects.size();
     std::vector<Strategy> c;
+    const bool use_fused = s.kernels && fused_worthwhile(g);
+    auto with_fused = [&](std::vector<Strategy> v) {
+      if (use_fused) v.insert(v.begin(), Strategy::fused);
+      return v;
+    };
     if (g.pure()) {
       if (same_dev) {
         if (s.kernels) c.push_back(Strategy::kernel);
@@ -169,14 +204,14 @@ class CudaExecutor final : public Executor {
         c.push_back(Strategy::runs);
         if (rects <= 2) std::stable_partition(c.begin(), c.end(), [](Strategy x) { return x == Strategy::runs; });
       }
-      return c;
+      return with_fused(std::move(c));
     }
     if (!s.kernels) fail(Errc::unsupported, "dtype conversion on CUDA needs the kernel module: " + s.kernel_error);
     if (src_cuda && dst_cuda) {
       if (!same_dev) fail(Errc::unsupported, "converting copies between two GPUs are not supported yet");
-      return {Strategy::kernel};
+      return with_fused({Strategy::kernel});
     }
-    return {Strategy::staged};
+    return with_fused({Strategy::staged});
   }
 
   int64_t run(Strategy strat, const Group& g, const std::vector<Op>& ops, uintptr_t stream) override {
@@ -192,6 +227,7 @@ class CudaExecutor final : public Executor {
       case Strategy::kernel: return kernel(s, g, st);
       case Strategy::staged: return staged(s, g, st);
       case Strategy::bounce: return bounce(s, g.src, g.dst, cached_rows(g, Strategy::bounce), st);
+      case Strategy::fused: return fused(s, g, st);
       default: fail(Errc::unsupported, "CUDA backend cannot run strategy " + std::string(strategy_name(strat)));
     }
   }
@@ -557,28 +593,32 @@ class CudaExecutor final : public Executor {
     return f;
   }
 
-  // Uploads the chunk table through a pinned/device slot ring and launches.
+  // Copies a parameter table to the device through the pinned/device slot
+  // ring. The caller launches, then records slot.done on the stream.
+  Slot& upload(Dev& s, const void* data, size_t need, CUstream st) {
+    Slot& sl = s.slots[s.next++ % kSlots];
+    if (sl.used) check(d_->cuEventSynchronize(sl.done), "cuEventSynchronize");
+    if (sl.cap < need) {
+      if (sl.host) d_->cuMemFreeHost(sl.host);
+      if (sl.dev) d_->cuMemFree(sl.dev);
+      sl.host = nullptr, sl.dev = 0;
+      size_t cap = 64 << 10;
+      while (cap < need) cap <<= 1;
+      check(d_->cuMemHostAlloc(&sl.host, cap, 0), "cuMemHostAlloc");
+      check(d_->cuMemAlloc(&sl.dev, cap), "cuMemAlloc");
+      sl.cap = cap;
+    }
+    std::memcpy(sl.host, data, need);
+    check(d_->cuMemcpyHtoDAsync(sl.dev, sl.host, need, st), "cuMemcpyHtoDAsync");
+    return sl;
+  }
+
   void launch(Dev& s, const std::string& name, const std::vector<Chunk>& chunks, const cv::Fn& fn, CUstream st) {
     if (chunks.empty()) return;
     CUfunction f = function(s, name);
-    const size_t bytes = chunks.size() * sizeof(Chunk);
     for (size_t at = 0; at < chunks.size();) {
       const size_t n = std::min<size_t>(chunks.size() - at, size_t{1} << 24);
-      Slot& sl = s.slots[s.next++ % kSlots];
-      if (sl.used) check(d_->cuEventSynchronize(sl.done), "cuEventSynchronize");
-      const size_t need = n * sizeof(Chunk);
-      if (sl.cap < need) {
-        if (sl.host) d_->cuMemFreeHost(sl.host);
-        if (sl.dev) d_->cuMemFree(sl.dev);
-        sl.host = nullptr, sl.dev = 0;
-        size_t cap = 64 << 10;
-        while (cap < need) cap <<= 1;
-        check(d_->cuMemHostAlloc(&sl.host, cap, 0), "cuMemHostAlloc");
-        check(d_->cuMemAlloc(&sl.dev, cap), "cuMemAlloc");
-        sl.cap = cap;
-      }
-      std::memcpy(sl.host, chunks.data() + at, need);
-      check(d_->cuMemcpyHtoDAsync(sl.dev, sl.host, need, st), "cuMemcpyHtoDAsync");
+      Slot& sl = upload(s, chunks.data() + at, n * sizeof(Chunk), st);
       int count = static_cast<int>(n);
       CUdeviceptr table = sl.dev;
       cv::Fn fcopy = fn;
@@ -590,9 +630,145 @@ class CudaExecutor final : public Executor {
       sl.used = true;
       at += n;
     }
-    (void)bytes;
   }
 
+  void launch_stmt(Dev& s, const std::vector<Base>& bases, const StmtDesc& desc, const cv::Fn& fn, CUstream st) {
+    if (bases.empty()) return;
+    CUfunction f = function(s, "ce_stmt");
+    Slot& sl = upload(s, bases.data(), bases.size() * sizeof(Base), st);
+    CUdeviceptr table = sl.dev;
+    long long total = static_cast<long long>(bases.size()) * desc.numel;
+    StmtDesc dcopy = desc;
+    cv::Fn fcopy = fn;
+    void* args[] = {&table, &total, &dcopy, &fcopy};
+    const unsigned threads = 256;
+    const unsigned blocks = static_cast<unsigned>((total + threads - 1) / threads);
+    check(d_->cuLaunchKernel(f, blocks, 1, 1, threads, 1, 1, 0, st, args, nullptr), "cuLaunchKernel ce_stmt");
+    check(d_->cuEventRecord(sl.done, st), "cuEventRecord");
+    sl.used = true;
+  }
+
+  // ---- fused structured statements --------------------------------------------------------
+
+  FusedPlan build_fused(const Group& g) const {
+    FusedPlan P;
+    if (g.forms.empty()) return P;
+    const bool src_cuda = g.src.device.kind == DeviceKind::cuda, dst_cuda = g.dst.device.kind == DeviceKind::cuda;
+    if (src_cuda && dst_cuda && g.src.device.index != g.dst.device.index) return P;
+    P.cross = !(src_cuda && dst_cuda);
+    P.h2d = dst_cuda;
+    const int mode = g.pure() ? 0 : (g.fn.identity() ? 1 : 2);
+    std::vector<const Form*> reps;
+    std::vector<size_t> batch_of(g.forms.size());
+    for (size_t i = 0; i < g.forms.size(); ++i) {
+      const Form& f = *g.forms[i];
+      size_t j = 0;
+      while (j < reps.size() && !reps[j]->same_structure(f)) ++j;
+      if (j == reps.size()) {
+        if (reps.size() == kMaxFusedBatches) return P;
+        reps.push_back(&f);
+        FusedBatch b;
+        b.desc.rank = f.rank, b.desc.sdt = static_cast<int>(f.sdt), b.desc.ddt = static_cast<int>(f.ddt);
+        b.desc.mode = mode, b.desc.numel = static_cast<unsigned>(f.numel);
+        for (int k = 0; k < f.rank; ++k)
+          b.desc.shape[k] = static_cast<unsigned>(f.shape[k]), b.desc.ss[k] = f.ss[k], b.desc.ds[k] = f.ds[k];
+        b.link_size = static_cast<i64>(itemsize(P.h2d ? f.sdt : f.ddt));
+        P.batches.push_back(std::move(b));
+      }
+      batch_of[i] = j;
+      P.batches[j].bases.push_back({f.s_base, f.d_base});
+    }
+    if (!P.cross) {
+      P.ok = true;
+      return P;
+    }
+    // Link-side byte intervals: the whole extent of every statement.
+    std::vector<i64> lo(g.forms.size()), len(g.forms.size());
+    for (size_t i = 0; i < g.forms.size(); ++i) {
+      const Form& f = *g.forms[i];
+      const i64 sz = P.batches[batch_of[i]].link_size;
+      const auto [a, b] = P.h2d ? f.src_extent() : f.dst_extent();
+      // D2H writes the staged bytes back verbatim: the destination must have no holes.
+      if (!P.h2d && b - a + 1 != f.numel) return FusedPlan{};
+      lo[i] = a * sz, len[i] = (b - a + 1) * sz;
+    }
+    const Intervals iv = interval_union(lo, len);
+    // Staging offsets keep each interval's alignment modulo 8.
+    std::vector<i64> off(iv.start.size());
+    i64 cur = 0, payload = 0;
+    for (size_t k = 0; k < iv.start.size(); ++k) {
+      cur = ((cur + 7) & ~i64{7}) + (iv.start[k] & 7);
+      off[k] = cur;
+      cur += iv.end[k] - iv.start[k];
+      payload += iv.end[k] - iv.start[k];
+    }
+    const int64_t budget = std::max<int64_t>(opt_.staging_budget, 1 << 20);
+    if (cur > budget) return FusedPlan{};
+    if (P.h2d && payload > 2 * g.bytes() + (4 << 10)) return FusedPlan{};  // sparse source: not worth moving whole extents
+    P.stg_bytes = static_cast<size_t>(cur);
+    for (size_t k = 0; k < iv.start.size(); ++k) {
+      const size_t n = static_cast<size_t>(iv.end[k] - iv.start[k]);
+      if (P.h2d) P.raws.push_back({static_cast<uintptr_t>(iv.start[k]), static_cast<uintptr_t>(off[k]), n});
+      else P.raws.push_back({static_cast<uintptr_t>(off[k]), static_cast<uintptr_t>(iv.start[k]), n});
+    }
+    // Rebase the link side of every statement into staging (relative elements).
+    std::vector<size_t> seen(P.batches.size(), 0);
+    for (size_t i = 0; i < g.forms.size(); ++i) {
+      FusedBatch& b = P.batches[batch_of[i]];
+      Base& base = b.bases[seen[batch_of[i]]++];
+      long long& link = P.h2d ? base.src : base.dst;
+      const i64 byte = static_cast<i64>(link) * b.link_size;
+      const size_t k = static_cast<size_t>(std::upper_bound(iv.start.begin(), iv.start.end(), byte) - iv.start.begin()) - 1;
+      link = (off[k] + (byte - iv.start[k])) / b.link_size;
+    }
+    P.ok = true;
+    return P;
+  }
+
+  const FusedPlan& fused_plan(const Group& g) const {
+    auto& slot = g.exec_cache[static_cast<int>(Strategy::fused)];
+    if (!slot) slot = std::make_shared<FusedPlan>(build_fused(g));
+    return *static_cast<FusedPlan*>(slot.get());
+  }
+
+  // Short runs are where evaluating the statement beats copying runs.
+  bool fused_worthwhile(const Group& g) const {
+    if (g.forms.empty() || g.runs.empty()) return false;
+    const i64 avg = g.runs.total() / static_cast<i64>(g.runs.size());  // bytes for pure groups, else elements
+    return avg < (g.pure() ? 256 : 64) && fused_plan(g).ok;
+  }
+
+  int64_t fused(Dev& s, const Group& g, CUstream st) {
+    const FusedPlan& P = fused_plan(g);
+    if (!P.ok) fail(Errc::unsupported, "fused strategy is not applicable to this group");
+    const cv::Fn fn = to_cv(g.fn);
+    CUdeviceptr stg = 0;
+    std::vector<Raw> raws;
+    const Side dev_side{P.h2d ? g.dst.device : g.src.device, DType::u8, false};
+    const Side host_side{{DeviceKind::host, 0}, DType::u8, P.h2d ? g.src.pinned : g.dst.pinned};
+    if (P.cross) {
+      stg = staging(s, P.stg_bytes, st);
+      raws = P.raws;
+      for (Raw& r : raws) (P.h2d ? r.dst : r.src) += stg;
+      if (P.h2d) copy_raws(s, host_side, dev_side, raws, st);
+    }
+    std::vector<Base> bases;
+    for (const FusedBatch& b : P.batches) {
+      if (P.cross) {
+        bases = b.bases;
+        const long long add = static_cast<long long>(stg) / b.link_size;
+        for (Base& x : bases) (P.h2d ? x.src : x.dst) += add;
+        launch_stmt(s, bases, b.desc, fn, st);
+      } else {
+        launch_stmt(s, b.bases, b.desc, fn, st);
+      }
+    }
+    if (P.cross) {
+      if (!P.h2d) copy_raws(s, dev_side, host_side, raws, st);
+      staging_release(s, st);
+    }
+    return static_cast<int64_t>(P.batches.size()) + (P.cross ? static_cast<int64_t>(P.raws.size() > 2 ? 1 : P.raws.size()) : 0);
+  }
 
   static std::string kernel_name(const Group& g) {
     if (g.pure()) return "ce_bytes";

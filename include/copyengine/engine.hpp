@@ -18,8 +18,9 @@ enum class Strategy : uint8_t {
   kernel,         // CUDA: table-driven gather/scatter kernel (with cast / affine)
   staged,         // CUDA: dense raw copy to/from device staging + kernel on the device side
   bounce,         // CUDA: pageable host side packed through pinned buffers on the CPU
+  fused,          // CUDA: structured statements (strides, broadcast) evaluated by one kernel
 };
-inline constexpr int kNumStrategies = 7;
+inline constexpr int kNumStrategies = 8;
 std::string_view strategy_name(Strategy s);
 Strategy parse_strategy(std::string_view name);
 

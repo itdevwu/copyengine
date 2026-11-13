@@ -7,7 +7,7 @@
 namespace ce {
 
 namespace {
-constexpr std::string_view kNames[kNumStrategies] = {"passthrough", "runs", "runs_parallel", "batch", "kernel", "staged", "bounce"};
+constexpr std::string_view kNames[kNumStrategies] = {"passthrough", "runs", "runs_parallel", "batch", "kernel", "staged", "bounce", "fused"};
 
 double median(std::vector<double> v) {
   std::sort(v.begin(), v.end());

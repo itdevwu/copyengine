@@ -170,4 +170,102 @@ CE_HD D apply(S s, const Fn& f) {
   return from_float<D>(v);
 }
 
+// ---- runtime-dispatched conversion ---------------------------------------------
+// Same results as cast<D, S> / apply<D, S>, selected by dtype codes (the DType
+// enum order) instead of templates. Every source widens exactly into one of
+// three categories, so going through the category value changes no bits.
+
+enum { kF64 = 0, kF32, kF16, kBF16, kI64, kI32, kI16, kI8, kU8, kB8 };
+
+CE_HD int dt_size(int dt) {
+  switch (dt) {
+    case kF64: case kI64: return 8;
+    case kF32: case kI32: return 4;
+    case kF16: case kBF16: case kI16: return 2;
+    default: return 1;
+  }
+}
+
+struct Val {
+  double d;
+  float f;
+  long long i;
+  int cat;  // 0: d holds it, 1: f, 2: i
+};
+
+template <class T> CE_HD T rd(const void* p) {
+  T x;
+  memcpy(&x, p, sizeof(T));
+  return x;
+}
+template <class T> CE_HD void wr(void* p, T x) { memcpy(p, &x, sizeof(T)); }
+
+CE_HD Val load(const void* p, int dt) {
+  Val v;
+  v.d = 0, v.f = 0, v.i = 0, v.cat = 2;
+  switch (dt) {
+    case kF64: v.d = rd<double>(p), v.cat = 0; break;
+    case kF32: v.f = rd<float>(p), v.cat = 1; break;
+    case kF16: v.f = half_to_float(rd<uint16_t>(p)), v.cat = 1; break;
+    case kBF16: v.f = bf16_to_float(rd<uint16_t>(p)), v.cat = 1; break;
+    case kI64: v.i = rd<int64_t>(p); break;
+    case kI32: v.i = rd<int32_t>(p); break;
+    case kI16: v.i = rd<int16_t>(p); break;
+    case kI8: v.i = rd<int8_t>(p); break;
+    case kU8: v.i = rd<uint8_t>(p); break;
+    default: v.i = rd<uint8_t>(p) ? 1 : 0; break;
+  }
+  return v;
+}
+
+CE_HD float val_float(const Val& v) {
+  return v.cat == 0 ? static_cast<float>(v.d) : (v.cat == 1 ? v.f : static_cast<float>(v.i));
+}
+
+template <class I> CE_HD I val_int(const Val& v) {
+  return v.cat == 0 ? sat<I>(v.d) : (v.cat == 1 ? sat<I>(v.f) : static_cast<I>(v.i));
+}
+
+CE_HD void store_float(void* p, int dt, float x) {
+  switch (dt) {
+    case kF64: wr<double>(p, x); break;
+    case kF32: wr<float>(p, x); break;
+    case kF16: wr<uint16_t>(p, float_to_half(x)); break;
+    case kBF16: wr<uint16_t>(p, float_to_bf16(x)); break;
+    case kI64: wr<int64_t>(p, sat<int64_t>(x)); break;
+    case kI32: wr<int32_t>(p, sat<int32_t>(x)); break;
+    case kI16: wr<int16_t>(p, sat<int16_t>(x)); break;
+    case kI8: wr<int8_t>(p, sat<int8_t>(x)); break;
+    case kU8: wr<uint8_t>(p, sat<uint8_t>(x)); break;
+    default: wr<uint8_t>(p, static_cast<uint8_t>(x != 0.0f)); break;
+  }
+}
+
+// dst = cast(src) with the identity function (dtypes differ).
+CE_HD void dyn_cast(const void* s, int sdt, void* d, int ddt) {
+  const Val v = load(s, sdt);
+  switch (ddt) {
+    case kF64: wr<double>(d, v.cat == 0 ? v.d : (v.cat == 1 ? static_cast<double>(v.f) : static_cast<double>(v.i))); break;
+    case kF32: wr<float>(d, val_float(v)); break;
+    case kF16: wr<uint16_t>(d, float_to_half(val_float(v))); break;
+    case kBF16: wr<uint16_t>(d, float_to_bf16(val_float(v))); break;
+    case kI64: wr<int64_t>(d, val_int<int64_t>(v)); break;
+    case kI32: wr<int32_t>(d, val_int<int32_t>(v)); break;
+    case kI16: wr<int16_t>(d, val_int<int16_t>(v)); break;
+    case kI8: wr<int8_t>(d, val_int<int8_t>(v)); break;
+    case kU8: wr<uint8_t>(d, val_int<uint8_t>(v)); break;
+    default: wr<uint8_t>(d, static_cast<uint8_t>(v.cat == 0 ? v.d != 0 : (v.cat == 1 ? v.f != 0 : v.i != 0))); break;
+  }
+}
+
+// dst = fn(src), computed in f32.
+CE_HD void dyn_apply(const void* s, int sdt, void* d, int ddt, const Fn& f) {
+  float x = val_float(load(s, sdt));
+  x = x * f.scale;
+  x = x + f.bias;
+  if (f.round) x = rintf(x);
+  if (f.clamp) x = fminf(fmaxf(x, f.lo), f.hi);
+  store_float(d, ddt, x);
+}
+
 }  // namespace ce::cv

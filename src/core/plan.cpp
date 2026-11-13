@@ -52,6 +52,7 @@ Hash128 fingerprint(const Op& op) {
   h.add(std::bit_cast<uint32_t>(op.fn.lo));
   h.add(std::bit_cast<uint32_t>(op.fn.hi));
   h.add(op.ctx);
+  h.add(uint64_t{op.form != nullptr});
   h.add(static_cast<uint64_t>(op.src_lo));
   h.add(static_cast<uint64_t>(op.src_hi));
   h.add(op.runs.src);
@@ -59,6 +60,19 @@ Hash128 fingerprint(const Op& op) {
   h.add(op.runs.len);
   return h.done();
 }
+
+static std::pair<i64, i64> extent_of(i64 base, const std::array<i64, Form::kMaxRank>& shape,
+                                     const std::array<i64, Form::kMaxRank>& stride, int rank) {
+  i64 lo = base, hi = base;
+  for (int k = 0; k < rank; ++k) {
+    const i64 span = (shape[k] - 1) * stride[k];
+    lo += std::min<i64>(0, span), hi += std::max<i64>(0, span);
+  }
+  return {lo, hi};
+}
+
+std::pair<i64, i64> Form::src_extent() const { return extent_of(s_base, shape, ss, rank); }
+std::pair<i64, i64> Form::dst_extent() const { return extent_of(d_base, shape, ds, rank); }
 
 // ---- safety ----------------------------------------------------------------------
 
@@ -166,6 +180,8 @@ Plan build_plan(const std::vector<Op>& ops) {
       std::vector<i64> lo, len;
       for (int k : g.ops) lo.push_back(ops[k].src_lo), len.push_back(ops[k].src_hi - ops[k].src_lo);
       g.src_extent = interval_union(lo, len);
+      if (std::all_of(g.ops.begin(), g.ops.end(), [&](int k) { return ops[k].form != nullptr; }))
+        for (int k : g.ops) g.forms.push_back(ops[k].form);
       g.runs = g.runs.coalesce();
       g.rects = recover_2d(g.runs);
       if (!g.runs.empty()) plan.groups.push_back(std::move(g));

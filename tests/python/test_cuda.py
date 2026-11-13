@@ -247,7 +247,8 @@ def test_dense_permute_h2d_moves_once_and_permutes_on_device(pinned, dtype):
         e = ce.Engine(tune=False)
         e.copy_(dst, src)
         torch.testing.assert_close(dst.cpu(), src.contiguous(), rtol=0, atol=0)
-        assert e.stats()["last"]["strategies"] == ["staged"]
+        # 256-byte rows go through staging + chunk kernel; single elements through the fused kernel
+        assert e.stats()["last"]["strategies"] in (["staged"], ["fused"])
         assert e.stats()["last"]["calls"] == 2              # one dense H2D + one kernel
 
 
@@ -293,3 +294,76 @@ def test_broadcast_and_element_transpose_kernels():
     out = torch.empty(65, 33, device=DEV, dtype=torch.bfloat16)
     ce.Engine(tune=False).copy_(out, x.t())
     torch.testing.assert_close(out, x.t().bfloat16(), rtol=0, atol=0)
+
+
+# ---- fused structured statements -------------------------------------------------------------
+
+
+def test_fused_qscale_mixed_head_counts():
+    # Layers with different head counts: different structures, still one group.
+    B, N = 16, 16
+    heads = [8, 4, 8, 4, 2, 8]
+    k_qs = torch.rand(B, N, 1).pin_memory()
+    scales = [torch.zeros(B, N, s, device=DEV) for s in heads]
+
+    def body(e):
+        for t in scales:
+            t.zero_()
+        with e.scope():
+            for t, s in zip(scales, heads):
+                for b in range(B):
+                    e.copy_(t[b], k_qs[b].expand(N, s))
+
+    def check():
+        for t, s in zip(scales, heads):
+            torch.testing.assert_close(t.cpu(), k_qs.expand(B, N, s), rtol=0, atol=0)
+
+    e, seen = explore(body, check=check)
+    assert "fused" in seen
+    e2 = ce.Engine(tune=False)
+    body(e2)
+    check()
+    st = e2.stats()["last"]
+    assert st["strategies"] == ["fused"] and st["calls"] == 4     # 3 structures + 1 link copy
+
+
+@pytest.mark.parametrize("pinned", [False, True])
+def test_fused_d2h_dense_and_h2d_flip_with_fn(pinned):
+    x = torch.randn(40, 24, device=DEV)
+    out = torch.empty(24, 40, dtype=torch.float16)
+    out = out.pin_memory() if pinned else out
+    e = ce.Engine(tune=False)
+    e.copy_(out, x.t())                                  # D2H, element transpose + cast
+    assert e.stats()["last"]["strategies"] == ["fused"]
+    torch.testing.assert_close(out, x.t().cpu().half(), rtol=0, atol=0)
+
+    h = torch.randn(24, 40)
+    h = h.pin_memory() if pinned else h
+    q = torch.empty(40, 24, dtype=torch.int8, device=DEV)
+    fn = ce.Elementwise(scale=20.0, round=True, clamp=(-127, 127))
+    e.copy_(q, h.t().flip(0), fn=fn)                     # H2D, negative stride + quantize
+    want = torch.empty(40, 24, dtype=torch.int8)
+    ce.Engine(tune=False).copy_(want, h.t().flip(0), fn=fn)
+    assert torch.equal(q.cpu(), want)
+
+
+def test_fused_d2d_broadcast_and_strided_dst():
+    src = torch.randn(64, 1, device=DEV)
+    dst = torch.full((64, 32), -1.0, device=DEV)
+    e = ce.Engine(tune=False)
+    e.copy_(dst[:, ::2], src.expand(64, 16))             # strided destination keeps its holes
+    assert e.stats()["last"]["strategies"] == ["fused"]
+    want = torch.full((64, 32), -1.0, device=DEV)
+    want[:, ::2] = src
+    torch.testing.assert_close(dst, want, rtol=0, atol=0)
+
+
+def test_d2h_with_holes_does_not_use_fused():
+    src = torch.randn(64, 16, device=DEV)
+    dst = torch.full((64, 32), -1.0)
+    e = ce.Engine(tune=False)
+    e.copy_(dst[:, ::2], src)                            # host gaps must survive
+    assert "fused" not in e.stats()["last"]["strategies"]
+    want = torch.full((64, 32), -1.0)
+    want[:, ::2] = src.cpu()
+    torch.testing.assert_close(dst, want, rtol=0, atol=0)

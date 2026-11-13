@@ -66,6 +66,49 @@ extern "C" __global__ void ce_bytes(const Chunk* __restrict__ chunks, int n) {
   }
 }
 
+// Structured statements: dst[D(i)] = f(src[S(i)]) over a shared domain, for a
+// batch of statements with the same shape and strides but different bases.
+// One thread per element; strides may be 0 (broadcast) or negative. Dtypes are
+// dispatched at runtime (same bits as the typed kernels, see convert.hpp).
+struct StmtDesc {
+  int rank, sdt, ddt, mode;  // mode 0: raw element copy, 1: cast, 2: apply fn
+  unsigned numel;
+  unsigned shape[6];
+  long long ss[6], ds[6];
+};
+
+struct Base {
+  long long src, dst;
+};
+
+extern "C" __global__ void ce_stmt(const Base* __restrict__ bases, long long total, StmtDesc D, Fn fn) {
+  const long long e = blockIdx.x * static_cast<long long>(blockDim.x) + threadIdx.x;
+  if (e >= total) return;
+  const long long op = e / D.numel;
+  unsigned r = static_cast<unsigned>(e - op * D.numel);
+  long long so = bases[op].src, dof = bases[op].dst;
+  for (int k = D.rank - 1; k >= 0; --k) {
+    const unsigned q = r / D.shape[k], i = r - q * D.shape[k];
+    r = q;
+    so += static_cast<long long>(i) * D.ss[k];
+    dof += static_cast<long long>(i) * D.ds[k];
+  }
+  const void* sp = reinterpret_cast<const void*>(static_cast<uintptr_t>(so) * dt_size(D.sdt));
+  void* dp = reinterpret_cast<void*>(static_cast<uintptr_t>(dof) * dt_size(D.ddt));
+  if (D.mode == 0) {
+    switch (dt_size(D.sdt)) {
+      case 8: wr<uint64_t>(dp, rd<uint64_t>(sp)); break;
+      case 4: wr<uint32_t>(dp, rd<uint32_t>(sp)); break;
+      case 2: wr<uint16_t>(dp, rd<uint16_t>(sp)); break;
+      default: wr<uint8_t>(dp, rd<uint8_t>(sp)); break;
+    }
+  } else if (D.mode == 1) {
+    dyn_cast(sp, D.sdt, dp, D.ddt);
+  } else {
+    dyn_apply(sp, D.sdt, dp, D.ddt, fn);
+  }
+}
+
 #define CE_TYPES(X, ...)            \
   X(__VA_ARGS__, f64, double)       \
   X(__VA_ARGS__, f32, float)        \

@@ -96,7 +96,8 @@ struct Engine::Impl {
   }
 
   // Validated, absolute, safety-checked op ready to queue (runs may be empty).
-  Op make_op(const Endpoint& src, const Endpoint& dst, Runs runs, const Elementwise& fn, const Hints& hints) {
+  Op make_op(const Endpoint& src, const Endpoint& dst, Runs runs, const Elementwise& fn, const Hints& hints,
+             std::shared_ptr<const Form> form = nullptr) {
     const i64 ssz = static_cast<i64>(itemsize(src.dtype)), dsz = static_cast<i64>(itemsize(dst.dtype));
     for (const Endpoint* e : {&src, &dst}) {
       if (e->base % itemsize(e->dtype) != 0) fail(Errc::invalid_argument, "buffer base is not aligned to its dtype");
@@ -133,6 +134,7 @@ struct Engine::Impl {
     op.runs = std::move(runs);
     if (op.runs.empty()) return op;
     exec_for(op.src, op.dst);  // fail early when the platform is missing
+    op.form = std::move(form);
     op.fp = fingerprint(op);
     if (!safe.count(op.fp)) {
       check_safe(op);
@@ -145,8 +147,27 @@ struct Engine::Impl {
   static Op clone(const Op& o) {
     Op c;
     c.src = o.src, c.dst = o.dst, c.runs = o.runs, c.fn = o.fn, c.ctx = o.ctx;
-    c.src_lo = o.src_lo, c.src_hi = o.src_hi, c.fp = o.fp;
+    c.src_lo = o.src_lo, c.src_hi = o.src_hi, c.fp = o.fp, c.form = o.form;
     return c;
+  }
+
+  // Structured form of a table-free statement, or null if it has none.
+  static std::shared_ptr<const Form> make_form(const Endpoint& src, const Endpoint& dst, const Stmt& stmt) {
+    if (stmt.src.has_table() || stmt.dst.has_table()) return nullptr;
+    Form f;
+    f.sdt = src.dtype, f.ddt = dst.dtype;
+    f.s_base = static_cast<i64>(src.base / itemsize(src.dtype)) + stmt.src.base();
+    f.d_base = static_cast<i64>(dst.base / itemsize(dst.dtype)) + stmt.dst.base();
+    const auto &st = stmt.src.terms(), &dt = stmt.dst.terms();
+    for (size_t k = 0; k < st.size(); ++k) {
+      if (st[k].size == 1) continue;  // contributes nothing but its (already folded) base
+      if (f.rank == Form::kMaxRank) return nullptr;
+      f.shape[f.rank] = st[k].size, f.ss[f.rank] = st[k].stride, f.ds[f.rank] = dt[k].stride;
+      f.numel *= st[k].size;
+      ++f.rank;
+    }
+    if (f.numel <= 0 || f.numel >= (int64_t{1} << 31)) return nullptr;
+    return std::make_shared<const Form>(f);
   }
 
   void push(Op op, uintptr_t strm) {
@@ -208,7 +229,8 @@ struct Engine::Impl {
       push(clone(it->second), strm);
       return;
     }
-    Op op = make_op(src, dst, lower(stmt), fn, hints);
+    std::shared_ptr<const Form> form = hints.has_valid ? nullptr : make_form(src, dst, stmt);
+    Op op = make_op(src, dst, lower(stmt), fn, hints, std::move(form));
     if (static_cast<int>(stmt_cache.size()) >= opt.plan_cache * 4) stmt_cache.clear();
     stmt_cache.emplace(key, clone(op));
     push(std::move(op), strm);

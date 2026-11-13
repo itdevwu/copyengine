@@ -41,12 +41,30 @@ struct Side {
   bool operator==(const Side&) const = default;
 };
 
+// A table-free statement kept in structured form: absolute element indices in
+// units of the original dtypes (also for pure copies, whose runs are bytes).
+struct Form {
+  static constexpr int kMaxRank = 6;
+  int rank = 0;
+  int64_t numel = 1;
+  std::array<i64, kMaxRank> shape{}, ss{}, ds{};
+  i64 s_base = 0, d_base = 0;
+  DType sdt = DType::u8, ddt = DType::u8;
+  // Lowest / highest element index touched on each side.
+  std::pair<i64, i64> src_extent() const;
+  std::pair<i64, i64> dst_extent() const;
+  bool same_structure(const Form& o) const {
+    return rank == o.rank && shape == o.shape && ss == o.ss && ds == o.ds && sdt == o.sdt && ddt == o.ddt;
+  }
+};
+
 struct Op {
   Side src, dst;
   Runs runs;  // absolute element indices
   Elementwise fn;
   std::string ctx;
   int64_t src_lo = 0, src_hi = 0;  // the source allocation, absolute bytes: reads may widen within it
+  std::shared_ptr<const Form> form;  // null when the statement has tables or came in as runs
   Hash128 fp;  // content fingerprint
   // byte-interval read / write sets (absolute addresses), computed lazily
   mutable std::unique_ptr<Intervals> rd, wr;
@@ -70,6 +88,7 @@ struct Group {
   Runs runs;             // merged, coalesced
   Rects rects;           // structure recovered from runs
   Intervals src_extent;  // union of the source allocations (bytes): gap filling stays inside
+  std::vector<std::shared_ptr<const Form>> forms;  // one per op when every op is structured, else empty
   int wave = 0;
   // filled at plan time
   std::vector<Strategy> candidates;

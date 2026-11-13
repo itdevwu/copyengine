@@ -733,7 +733,7 @@ class CudaExecutor final : public Executor {
       if (f.ds[k] == 1 || f.ds[k] == -1) da = k;
       if (f.ss[k] == 1 || f.ss[k] == -1) sb = k;
     }
-    if (da >= 0 && sb >= 0 && da != sb && f.shape[da] >= 8 && f.shape[sb] >= 8) *a = da, *b = sb;
+    if (da >= 0 && sb >= 0 && da != sb && f.shape[da] >= 32 && f.shape[sb] >= 32) *a = da, *b = sb;  // full tiles only
   }
 
   void launch_stmt(const DevTable& table, const FusedBatch& batch, const cv::Fn& fn, long long sadd, long long dadd,

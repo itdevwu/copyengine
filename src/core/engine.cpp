@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -117,6 +118,64 @@ struct Engine::Impl {
   // Streams with issued, unfinished CUDA work, and whether any of it touches
   // host memory (only then must the host wait before returning or reading).
   std::vector<uintptr_t> cuda_streams;
+  std::vector<std::pair<uintptr_t, int>> pending_at;  // (stream, device) with pending work, for mark_pending
+  std::unordered_map<int64_t, std::vector<int64_t>> tokens;  // mark_pending token -> executor marks
+  int64_t next_token = 0;
+  std::thread::id owner;  // thread with the open scope (depth > 0)
+
+  // Objects whose destruction may run frontend code (Python objects, torch
+  // tensors): destroyed only once the engine lock is released (see Locked),
+  // so no thread ever waits for the GIL while holding the engine lock.
+  std::vector<std::shared_ptr<void>> graveyard;
+  int lock_depth = 0;
+  void bury(std::shared_ptr<void> p) {
+    if (p) graveyard.push_back(std::move(p));
+  }
+
+  // Copies whose host side is not waited for (an intercepted non_blocking
+  // copy_, or allow_async): their payloads hold the frontend's buffers, which
+  // must outlive the copy (torch would otherwise reuse pinned memory early).
+  struct Kept {
+    std::vector<int64_t> marks;
+    std::vector<std::shared_ptr<NativeOp>> payloads;
+  };
+  std::deque<Kept> kept;
+
+  void keep(const std::vector<Op>& ops, uintptr_t strm) {
+    if (!cuda) return;
+    Kept k;
+    std::vector<int> devs;
+    for (const Op& op : ops) {
+      const bool host = op.src.device.kind == DeviceKind::host || op.dst.device.kind == DeviceKind::host;
+      const bool cuda_side = op.src.device.kind == DeviceKind::cuda || op.dst.device.kind == DeviceKind::cuda;
+      if (!op.native || !host || !cuda_side || !(op.host_async || opt.allow_async)) continue;
+      k.payloads.push_back(op.native);
+      const int dev = op.src.device.kind == DeviceKind::cuda ? op.src.device.index : op.dst.device.index;
+      if (std::find(devs.begin(), devs.end(), dev) == devs.end()) devs.push_back(dev);
+    }
+    if (k.payloads.empty()) return;
+    for (int d : devs) k.marks.push_back(cuda->mark(strm, d));
+    kept.push_back(std::move(k));
+  }
+
+  // Lets go of kept payloads whose copies have completed (oldest first).
+  void reap(bool all = false) {
+    while (!kept.empty()) {
+      Kept& k = kept.front();
+      if (!all)
+        for (int64_t m : k.marks)
+          if (!cuda->ready(m)) return;
+      for (int64_t m : k.marks) cuda->release(m);
+      for (auto& p : k.payloads) bury(std::move(p));
+      kept.pop_front();
+    }
+  }
+
+  void check_thread() const {
+    if (depth > 0 && owner != std::this_thread::get_id())
+      fail(Errc::invalid_argument,
+           "this engine has a scope open on another thread; give each thread its own engine");
+  }
   bool host_pending = false;
   FlushStats last;
   int64_t total_flushes = 0, total_ops = 0, total_calls = 0, total_bytes = 0, plan_hits = 0;
@@ -269,10 +328,14 @@ struct Engine::Impl {
   void note_pending(const Side& s, const Side& d, uintptr_t strm, bool host_wait) {
     if (s.device.kind == DeviceKind::host && d.device.kind == DeviceKind::host) return;
     if (std::find(cuda_streams.begin(), cuda_streams.end(), strm) == cuda_streams.end()) cuda_streams.push_back(strm);
+    const int dev = s.device.kind == DeviceKind::cuda ? s.device.index : d.device.index;
+    if (std::find(pending_at.begin(), pending_at.end(), std::make_pair(strm, dev)) == pending_at.end())
+      pending_at.emplace_back(strm, dev);
     if (host_wait && (s.device.kind == DeviceKind::host || d.device.kind == DeviceKind::host)) host_pending = true;
   }
 
-  void run_native_now(const Op& op, uintptr_t strm) {
+  // torch's own copy keeps its buffers safe itself (it records events on pinned memory).
+  void run_native_now(Op& op, uintptr_t strm) {
     if (!queue.empty() && (strm != stream || conflicts(op.src.device, op.src_lo, op.src_hi, op.dst.device, op.dst_lo,
                                                       op.dst_hi)))
       flush();
@@ -280,12 +343,14 @@ struct Engine::Impl {
     if (host_only && host_pending) synchronize();  // host work may touch what CUDA work still uses
     op.native->run(strm);
     note_pending(op.src, op.dst, strm, !op.host_async);
+    bury(std::move(op.native));
     ++native_ops;
     if (depth == 0) finish();
   }
 
   void push(Op op, uintptr_t strm) {
     if (op.runs().empty()) return;
+    if (!kept.empty()) reap();
     if (native_now(op)) {
       run_native_now(op, strm);
       return;
@@ -487,12 +552,18 @@ struct Engine::Impl {
     ++memo.served;
     const Group& g = memo.plan->groups.front();
     const int64_t calls = run_group(g, memo.strategy, queue, stream, false, nullptr);
-    if (memo.strategy != Strategy::native) op.native.reset();
+    keep(queue, stream);
+    if (memo.strategy != Strategy::native) bury(std::move(op.native));
     ++total_flushes, ++total_ops, ++plan_hits;
     total_calls += calls;
     total_bytes += g.bytes();
-    if (last_ops && last_ops.use_count() == 1 && last_ops->size() == 1) (*last_ops)[0] = std::move(op);
-    else last_ops = std::make_shared<std::vector<Op>>(1, std::move(op));
+    if (last_ops && last_ops.use_count() == 1 && last_ops->size() == 1) {
+      bury(std::move((*last_ops)[0].native));
+      (*last_ops)[0] = std::move(op);
+    } else {
+      bury(std::move(last_ops));
+      last_ops = std::make_shared<std::vector<Op>>(1, std::move(op));
+    }
     if (last_ran.plan != memo.plan) last_ran = Ran{memo.plan, {memo.strategy}};
     queue.clear();
     q_reads.clear();
@@ -554,10 +625,11 @@ struct Engine::Impl {
     // Payloads hold the frontend's tensors: release them where the decision
     // is a ce strategy. Kept while undecided or native, so freeze() can replay
     // the reference.
+    keep(ops, stream);
     for (const Group& g : plan.groups) {
       const auto l = tuner.locked_strategy(g.bucket);
       if (l && *l != Strategy::native)
-        for (int k : g.ops) ops[k].native.reset();
+        for (int k : g.ops) bury(std::move(ops[k].native));
     }
     last = st;
     ++total_flushes;
@@ -565,6 +637,7 @@ struct Engine::Impl {
     total_calls += st.calls;
     total_bytes += st.bytes;
     plan_hits += hit;
+    bury(std::move(last_ops));
     last_ops = std::make_shared<std::vector<Op>>(std::move(ops));
     last_ran = std::move(ran);
   }
@@ -573,6 +646,8 @@ struct Engine::Impl {
     if (cuda_streams.empty()) return;
     cuda->sync(cuda_streams);
     cuda_streams.clear();
+    pending_at.clear();
+    reap(true);
     host_pending = false;
     poll_samples();
   }
@@ -584,10 +659,28 @@ struct Engine::Impl {
   }
 };
 
+namespace {
+// The engine lock. When the outermost holder lets go, the graveyard is
+// emptied after unlocking (see Impl::graveyard).
+class Locked {
+ public:
+  explicit Locked(Engine::Impl& m) : m_(m), lk_(m.mu) { ++m_.lock_depth; }
+  ~Locked() {
+    std::vector<std::shared_ptr<void>> drop;
+    if (--m_.lock_depth == 0) drop.swap(m_.graveyard);
+    lk_.unlock();
+  }  // `drop` is destroyed here, unlocked
+
+ private:
+  Engine::Impl& m_;
+  std::unique_lock<std::recursive_mutex> lk_;
+};
+}  // namespace
+
 Engine::Engine(EngineOptions options) : impl_(std::make_unique<Impl>(options)) {}
 Engine::~Engine() {
   try {
-    std::lock_guard lk(impl_->mu);
+    Locked lk(*impl_);
     impl_->flush();
     impl_->synchronize();
   } catch (...) {
@@ -597,29 +690,57 @@ Engine::~Engine() {
 void Engine::copy(const Endpoint& src, const Endpoint& dst, const Runs& runs, const Elementwise& fn,
                   const Hints& hints, uintptr_t stream) {
   const auto t0 = Clock::now();
-  std::lock_guard lk(impl_->mu);
+  Locked lk(*impl_);
+  impl_->check_thread();
   impl_->enqueue(src, dst, runs, fn, hints, stream, t0);
 }
 
 void Engine::copy(const Endpoint& src, const Endpoint& dst, const Stmt& stmt, const Elementwise& fn,
                   const Hints& hints, uintptr_t stream) {
   const auto t0 = Clock::now();
-  std::lock_guard lk(impl_->mu);
+  Locked lk(*impl_);
+  impl_->check_thread();
   impl_->enqueue_stmt(src, dst, stmt, fn, hints, stream, t0);
 }
 
 void Engine::fence(std::span<const Range> reads, std::span<const Range> writes) {
-  std::lock_guard lk(impl_->mu);
+  Locked lk(*impl_);
   impl_->fence(reads, writes);
 }
 
 void Engine::begin_scope() {
-  std::lock_guard lk(impl_->mu);
-  ++impl_->depth;
+  Locked lk(*impl_);
+  impl_->check_thread();
+  if (impl_->depth++ == 0) impl_->owner = std::this_thread::get_id();
+}
+
+int64_t Engine::mark_pending() {
+  Locked lk(*impl_);
+  Impl& m = *impl_;
+  if (m.pending_at.empty() || !m.cuda) return -1;
+  std::vector<int64_t> marks;
+  for (auto [st, dev] : m.pending_at) marks.push_back(m.cuda->mark(st, dev));
+  m.pending_at.clear();  // later work gets a later token
+  const int64_t t = m.next_token++;
+  m.tokens.emplace(t, std::move(marks));
+  return t;
+}
+
+bool Engine::done(int64_t token) {
+  Locked lk(*impl_);
+  Impl& m = *impl_;
+  auto it = m.tokens.find(token);
+  if (it == m.tokens.end()) return true;
+  for (int64_t mk : it->second)
+    if (!m.cuda->ready(mk)) return false;
+  for (int64_t mk : it->second) m.cuda->release(mk);
+  m.tokens.erase(it);
+  return true;
 }
 
 void Engine::end_scope() {
-  std::lock_guard lk(impl_->mu);
+  Locked lk(*impl_);
+  impl_->check_thread();
   if (impl_->depth == 0) fail(Errc::invalid_argument, "end_scope without begin_scope");
   if (--impl_->depth == 0) {
     impl_->flush();
@@ -628,34 +749,34 @@ void Engine::end_scope() {
 }
 
 void Engine::flush() {
-  std::lock_guard lk(impl_->mu);
+  Locked lk(*impl_);
   impl_->flush();
 }
 
 void Engine::synchronize() {
-  std::lock_guard lk(impl_->mu);
+  Locked lk(*impl_);
   impl_->synchronize();
 }
 
 int Engine::depth() const {
-  std::lock_guard lk(impl_->mu);
+  Locked lk(*impl_);
   return impl_->depth;
 }
 
 size_t Engine::queued() const {
-  std::lock_guard lk(impl_->mu);
+  Locked lk(*impl_);
   return impl_->queue.size();
 }
 
 const EngineOptions& Engine::options() const { return impl_->opt; }
 
 FlushStats Engine::last() const {
-  std::lock_guard lk(impl_->mu);
+  Locked lk(*impl_);
   return impl_->last;
 }
 
 std::string Engine::stats_json() const {
-  std::lock_guard lk(impl_->mu);
+  Locked lk(*impl_);
   const Impl& m = *impl_;
   Json strategies = Json::array();
   for (auto& s : m.last.strategies) strategies.push(s);
@@ -675,6 +796,7 @@ std::string Engine::stats_json() const {
       .set("bytes", m.total_bytes)
       .set("plan_hits", m.plan_hits)
       .set("native_ops", m.native_ops)
+      .set("kept", static_cast<uint64_t>(m.kept.size()))  // in-flight copies whose buffers are held
       .set("plans", static_cast<uint64_t>(m.plans.size()))
       .set("buckets", static_cast<uint64_t>(m.tuner.size()))
       .set("cuda", m.cuda ? m.cuda->info() : Json(m.cuda_error))
@@ -682,7 +804,7 @@ std::string Engine::stats_json() const {
 }
 
 std::string Engine::dump_profile() const {
-  std::lock_guard lk(impl_->mu);
+  Locked lk(*impl_);
   Json t = impl_->tuner.dump();
   return Json::object()
       .set("copyengine_profile", 2)
@@ -705,7 +827,7 @@ void Engine::load_profile(const std::string& text) {
     fail(Errc::invalid_argument, "profile: unsupported version (re-run warmup)");
   if (!j["hardware"].is_string() || j["hardware"].str() != hardware_fingerprint())
     fail(Errc::invalid_argument, "profile: recorded on different hardware");
-  std::lock_guard lk(impl_->mu);
+  Locked lk(*impl_);
   impl_->tuner.load(j);
   impl_->memo.valid = false;  // locked choices may have changed
 }
@@ -716,7 +838,7 @@ class FrozenImpl final : public Frozen {
   FrozenImpl(Engine::Impl* eng, std::shared_ptr<std::vector<Op>> ops, Ran ran)
       : eng_(eng), ops_(std::move(ops)), ran_(std::move(ran)) {}
   void run(uintptr_t stream) override {
-    std::lock_guard lk(eng_->mu);
+    Locked lk(*eng_);
     const auto& groups = ran_.plan->groups;
     for (size_t i = 0; i < groups.size(); ++i)
       eng_->run_group(groups[i], ran_.strategies[i], *ops_, stream, false, nullptr);
@@ -731,7 +853,7 @@ class FrozenImpl final : public Frozen {
 }  // namespace
 
 std::shared_ptr<Frozen> Engine::freeze() const {
-  std::lock_guard lk(impl_->mu);
+  Locked lk(*impl_);
   if (!impl_->last_ops) fail(Errc::invalid_argument, "freeze: nothing has been flushed yet");
   // What each group should run from now on, not what the last flush happened
   // to run (an exploration or online sample): the locked strategy, else the

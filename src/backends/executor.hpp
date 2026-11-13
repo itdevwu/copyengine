@@ -29,6 +29,8 @@ class Executor {
   virtual int64_t mark(uintptr_t /*stream*/, int /*device*/) { return -1; }
   virtual double elapsed(int64_t /*a*/, int64_t /*b*/) { return 0; }
   virtual void release(int64_t /*m*/) {}
+  // Whether the work before mark `m` has completed (does not release it).
+  virtual bool ready(int64_t /*m*/) { return true; }
   // Admission results etc. for stats().
   virtual Json info() { return Json(true); }
 };

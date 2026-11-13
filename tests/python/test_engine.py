@@ -636,3 +636,68 @@ def test_the_same_memory_described_twice_still_merges():
         e._e.copy_runs(whole, d, [128], [128], [128], ce.Elementwise())
     assert e.stats()["last"]["calls"] == 1  # the cut at 512 bytes is inside `whole`
     np.testing.assert_array_equal(dst, buf)
+
+
+# ---- threads ---------------------------------------------------------------------------------
+
+
+def test_default_engine_is_per_thread():
+    import threading
+    seen = []
+    t = threading.Thread(target=lambda: seen.append(ce.default_engine()))
+    t.start()
+    t.join()
+    assert seen[0] is not ce.default_engine()
+
+
+def test_a_scope_on_another_thread_is_an_error_not_a_silent_queue():
+    import threading
+    e = engine()
+    a = np.arange(16, dtype=np.float32)
+    b = np.zeros(16, np.float32)
+    entered, release = threading.Event(), threading.Event()
+
+    def owner():
+        with e.scope():
+            entered.set()
+            release.wait(5)
+
+    t = threading.Thread(target=owner)
+    t.start()
+    entered.wait(5)
+    try:
+        with pytest.raises(ValueError, match="another thread"):
+            e.copy_(b, a)
+        with pytest.raises(ValueError, match="another thread"):
+            with e.scope():
+                pass
+    finally:
+        release.set()
+        t.join()
+    e.copy_(b, a)  # fine once the scope is closed
+    np.testing.assert_array_equal(b, a)
+
+
+def test_threads_with_their_own_engines_run_concurrently():
+    import threading
+    errors = []
+
+    def work(seed):
+        try:
+            rng = np.random.default_rng(seed)
+            for _ in range(30):
+                src = rng.standard_normal((64, 32)).astype(np.float32)
+                dst = np.zeros((32, 64), np.float32)
+                with ce.scope():
+                    for r in range(0, 64, 8):
+                        ce.copy_(dst[:, r:r + 8], src[r:r + 8].T)
+                np.testing.assert_array_equal(dst, src.T)
+        except Exception as ex:  # noqa: BLE001 - reported below
+            errors.append(ex)
+
+    ts = [threading.Thread(target=work, args=(i,)) for i in range(8)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    assert not errors, errors

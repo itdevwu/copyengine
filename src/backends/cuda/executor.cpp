@@ -305,6 +305,15 @@ class CudaExecutor final : public Executor {
     if (m >= 0) free_marks_.push_back(m);
   }
 
+  bool ready(int64_t m) override {
+    if (m < 0) return true;
+    Push push(*d_, devs_[marks_[m].dev].ctx);
+    const CUresult q = d_->cuEventQuery(marks_[m].ev);
+    if (q == CUDA_ERROR_NOT_READY) return false;
+    check(q, "cuEventQuery");
+    return true;
+  }
+
   Json info() override {
     Json devs = Json::array();
     for (size_t i = 0; i < devs_.size(); ++i) {

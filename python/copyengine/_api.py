@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import collections
 import json
 import statistics
 import sys
@@ -95,7 +96,8 @@ class Engine:
         self._e = _core.Engine(self._opts)
         self._handle = self._e.handle
         self._native = native_copy  # replaceable in tests
-        self._held: list[Any] = []
+        self._held: list[Any] = []         # inside a scope: buffers of queued copies
+        self._inflight: collections.deque = collections.deque()  # allow_async: (token, buffers) until done
         self._lock = threading.RLock()
         self._force = _intercept  # tests: "shim" or "mode" regardless of what is installed
         self._set_depth(0)        # scope depth as seen from Python: whether queued copies need references held
@@ -134,16 +136,29 @@ class Engine:
             self._e.synchronize()
             if self._e.depth == 0:
                 self._held.clear()
+                self._inflight.clear()
 
     def synchronize(self) -> None:
         with self._lock:
             self._e.synchronize()
             if self._e.depth == 0 and self._e.queued == 0:
                 self._held.clear()
+                self._inflight.clear()
 
     def _after(self, *objs) -> None:
-        if self._hold:
+        if self._depth > 0:
             self._held.extend(objs)
+        elif self._opts.allow_async:
+            self._retire(objs)
+
+    def _retire(self, objs) -> None:
+        """allow_async, outside a scope: keep `objs` until the work issued so far completes."""
+        inflight = self._inflight
+        while inflight and self._e.done(inflight[0][0]):
+            inflight.popleft()
+        token = self._e.mark_pending()
+        if token >= 0 and objs:
+            inflight.append((token, objs))
 
     def _set_depth(self, d: int) -> None:
         self._depth = d
@@ -170,7 +185,7 @@ class Engine:
                 # dtype / device / layout the op does not take: the general path decides
             else:
                 if self._hold:
-                    self._held.extend((src, dst))
+                    self._after(src, dst)
                 return dst
         if not ctx and torch_fast(dst) and torch_fast(src):
             dep, ds, dst_, doff, dcuda = torch_parts(dst)
@@ -357,8 +372,10 @@ class _Scope:
             with e._lock:
                 e._set_depth(e._depth - 1)
                 e._e.end_scope()
-                if e._depth == 0 and not e._opts.allow_async:
-                    e._held.clear()
+                if e._depth == 0:
+                    held, e._held = e._held, []
+                    if e._opts.allow_async:
+                        e._retire(held)
         if self.timed:
             e._sites[self.site].report(self.kind == "mode", time.perf_counter() - self.t0)
 
@@ -379,8 +396,9 @@ class FrozenPlan:
 
 # ---- module-level default engine ------------------------------------------------------
 
-_default: Optional[Engine] = None
-_default_lock = threading.Lock()
+# One per thread: a scope queues the copies of the engine it belongs to, so a
+# shared default engine would pull other threads' copies into it.
+_default = threading.local()
 
 
 if torch is not None and _shim.lib is None and "CE_SHIM=0" not in _shim.error:
@@ -389,11 +407,11 @@ if torch is not None and _shim.lib is None and "CE_SHIM=0" not in _shim.error:
 
 
 def default_engine() -> Engine:
-    global _default
-    with _default_lock:
-        if _default is None:
-            _default = Engine()
-        return _default
+    """This thread's engine (created on first use)."""
+    e = getattr(_default, "engine", None)
+    if e is None:
+        e = _default.engine = Engine()
+    return e
 
 
 def scope():

@@ -69,8 +69,10 @@ struct Range {
   uintptr_t lo = 0, hi = 0;
 };
 
-// Lazy copy queue. Not thread-safe across scopes: give each thread its own
-// engine, or serialize access (methods take an internal lock).
+// Lazy copy queue. Methods take an internal lock, so threads may share an
+// engine; but while one thread has a scope open, another thread's copies or
+// scopes on the same engine fail (they would be queued into that scope):
+// give each thread its own engine.
 class Engine {
  public:
   explicit Engine(EngineOptions options = EngineOptions::from_env());
@@ -95,6 +97,11 @@ class Engine {
   void end_scope();
   void flush();         // plan + issue everything queued
   void synchronize();   // wait for all issued work, device-only copies included
+  // A token for the work issued so far (-1: none is pending), and whether it
+  // has completed, without blocking. done() forgets the token once it is true.
+  // Callers keep a copy's buffers alive until then (allow_async).
+  int64_t mark_pending();
+  bool done(int64_t token);
   int depth() const;
   size_t queued() const;
 

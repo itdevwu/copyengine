@@ -336,6 +336,8 @@ NB_MODULE(_core, m) {
       .def("end_scope", &ce::Engine::end_scope, nb::call_guard<nb::gil_scoped_release>())
       .def("flush", &ce::Engine::flush, nb::call_guard<nb::gil_scoped_release>())
       .def("synchronize", &ce::Engine::synchronize, nb::call_guard<nb::gil_scoped_release>())
+      .def("mark_pending", &ce::Engine::mark_pending)
+      .def("done", &ce::Engine::done, "token"_a)
       .def_prop_ro("depth", &ce::Engine::depth)
       .def_prop_ro("queued", &ce::Engine::queued)
       .def("stats_json", &ce::Engine::stats_json)

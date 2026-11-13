@@ -142,6 +142,11 @@ fastest.
   copies are not waited for; intercepted `copy_` keeps its `non_blocking`
   behavior; the explicit `ce.copy_` returns with any host-side copy complete
   (unless the engine was created with `allow_async=True`).
+- Threads: `ce.scope()` and `ce.copy_` use a per-thread default engine. An
+  `Engine` you share between threads works while none of them has a scope
+  open on it; a copy or scope from another thread during one raises an error.
+- Buffers of copies that are not waited for (intercepted `non_blocking`
+  copies, `allow_async`) are kept alive until the GPU is done with them.
 - Each destination element must be written once per copy: duplicate scatter
   indices and a source overlapping its own destination raise `UnsafeCopy` in
   the explicit API (an intercepted `copy_` leaves those to torch).

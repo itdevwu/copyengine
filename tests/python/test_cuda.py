@@ -478,3 +478,57 @@ def test_fused_more_statements_than_one_grid_row():
             e.copy_(dst[i], src[i].expand(4))
     assert e.stats()["last"]["strategies"] == ["fused"]
     torch.testing.assert_close(dst, src.expand(n, 4), rtol=0, atol=0)
+
+
+# ---- buffers of copies the host does not wait for -------------------------------------------
+
+
+def _reuse_pinned_after_free(start_copy, later, n=1 << 20):
+    """Start a copy from a pinned tensor while the GPU is busy, drop the tensor and
+    let the engine move on to other (already planned) work: until the copy has
+    run, torch must not hand that pinned memory to anyone else, and the copy
+    must deliver the original data. (WSL's driver captures pinned sources at
+    submit time, so only the pointer check can fail there.)"""
+    later()  # planned once now: planning may synchronize, the timed part must not
+    src = torch.arange(n, dtype=torch.float32).pin_memory()
+    want, p = src.clone(), src.data_ptr()
+    dst = torch.zeros(n, device=DEV)
+    torch.cuda._sleep(2_000_000_000)  # the copy is queued behind this
+    start_copy(dst, src)
+    del src
+    later()
+    assert not torch.cuda.current_stream().query(), "the GPU finished too early for this test"
+    junk = torch.empty(n, pin_memory=True)
+    assert junk.data_ptr() != p, "pinned memory of an in-flight copy was reused"
+    junk.fill_(-1.0)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(dst.cpu(), want, rtol=0, atol=0)
+
+
+def test_allow_async_keeps_pinned_sources_alive():
+    e = ce.Engine(allow_async=True, prior_only=True)
+    small = (torch.zeros(4, device=DEV), torch.ones(4, device=DEV))
+    _reuse_pinned_after_free(lambda d, s: e.copy_(d, s), lambda: e.copy_(*small))
+    for _ in range(200):  # references are let go as copies complete: no growth
+        e.copy_(torch.zeros(4, device=DEV), torch.ones(4).pin_memory())
+    torch.cuda.synchronize()
+    e.copy_(torch.zeros(4, device=DEV), torch.ones(4).pin_memory())
+    assert len(e._inflight) <= 2
+
+
+@pytest.mark.parametrize("intercept", ["mode", "shim"])
+def test_intercepted_non_blocking_keeps_pinned_sources_alive(intercept):
+    if intercept == "shim" and ce._shim.lib is None:
+        pytest.skip(ce._shim.error)
+    e = ce.Engine(prior_only=True, _intercept=intercept)
+
+    def start(d, s):
+        with e.scope():
+            d.copy_(s, non_blocking=True)
+
+    def later():  # a new flush replaces the last one's ops
+        a, b = torch.zeros(4, device=DEV), torch.ones(4, device=DEV)
+        with e.scope():
+            a.copy_(b)
+
+    _reuse_pinned_after_free(start, later)

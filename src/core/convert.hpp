@@ -4,13 +4,15 @@
 // so both produce identical bits. Pure integer / IEEE arithmetic only: no
 // intrinsics, no FMA (callers compile with -ffp-contract=off / --fmad=false).
 
+#include <math.h>
 #include <stdint.h>
+#include <string.h>
+
+#include <type_traits>
 
 #if defined(__CUDACC__)
 #define CE_HD __host__ __device__ __forceinline__
 #else
-#include <math.h>
-#include <string.h>
 #define CE_HD inline
 #endif
 
@@ -130,13 +132,13 @@ template <> struct is_halfish<bf16_t> { static constexpr bool value = true; };
 // Identity-function conversion S -> D (see the rules in copyengine/types.hpp).
 template <class D, class S>
 CE_HD D cast(S s) {
-  if constexpr (sizeof(D) == sizeof(S) && __is_same(D, S)) {
+  if constexpr (sizeof(D) == sizeof(S) && std::is_same_v<D, S>) {
     return s;
-  } else if constexpr (__is_same(D, bool_t)) {
-    if constexpr (__is_same(S, bool_t)) return s;
+  } else if constexpr (std::is_same_v<D, bool_t>) {
+    if constexpr (std::is_same_v<S, bool_t>) return s;
     else if constexpr (is_int<S>::value) return {static_cast<uint8_t>(s != 0)};
     else return {static_cast<uint8_t>(widen(s) != 0)};
-  } else if constexpr (__is_same(S, bool_t)) {
+  } else if constexpr (std::is_same_v<S, bool_t>) {
     if constexpr (is_int<D>::value) return static_cast<D>(s.v ? 1 : 0);
     else return from_float<D>(s.v ? 1.0f : 0.0f);
   } else if constexpr (is_int<S>::value) {
@@ -146,8 +148,8 @@ CE_HD D cast(S s) {
   } else {
     // S is float-like
     if constexpr (is_int<D>::value) return sat<D>(widen(s));
-    else if constexpr (__is_same(D, double)) return static_cast<double>(widen(s));
-    else if constexpr (__is_same(D, float)) return static_cast<float>(widen(s));
+    else if constexpr (std::is_same_v<D, double>) return static_cast<double>(widen(s));
+    else if constexpr (std::is_same_v<D, float>) return static_cast<float>(widen(s));
     else return from_float<D>(static_cast<float>(widen(s)));
   }
 }

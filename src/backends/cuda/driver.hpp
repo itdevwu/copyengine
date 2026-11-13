@@ -41,7 +41,14 @@ namespace ce::cuda {
   X(cuMemsetD8Async)            \
   X(cuMemcpyHtoDAsync)          \
   X(cuMemcpyDtoHAsync)          \
-  X(cuMemcpyDtoDAsync)
+  X(cuMemcpyDtoDAsync)          \
+  X(cuMemcpyAsync)              \
+  X(cuMemcpy2DAsync)            \
+  X(cuStreamWaitEvent)          \
+  X(cuEventQuery)               \
+  X(cuModuleLoadData)           \
+  X(cuModuleGetFunction)        \
+  X(cuLaunchKernel)
 
 // Present only on newer drivers; null when missing.
 #define CE_CUDA_OPTIONAL(X)              \

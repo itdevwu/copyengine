@@ -1,9 +1,11 @@
 build_dir := "build/dev"
+# Fast local builds compile kernels for this machine's GPU only; wheels use the full list.
+cuda_archs := env_var_or_default("CE_CUDA_ARCHS", "native")
 
 default: test
 
 configure:
-    cmake -S . -B {{build_dir}} -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+    cmake -S . -B {{build_dir}} -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCE_CUDA_ARCHS={{cuda_archs}}
 
 build: configure
     cmake --build {{build_dir}}
@@ -12,7 +14,7 @@ test-cpp: build
     ctest --test-dir {{build_dir}} --output-on-failure
 
 test-python:
-    pip install --no-build-isolation . -q
+    SKBUILD_CMAKE_DEFINE="CE_CUDA_ARCHS={{cuda_archs}}" pip install --no-build-isolation . -q
     pytest -q
 
 test: test-cpp test-python

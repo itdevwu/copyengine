@@ -9,6 +9,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN python3 -m venv /opt/venv \
     && /opt/venv/bin/pip install --no-cache-dir -U pip \
-    && /opt/venv/bin/pip install --no-cache-dir scikit-build-core nanobind pytest numpy \
+    && /opt/venv/bin/pip install --no-cache-dir scikit-build-core nanobind pytest numpy
+
+# Optional: PyTorch for the torch-facing tests and benchmarks.
+ARG TORCH_INDEX=https://download.pytorch.org/whl/cu128
+ARG WITH_TORCH=1
+RUN if [ "$WITH_TORCH" = "1" ]; then \
+      /opt/venv/bin/pip install --no-cache-dir torch --index-url "$TORCH_INDEX"; \
+    fi \
     && chmod -R a+rwX /opt/venv
 ENV PATH=/opt/venv/bin:$PATH

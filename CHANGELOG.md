@@ -1,0 +1,34 @@
+# Changelog
+
+copyengine follows [semantic versioning](https://semver.org). From 0.1.0 on,
+the Python API, the C ABI (`CE_ABI_VERSION`) and the tuning profile format
+change incompatibly only in a new minor (0.x) or major release.
+
+## 0.1.0
+
+First release.
+
+- `ce.scope()`: inside it, unchanged torch `copy_` calls are queued, merged
+  and issued together; every other op is ordered after the queued copies it
+  touches. A C++ dispatcher shim does the interception (prebuilt for torch
+  2.9, 2.10 and 2.11, compiled on import for others); a pure-Python
+  interception with the same results is the fallback.
+- Explicit API: `ce.copy_` for any strided views with broadcast,
+  `ce.lazy(...)` views torch cannot express (gather + permute + slice),
+  `ce.gather` / `ce.scatter_`, `ce.segments`, conversions and quantization
+  with `ce.Elementwise`, `Engine.freeze()` replay.
+- Strategies on CUDA: merged and batched DMA (`cuMemcpyBatchAsync`), 2-D
+  copies, vectorized copy and conversion kernels, dense link copies with the
+  reordering done on the GPU, pinned bounce buffers for pageable memory. Host
+  copies run on worker threads.
+- Measured choices: torch's own copy is the baseline; other strategies must
+  win a paired A/B, and locked decisions are re-checked online.
+- dtypes: float64/32/16, bfloat16, int64/32/16/8, uint8, bool. Host and GPU
+  conversions are bit-identical.
+- Platforms: Linux x86_64, Python 3.10+, CUDA 12.x and 13.x drivers (loaded at
+  runtime), torch 2.9+ for the torch integration. A stable C ABI and CMake
+  package for C and C++ callers.
+
+Known limits: no fp8 dtypes; copies between two GPUs are implemented but have
+not been tested on a multi-GPU machine; small explicit copies pay a few
+microseconds of host overhead more than torch.

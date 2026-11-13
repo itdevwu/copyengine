@@ -48,11 +48,14 @@ scope: it runs as usual, ordered correctly around the copies.
 
 ## What it guarantees
 
-1. **Not slower than the original.** The framework's own copy (torch's
-   `copy_`) is always a candidate. Anything else is measured against it,
+1. **Not slower than the original.** Wherever torch has the same copy, torch's
+   own `copy_` is always a candidate. Anything else is measured against it,
    including the time copyengine itself spends planning and submitting, and is
    kept only if it is clearly faster. Decisions keep being re-checked while
-   your program runs.
+   your program runs. Copies only copyengine can express (`ce.lazy` gathers,
+   `ce.segments`, conversions with `fn=`) have no original to compare with:
+   there it picks the fastest of its own strategies, which can still lose to a
+   torch rewrite of the same thing.
 2. **The same results.** copyengine only takes a copy when it can produce
    exactly torch's result; otherwise torch runs it. Host and GPU conversions
    are bit-identical.

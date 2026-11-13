@@ -3,7 +3,9 @@
 ## Layout
 
 - `include/copyengine/copyengine.h` is the stable C ABI (`ce_` prefix). Any
-  incompatible change bumps `CE_ABI_VERSION`.
+  incompatible change bumps `CE_ABI_VERSION`. Until the first release, the C
+  ABI, Python API and profile format may change freely; from then on they
+  follow semver.
 - `include/copyengine/*.hpp` + `src/core`: the platform-independent planner
   (namespace `ce`): IR and lowering (`ir`), planning and dependencies (`plan`),
   tuner, engine, probe. It must not include torch or CUDA headers.
@@ -16,6 +18,11 @@
   `-ffp-contract=off`, kernels `--fmad=false`).
 - `src/capi` implements the C ABI; `src/python` is the nanobind extension
   `copyengine._core`; `python/copyengine` is the Python layer.
+- torch integration is layered, and all logic stays in the torch-free core:
+  `_torch` on the stable libtorch ABI (descriptors, explicit APIs as custom
+  ops; one build for every supported torch), a per-torch-version interception
+  shim holding only dispatch-key registration and redispatch, and
+  TorchDispatchMode as the fallback when the shim is missing.
 - The version lives only in `project(... VERSION ...)` in `CMakeLists.txt`.
 
 ## Invariants
@@ -27,6 +34,15 @@
 - New platform features are admitted only after a verified test copy.
 - Backend tables built per group go in `Group::exec_cache`; hot paths do not
   re-plan.
+- No regression: the framework's own copy is the baseline. Dominance-safe
+  transforms apply directly; a speculative strategy is used only after it wins
+  a paired A/B against the baseline that counts host and GPU time. Ties keep
+  the baseline.
+- The native baseline is offered only for dtype pairs whose bits match ce's,
+  backed by a test.
+- Hot paths never synchronize; only warmup exploration and validation may.
+- Intercepted `copy_` keeps the caller's `non_blocking` semantics; explicit
+  `ce.copy_` returns with host-side copies complete.
 
 ## Scope
 

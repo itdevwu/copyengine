@@ -19,7 +19,7 @@ int main(void) {
 
   ce_engine_options o;
   ce_engine_options_default(&o);
-  o.tune = 0;
+  o.explore = 0;
   ce_engine* e = NULL;
   CHECK(ce_engine_create(&o, &e) == CE_OK);
 

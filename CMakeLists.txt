@@ -23,6 +23,7 @@ configure_file(src/core/config.hpp.in ${CMAKE_CURRENT_BINARY_DIR}/generated/copy
 add_library(copyengine
   src/core/version.cpp
   src/core/probe.cpp
+  src/core/ir.cpp
   src/capi/capi.cpp
 )
 add_library(copyengine::copyengine ALIAS copyengine)

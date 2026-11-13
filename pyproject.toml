@@ -9,7 +9,7 @@ description = "A software copy planner for ML infra: batches, fuses and schedule
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = ["numpy>=1.22"]
 
 [project.optional-dependencies]
 test = ["pytest>=8"]

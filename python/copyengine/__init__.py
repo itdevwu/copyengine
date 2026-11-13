@@ -3,9 +3,36 @@
 import json as _json
 
 from . import _core
-from ._core import ABI_VERSION, __version__
+from ._core import (
+    ABI_VERSION,
+    Access,
+    BackendError,
+    CopyEngineError,
+    NeedsMaterialize,
+    Rects,
+    Runs,
+    Stmt,
+    Unsupported,
+    UnsafeCopy,
+    __version__,
+    lower,
+)
 
-__all__ = ["ABI_VERSION", "__version__", "probe"]
+__all__ = [
+    "ABI_VERSION",
+    "Access",
+    "BackendError",
+    "CopyEngineError",
+    "NeedsMaterialize",
+    "Rects",
+    "Runs",
+    "Stmt",
+    "Unsupported",
+    "UnsafeCopy",
+    "__version__",
+    "lower",
+    "probe",
+]
 
 
 def probe(bandwidth: bool = False) -> dict:

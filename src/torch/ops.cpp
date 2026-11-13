@@ -13,6 +13,7 @@
 #include <torch/csrc/stable/library.h>
 #include <torch/csrc/stable/ops.h>
 #include <torch/csrc/stable/tensor.h>
+#include <torch/headeronly/core/Layout.h>
 #include <torch/headeronly/core/ScalarType.h>
 #include <torch/headeronly/util/Exception.h>
 
@@ -49,6 +50,7 @@ bool same_bits(ST d, ST s) { return d == s || (is_float(d) && s != ST::Bool); }
 // The whole storage is the endpoint; the view is (shape, strides, offset) in elements.
 ce::Endpoint endpoint(const Tensor& t) {
   ce::Endpoint e;
+  STD_TORCH_CHECK(t.layout() == c10::Layout::Strided, "[copyengine:3] only strided tensors are supported");
   STD_TORCH_CHECK(to_dtype(t.scalar_type(), &e.dtype), "[copyengine:3] unsupported dtype");
   const int64_t isz = static_cast<int64_t>(t.element_size());
   e.base = reinterpret_cast<uintptr_t>(t.data_ptr()) - static_cast<uintptr_t>(t.storage_offset() * isz);

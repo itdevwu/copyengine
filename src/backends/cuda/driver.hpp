@@ -25,6 +25,7 @@ namespace ce::cuda {
   X(cuDevicePrimaryCtxRelease)  \
   X(cuCtxPushCurrent)           \
   X(cuCtxPopCurrent)            \
+  X(cuCtxGetCurrent)            \
   X(cuCtxGetStreamPriorityRange) \
   X(cuStreamCreate)             \
   X(cuStreamDestroy)            \

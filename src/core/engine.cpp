@@ -408,8 +408,8 @@ struct Engine::Impl {
     });
   }
 
-  void run_group(const Group& g, Strategy s, const std::vector<Op>& ops, uintptr_t strm, bool measure,
-                 FlushStats* st) {
+  int64_t run_group(const Group& g, Strategy s, const std::vector<Op>& ops, uintptr_t strm, bool measure,
+                    FlushStats* st) {
     Executor& ex = exec_for(g.src, g.dst);
     if (&ex == &host && host_pending) synchronize();  // host work may touch what CUDA work still uses
     const int64_t a = measure ? ex.mark(strm, device_of(g)) : -1;
@@ -435,10 +435,40 @@ struct Engine::Impl {
       st->bytes += g.bytes();
       st->strategies.emplace_back(strategy_name(s));
     }
+    return calls;
+  }
+
+  // The hot depth-0 case: the same lone op as last time, its strategy locked.
+  // Runs it without hashing, tuner lookups, key statistics or stats strings.
+  struct Memo {
+    bool valid = false;
+    Hash128 fp;
+    std::shared_ptr<const Plan> plan;
+    Strategy strategy = Strategy::passthrough;
+  } memo;
+
+  bool flush_memo() {
+    if (!memo.valid || queue.size() != 1) return false;
+    Op& op = queue.front();
+    if (!(op.fp == memo.fp) || (memo.strategy == Strategy::native && !op.native)) return false;
+    const Group& g = memo.plan->groups.front();
+    const int64_t calls = run_group(g, memo.strategy, queue, stream, false, nullptr);
+    if (memo.strategy != Strategy::native) op.native.reset();
+    ++total_flushes, ++total_ops, ++plan_hits;
+    total_calls += calls;
+    total_bytes += g.bytes();
+    if (last_ops && last_ops.use_count() == 1 && last_ops->size() == 1) (*last_ops)[0] = std::move(op);
+    else last_ops = std::make_shared<std::vector<Op>>(1, std::move(op));
+    if (last_ran.plan != memo.plan) last_ran = Ran{memo.plan, {memo.strategy}};
+    queue.clear();
+    q_reads.clear();
+    q_writes.clear();
+    return true;
   }
 
   void flush() {
     if (queue.empty()) return;
+    if (flush_memo()) return;
     poll_samples();
     std::vector<Op> ops;
     ops.swap(queue);
@@ -469,10 +499,13 @@ struct Engine::Impl {
     Ran ran{pp, {}};
     ran.strategies.reserve(plan.groups.size());
     bool any_native = false;
+    memo.valid = false;
     for (const Group& g : plan.groups) {
       const Choice c = choice_for(g, ops);
       Tuner::Pick p{c.baseline, false};
       if (!opt.disable) p = tuner.pick(g.bucket, c);
+      if (ops.size() == 1 && plan.groups.size() == 1 && !p.measure && (opt.disable || tuner.locked(g.bucket)))
+        memo = {true, ops.front().fp, pp, p.strategy};
       run_group(g, p.strategy, ops, stream, p.measure, &st);
       ran.strategies.push_back(p.strategy);
       any_native |= p.strategy == Strategy::native;
@@ -632,6 +665,7 @@ void Engine::load_profile(const std::string& text) {
     fail(Errc::invalid_argument, "profile: recorded on different hardware");
   std::lock_guard lk(impl_->mu);
   impl_->tuner.load(j);
+  impl_->memo.valid = false;  // locked choices may have changed
 }
 
 namespace {

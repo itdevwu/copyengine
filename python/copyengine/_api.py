@@ -31,6 +31,7 @@ from ._tensor import (
 
 Elementwise = _core.Elementwise
 _IDENTITY = _core.Elementwise()
+_Tensor = torch.Tensor if torch is not None else None
 
 if torch is not None:
     _FLOATS = (torch.float16, torch.bfloat16, torch.float32, torch.float64)
@@ -95,6 +96,7 @@ class Engine:
         self._held: list[Any] = []
         self._lock = threading.RLock()
         self._force = _intercept  # tests: "shim" or "mode" regardless of what is installed
+        self._set_depth(0)        # scope depth as seen from Python: whether queued copies need references held
         self._sites: dict = {}    # call site -> _Site (Python-mode on/off decision)
 
     # ---- scope ----------------------------------------------------------------
@@ -138,27 +140,37 @@ class Engine:
                 self._held.clear()
 
     def _after(self, *objs) -> None:
-        if self._e.depth > 0 or self._opts.allow_async:
+        if self._hold:
             self._held.extend(objs)
+
+    def _set_depth(self, d: int) -> None:
+        self._depth = d
+        self._hold = d > 0 or self._opts.allow_async
 
     # ---- copies -----------------------------------------------------------------
 
     def copy_(self, dst, src, *, fn: Optional[Elementwise] = None, ctx: str = "") -> Any:
         """``dst[...] = fn(src)`` for any strided views; ``src`` broadcasts to ``dst``."""
-        if not ctx and torch_fast(dst) and torch_fast(src):
-            if _torch_ops.copy_ is not None:  # descriptors and the native baseline in C++
-                with self._lock:
-                    try:
-                        if fn is None or fn is _IDENTITY:
-                            _torch_ops.copy_(dst, src, self._handle)
-                        else:
-                            lo, hi = fn.clamp or (0.0, 0.0)
-                            _torch_ops.copy_fn_(dst, src, self._handle, fn.scale, fn.bias, fn.round,
-                                                fn.clamp is not None, lo, hi)
-                    except RuntimeError as e:
-                        raise _torch_ops.translate(e) from None
-                    self._after(src, dst)
+        op = _torch_ops.copy_
+        if op is not None and not ctx and type(dst) is _Tensor and type(src) is _Tensor:
+            # Descriptors, checks and the native baseline in C++; the engine locks itself.
+            try:
+                if fn is None or fn is _IDENTITY:
+                    op(dst, src, self._handle)
+                else:
+                    lo, hi = fn.clamp or (0.0, 0.0)
+                    _torch_ops.copy_fn_(dst, src, self._handle, fn.scale, fn.bias, fn.round,
+                                        fn.clamp is not None, lo, hi)
+            except RuntimeError as e:
+                err = _torch_ops.translate(e)
+                if not isinstance(err, _core.Unsupported):
+                    raise err from None
+                # dtype / device / layout the op does not take: the general path decides
+            else:
+                if self._hold:
+                    self._held.extend((src, dst))
                 return dst
+        if not ctx and torch_fast(dst) and torch_fast(src):
             dep, ds, dst_, doff, dcuda = torch_parts(dst)
             sep, ss, sst, soff, scuda = torch_parts(src)
             stream = raw_stream(dst if dcuda else src) if (dcuda or scuda) else 0
@@ -317,6 +329,7 @@ class _Scope:
         e = self.engine
         with e._lock:
             e._e.begin_scope()
+            e._set_depth(e._depth + 1)
         self.kind, self.timed = e._interception(self.site)
         if self.timed:
             self.t0 = time.perf_counter()
@@ -340,8 +353,9 @@ class _Scope:
                 self.mode = None
         finally:
             with e._lock:
+                e._set_depth(e._depth - 1)
                 e._e.end_scope()
-                if e._e.depth == 0 and not e._opts.allow_async:
+                if e._depth == 0 and not e._opts.allow_async:
                     e._held.clear()
         if self.timed:
             e._sites[self.site].report(self.kind == "mode", time.perf_counter() - self.t0)

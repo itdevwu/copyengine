@@ -343,10 +343,19 @@ class CudaExecutor final : public Executor {
     std::array<Bounce, 2> bounce;
   };
 
+  // Makes `c` current for a scope. torch and ce share each device's primary
+  // context, so it usually already is: then nothing is pushed or popped.
   struct Push {
     const Driver& d;
-    Push(const Driver& drv, CUcontext c) : d(drv) { check(d.cuCtxPushCurrent(c), "cuCtxPushCurrent"); }
+    bool pushed = false;
+    Push(const Driver& drv, CUcontext c) : d(drv) {
+      CUcontext cur{};
+      if (d.cuCtxGetCurrent(&cur) == CUDA_SUCCESS && cur == c) return;
+      check(d.cuCtxPushCurrent(c), "cuCtxPushCurrent");
+      pushed = true;
+    }
     ~Push() {
+      if (!pushed) return;
       CUcontext dummy{};
       d.cuCtxPopCurrent(&dummy);
     }

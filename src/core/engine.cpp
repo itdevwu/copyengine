@@ -250,10 +250,11 @@ struct Engine::Impl {
     return overlaps(q_writes, sd, slo, shi) || overlaps(q_writes, dd, dlo, dhi) || overlaps(q_reads, dd, dlo, dhi);
   }
 
-  void note_pending(const Side& s, const Side& d, uintptr_t strm) {
+  // `host_wait`: the caller expects the host side complete when it returns.
+  void note_pending(const Side& s, const Side& d, uintptr_t strm, bool host_wait) {
     if (s.device.kind == DeviceKind::host && d.device.kind == DeviceKind::host) return;
     if (std::find(cuda_streams.begin(), cuda_streams.end(), strm) == cuda_streams.end()) cuda_streams.push_back(strm);
-    if (s.device.kind == DeviceKind::host || d.device.kind == DeviceKind::host) host_pending = true;
+    if (host_wait && (s.device.kind == DeviceKind::host || d.device.kind == DeviceKind::host)) host_pending = true;
   }
 
   void run_native_now(const Op& op, uintptr_t strm) {
@@ -263,7 +264,7 @@ struct Engine::Impl {
     const bool host_only = op.src.device.kind == DeviceKind::host && op.dst.device.kind == DeviceKind::host;
     if (host_only && host_pending) synchronize();  // host work may touch what CUDA work still uses
     op.native->run(strm);
-    note_pending(op.src, op.dst, strm);
+    note_pending(op.src, op.dst, strm, !op.host_async);
     ++native_ops;
     if (depth == 0) finish();
   }
@@ -289,6 +290,7 @@ struct Engine::Impl {
                uintptr_t strm, Clock::time_point t0) {
     Op op = make_op(src, dst, std::move(runs), fn, hints);
     op.native = hints.native;
+    op.host_async = hints.host_async;
     op.enqueue_us = us_since(t0);
     push(std::move(op), strm);
   }
@@ -350,6 +352,7 @@ struct Engine::Impl {
     if (auto it = stmt_cache.find(key); it != stmt_cache.end()) {
       Op op = it->second;
       op.native = hints.native;
+      op.host_async = hints.host_async;
       op.enqueue_us = us_since(t0);
       push(std::move(op), strm);
       return;
@@ -359,6 +362,7 @@ struct Engine::Impl {
     if (static_cast<int>(stmt_cache.size()) >= opt.plan_cache * 4) stmt_cache.clear();
     stmt_cache.emplace(key, op);
     op.native = hints.native;
+    op.host_async = hints.host_async;
     op.enqueue_us = us_since(t0);
     push(std::move(op), strm);
   }
@@ -424,7 +428,8 @@ struct Engine::Impl {
       const int64_t b = ex.mark(strm, device_of(g));
       samples.push_back({g.bucket, s, host_us, a, b, &ex});
     }
-    note_pending(g.src, g.dst, strm);
+    note_pending(g.src, g.dst, strm,
+                 std::any_of(g.ops.begin(), g.ops.end(), [&](int k) { return !ops[k].host_async; }));
     if (st) {
       st->calls += calls;
       st->bytes += g.bytes();

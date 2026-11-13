@@ -29,8 +29,8 @@ namespace {
 
 int copy_strided(Engine& engine, const Endpoint& src, const Endpoint& dst, const int64_t* s_shape,
                  const int64_t* s_strides, int s_rank, int64_t s_off, const int64_t* d_shape, const int64_t* d_strides,
-                 int d_rank, int64_t d_off, const Elementwise& fn, std::shared_ptr<NativeOp> native, uintptr_t stream,
-                 std::string* error) {
+                 int d_rank, int64_t d_off, const Elementwise& fn, std::shared_ptr<NativeOp> native, uint32_t flags,
+                 uintptr_t stream, std::string* error) {
   try {
     const std::span<const i64> ds(d_shape, static_cast<size_t>(d_rank));
     Access da = Access::strided(ds, std::span<const i64>(d_strides, static_cast<size_t>(d_rank)), d_off);
@@ -39,6 +39,7 @@ int copy_strided(Engine& engine, const Endpoint& src, const Endpoint& dst, const
                              ds);
     Hints h;
     h.native = std::move(native);
+    h.host_async = (flags & FrontendApi::kHostAsync) != 0;
     engine.copy(src, dst, Stmt(std::move(da), std::move(sa)), fn, h, stream);
     return 0;
   } catch (const Error& e) {
@@ -50,6 +51,22 @@ int copy_strided(Engine& engine, const Endpoint& src, const Endpoint& dst, const
   }
 }
 
+int fence(Engine& engine, const Range* reads, size_t n_reads, const Range* writes, size_t n_writes,
+          std::string* error) {
+  try {
+    engine.fence(std::span<const Range>(reads, n_reads), std::span<const Range>(writes, n_writes));
+    return 0;
+  } catch (const Error& e) {
+    if (error) *error = e.what();
+    return 1 + static_cast<int>(e.code());
+  } catch (const std::exception& e) {
+    if (error) *error = e.what();
+    return 1 + static_cast<int>(Errc::backend);
+  }
+}
+
+size_t queued(const Engine& engine) { return engine.queued(); }
+
 }  // namespace
 
 const FrontendApi* frontend_api() {
@@ -57,6 +74,8 @@ const FrontendApi* frontend_api() {
     FrontendApi a;
     a.copy_strided = &copy_strided;
     a.host_is_pinned = &host_is_pinned;
+    a.fence = &fence;
+    a.queued = &queued;
     return a;
   }();
   return &api;

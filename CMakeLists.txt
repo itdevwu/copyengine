@@ -141,6 +141,15 @@ if(CE_BUILD_PYTHON)
   target_link_libraries(_core PRIVATE copyengine)
   install(TARGETS _core LIBRARY DESTINATION copyengine)
 
+  # Interception shim sources, laid out as in the wheel: the runtime compiles
+  # them for any torch the prebuilt shim below does not match.
+  set(_shim_src ${CMAKE_CURRENT_BINARY_DIR}/_shim_src)
+  configure_file(src/torch/shim.cpp ${_shim_src}/shim.cpp COPYONLY)
+  foreach(h frontend engine ir types)
+    configure_file(include/copyengine/${h}.hpp ${_shim_src}/include/copyengine/${h}.hpp COPYONLY)
+  endforeach()
+  install(DIRECTORY ${_shim_src} DESTINATION copyengine)
+
   # copyengine._torch_stable: explicit APIs as torch custom ops on the stable
   # libtorch ABI (torch >= 2.9), one binary for every later torch. Optional:
   # without it the Python layer issues copies itself.
@@ -166,6 +175,26 @@ if(CE_BUILD_PYTHON)
                             CXX_VISIBILITY_PRESET hidden)
       install(TARGETS copyengine_torch LIBRARY DESTINATION copyengine)
       message(STATUS "copyengine: stable-ABI torch extension ON")
+
+      # The interception shim, prebuilt for the build-time torch and stamped
+      # with the key the runtime checks (python/copyengine/_shim_key.py).
+      execute_process(COMMAND "${Python_EXECUTABLE}" -c "import torch; print(int(torch._C._GLIBCXX_USE_CXX11_ABI), end='')"
+                      OUTPUT_VARIABLE _torch_abi)
+      execute_process(COMMAND "${Python_EXECUTABLE}" ${CMAKE_CURRENT_SOURCE_DIR}/python/copyengine/_shim_key.py
+                              ${_shim_src} ${PROJECT_VERSION}
+                      OUTPUT_VARIABLE _shim_key RESULT_VARIABLE _shim_key_rc)
+      find_library(CE_TORCH_LIB torch PATHS ${_torch_lib} NO_DEFAULT_PATH)
+      if(_shim_key_rc EQUAL 0)
+        add_library(copyengine_shim MODULE ${_shim_src}/shim.cpp)
+        target_include_directories(copyengine_shim SYSTEM PRIVATE ${_torch_inc})
+        target_include_directories(copyengine_shim PRIVATE ${_shim_src}/include)
+        target_compile_definitions(copyengine_shim PRIVATE _GLIBCXX_USE_CXX11_ABI=${_torch_abi})
+        target_link_libraries(copyengine_shim PRIVATE ${CE_TORCH_C10} ${CE_TORCH_CPU} ${CE_TORCH_LIB} ${CMAKE_DL_LIBS})
+        set_target_properties(copyengine_shim PROPERTIES PREFIX "" OUTPUT_NAME "libcopyengine_shim" CXX_VISIBILITY_PRESET hidden)
+        file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/libcopyengine_shim.key "${_shim_key}")
+        install(TARGETS copyengine_shim LIBRARY DESTINATION copyengine)
+        install(FILES ${CMAKE_CURRENT_BINARY_DIR}/libcopyengine_shim.key DESTINATION copyengine)
+      endif()
     elseif(CE_TORCH STREQUAL "ON")
       message(FATAL_ERROR "CE_TORCH=ON but torch >= 2.9 is not importable: ${_torch_err}")
     else()

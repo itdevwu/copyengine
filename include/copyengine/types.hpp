@@ -75,6 +75,9 @@ struct Hints {
   // The frontend's own implementation of this copy (see NativeOp); null when
   // the frontend has no equivalent with identical results.
   std::shared_ptr<NativeOp> native;
+  // The caller does not need the host side complete on return (an
+  // intercepted copy_ with non_blocking=True); device order still holds.
+  bool host_async = false;
 };
 
 }  // namespace ce

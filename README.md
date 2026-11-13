@@ -30,10 +30,12 @@ pip install .                      # needs CMake >= 3.26, a C++20 compiler
                                    # CUDA backend: CUDA toolkit headers + nvcc at build time
 ```
 
-With torch 2.9 or newer importable at build time (`pip install --no-build-isolation .`),
-the explicit copy API is also built as torch custom ops on torch's stable ABI,
-so one binary works with every later torch; without it the same API runs
-through Python.
+With torch importable at build time (`pip install --no-build-isolation .`), the
+wheel also carries the scope's interception shim, built for that torch, and,
+with torch 2.9 or newer, the explicit copy API as custom ops on torch's stable
+ABI. The shim follows torch's C++ API, so for any other torch it is compiled on
+first import (a C++ compiler, a few seconds, cached per torch build). Without
+it, scopes intercept in Python: the same results, only slower.
 
 The CUDA driver is loaded at runtime; nothing links against `libcuda` or
 `cudart`, and one build runs on CUDA 12.x and 13.x drivers.
@@ -44,11 +46,11 @@ The CUDA driver is loaded at runtime; nothing links against `libcuda` or
 import copyengine as ce
 import torch
 
-# Merge a per-layer, per-block loop into a few DMA calls.
+# Unchanged torch code: inside a scope, copy_ is queued and merged.
 with ce.scope():
     for l in range(num_layers):
         for i, b in enumerate(block_ids):
-            ce.copy_(kv_cache[l, b], host_slot[l, i])
+            kv_cache[l, b].copy_(host_slot[l, i])
 
 # Copies torch cannot express as one view: gather + permute + cast in one pass.
 src = ce.lazy(cache).index_select(0, ids).permute(0, 2, 1, 3)
@@ -79,8 +81,11 @@ C and C++ callers use `include/copyengine/copyengine.h` (stable C ABI) or
 
 - Each destination element is written once per copy; duplicate scatter indices
   and overlapping source/destination raise `UnsafeCopy`.
-- Buffers used inside a scope must not be touched by other code until the scope
-  exits (or `barrier()`).
+- Inside a scope, `Tensor.copy_` is queued when ce can produce torch's exact
+  result (otherwise torch runs it), and every other op is ordered after the
+  queued copies whose memory it reads or writes. Results are torch's; only
+  timing differs. Intercepted copies keep their `non_blocking` semantics.
+  Memory read without an op (`.numpy()`, raw pointers) needs `barrier()` first.
 - CUDA work is ordered on the caller's current stream (torch's, if any), like
   torch's own copies: device-to-device copies are not waited for. Copies that
   touch host memory have completed when the copy or scope returns, unless the
@@ -96,5 +101,7 @@ C and C++ callers use `include/copyengine/copyengine.h` (stable C ABI) or
 | `CE_STAGING_MB` | device staging budget (default 256) |
 | `CE_EXPLORE=0` | never measure: use the loaded profile; buckets it does not cover take the baseline and are listed in the profile for the next warmup |
 | `CE_SYNC=1` | wait for every copy, device-to-device included (debugging) |
+| `CE_SHIM=0` | do not load the C++ interception shim (scopes intercept in Python) |
+| `CE_CACHE_DIR` | where shims compiled on import are cached (default `~/.cache/copyengine`) |
 
 Licensed under Apache-2.0.

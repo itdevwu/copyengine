@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
-import contextlib
 import json
+import statistics
+import sys
 import threading
-from typing import Any, Iterator, Optional, Sequence
+import time
+import warnings
+from typing import Any, Optional, Sequence
 
 import numpy as np
 
-from . import _core, _torch_ops
+from . import _core, _torch_ops, _shim  # the shim lets copyengine:: ops through: load them first
 from ._tensor import (
     Lazy,
     View,
@@ -69,7 +72,8 @@ class Engine:
 
     def __init__(self, *, staging_budget_mb: int = 256, explore: bool = True, tune_trials: int = 3,
                  tune_topk: int = 3, ab_pairs: int = 20, ab_max_pairs: int = 50, allow_async: bool = False,
-                 host_threads: int = 0, disable: bool = False, prior_only: bool = False):
+                 host_threads: int = 0, disable: bool = False, prior_only: bool = False,
+                 _intercept: Optional[str] = None):
         """``explore=False`` uses only a loaded profile (uncovered buckets take the
         baseline). ``prior_only`` is for tests: always the prior's first strategy,
         no measurement and no no-regression guarantee."""
@@ -90,20 +94,34 @@ class Engine:
         self._native = native_copy  # replaceable in tests
         self._held: list[Any] = []
         self._lock = threading.RLock()
+        self._force = _intercept  # tests: "shim" or "mode" regardless of what is installed
+        self._sites: dict = {}    # call site -> _Site (Python-mode on/off decision)
 
     # ---- scope ----------------------------------------------------------------
 
-    @contextlib.contextmanager
-    def scope(self) -> Iterator["Engine"]:
-        with self._lock:
-            self._e.begin_scope()
-        try:
-            yield self
-        finally:
-            with self._lock:
-                self._e.end_scope()
-                if self._e.depth == 0 and not self._opts.allow_async:
-                    self._held.clear()
+    def scope(self, _site=None) -> "_Scope":
+        """Queue copies until exit, then plan and issue them together.
+
+        Inside a scope ``Tensor.copy_`` is intercepted too, and every other op is
+        ordered after the queued copies it touches. Results are always torch's.
+        """
+        if _site is None:
+            f = sys._getframe(1)
+            _site = (f.f_code, f.f_lineno)
+        return _Scope(self, _site)
+
+    def _interception(self, site):
+        """'shim', 'mode' or None for one scope entry; also whether to time it."""
+        if self._force is not None:
+            return self._force, False
+        if torch is None or self._opts.disable:
+            return None, False
+        if _shim.lib is not None:
+            return "shim", False
+        st = self._sites.get(site)
+        if st is None:
+            st = self._sites[site] = _Site()
+        return st.choose()
 
     def barrier(self) -> None:
         """Issue everything queued and wait for it."""
@@ -247,6 +265,88 @@ class Engine:
         return self._opts
 
 
+class _Site:
+    """Python-mode interception costs ~9 us per op, paid at scope entry. One
+    call site alternates entries with and without it; the mode stays only if
+    it wins clearly (the same rule as the engine's A/B), else the site runs
+    torch natively from then on."""
+
+    PAIRS = 10
+
+    def __init__(self):
+        self.on: list[float] = []
+        self.off: list[float] = []
+        self.decided: Optional[bool] = None
+
+    def choose(self):
+        if self.decided is not None:
+            return ("mode" if self.decided else None), False
+        use = len(self.on) <= len(self.off)
+        return ("mode" if use else None), True
+
+    def report(self, used: bool, seconds: float) -> None:
+        (self.on if used else self.off).append(seconds)
+        n = min(len(self.on), len(self.off))
+        if n < self.PAIRS:
+            return
+        on, off = self.on[:n], self.off[:n]
+        wins = sum(a < b for a, b in zip(on, off))
+        self.decided = statistics.median(on) <= 0.95 * statistics.median(off) and wins >= _sign_test(n)
+
+
+def _sign_test(n: int) -> int:
+    """Smallest k with P(Binomial(n, 1/2) >= k) <= 0.05."""
+    from math import comb
+    tail = 0.0
+    for k in range(n, -1, -1):
+        tail += comb(n, k) / 2 ** n
+        if tail > 0.05:
+            return k + 1
+    return n + 1
+
+
+class _Scope:
+    __slots__ = ("engine", "site", "kind", "mode", "timed", "t0")
+
+    def __init__(self, engine: Engine, site):
+        self.engine, self.site = engine, site
+        self.kind = self.mode = None
+        self.timed, self.t0 = False, 0.0
+
+    def __enter__(self) -> Engine:
+        e = self.engine
+        with e._lock:
+            e._e.begin_scope()
+        self.kind, self.timed = e._interception(self.site)
+        if self.timed:
+            self.t0 = time.perf_counter()
+        if self.kind == "shim":
+            if _shim.lib is None:
+                raise RuntimeError(f"the interception shim is unavailable: {_shim.error}")
+            _shim.lib.copyengine_shim_enter(e._handle)
+        elif self.kind == "mode":
+            from . import _mode
+            self.mode = _mode.Intercept(e)
+            self.mode.__enter__()
+        return e
+
+    def __exit__(self, *exc) -> None:
+        e = self.engine
+        try:
+            if self.kind == "shim":
+                _shim.lib.copyengine_shim_exit()
+            elif self.mode is not None:
+                self.mode.__exit__(*exc)
+                self.mode = None
+        finally:
+            with e._lock:
+                e._e.end_scope()
+                if e._e.depth == 0 and not e._opts.allow_async:
+                    e._held.clear()
+        if self.timed:
+            e._sites[self.site].report(self.kind == "mode", time.perf_counter() - self.t0)
+
+
 class FrozenPlan:
     """Replays a flushed plan. Buffers, layouts and index tables must not change."""
 
@@ -267,6 +367,11 @@ _default: Optional[Engine] = None
 _default_lock = threading.Lock()
 
 
+if torch is not None and _shim.lib is None and "CE_SHIM=0" not in _shim.error:
+    warnings.warn(f"copyengine: the C++ interception shim is unavailable ({_shim.error.splitlines()[0]}); "
+                  "scopes intercept copies in Python instead: same results, slower", RuntimeWarning, stacklevel=2)
+
+
 def default_engine() -> Engine:
     global _default
     with _default_lock:
@@ -276,7 +381,8 @@ def default_engine() -> Engine:
 
 
 def scope():
-    return default_engine().scope()
+    f = sys._getframe(1)
+    return default_engine().scope(_site=(f.f_code, f.f_lineno))
 
 
 def copy_(dst, src, **kw):

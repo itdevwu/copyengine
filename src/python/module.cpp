@@ -306,16 +306,17 @@ NB_MODULE(_core, m) {
       .def("copy_strided", [](ce::Engine& e, const ce::Endpoint& src, const ce::Endpoint& dst,
                               const std::vector<i64>& s_shape, const std::vector<i64>& s_strides, i64 s_off,
                               const std::vector<i64>& d_shape, const std::vector<i64>& d_strides, i64 d_off,
-                              const ce::Elementwise& fn, uintptr_t stream, nb::handle native) {
+                              const ce::Elementwise& fn, uintptr_t stream, nb::handle native, bool host_async) {
         ce::Access da = ce::Access::strided(d_shape, d_strides, d_off);
         ce::Access sa = ce::broadcast_to(ce::Access::strided(s_shape, s_strides, s_off), d_shape);
         ce::Stmt stmt(std::move(da), std::move(sa));
         ce::Hints h;
         h.native = py_payload(native);
+        h.host_async = host_async;
         nb::gil_scoped_release release;
         e.copy(src, dst, stmt, fn, h, stream);
       }, "src"_a, "dst"_a, "s_shape"_a, "s_strides"_a, "s_off"_a, "d_shape"_a, "d_strides"_a, "d_off"_a, "fn"_a,
-         "stream"_a, "native"_a = nb::none())
+         "stream"_a, "native"_a = nb::none(), "host_async"_a = false)
       .def_prop_ro("handle", [](ce::Engine& e) { return reinterpret_cast<uintptr_t>(&e); })
       .def("fence", [](ce::Engine& e, const std::vector<std::tuple<std::string, int, uintptr_t, uintptr_t>>& reads,
                        const std::vector<std::tuple<std::string, int, uintptr_t, uintptr_t>>& writes) {

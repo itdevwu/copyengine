@@ -101,8 +101,8 @@ void copy_with(Tensor dst, Tensor src, int64_t engine, const ce::Elementwise& fn
   std::string err;
   const int rc = g_api->copy_strided(*reinterpret_cast<ce::Engine*>(engine), se, de, ss.data(), st.data(),
                                      static_cast<int>(ss.size()), src.storage_offset(), ds.data(), dt.data(),
-                                     static_cast<int>(ds.size()), dst.storage_offset(), fn, std::move(native), stream,
-                                     &err);
+                                     static_cast<int>(ds.size()), dst.storage_offset(), fn, std::move(native), 0,
+                                     stream, &err);
   STD_TORCH_CHECK(rc == 0, "[copyengine:", rc - 1, "] ", err);
 }
 

@@ -18,11 +18,17 @@
   `-ffp-contract=off`, kernels `--fmad=false`).
 - `src/capi` implements the C ABI; `src/python` is the nanobind extension
   `copyengine._core`; `python/copyengine` is the Python layer.
-- torch integration is layered, and all logic stays in the torch-free core:
-  `_torch` on the stable libtorch ABI (descriptors, explicit APIs as custom
-  ops; one build for every supported torch), a per-torch-version interception
-  shim holding only dispatch-key registration and redispatch, and
-  TorchDispatchMode as the fallback when the shim is missing.
+- torch integration is layered, and all logic stays in the torch-free core,
+  reached through the `FrontendApi` table that `_core` exports:
+  `src/torch/ops.cpp` on the stable libtorch ABI (descriptors, explicit APIs as
+  custom ops; one build for every torch >= 2.9), and `src/torch/shim.cpp`, the
+  scope interception, holding only dispatch-key registration and redispatch.
+  The shim uses the DeferredInit key, refuses to load if something else holds
+  it, and is admitted only after a verified copy; it is prebuilt for the
+  build-time torch and otherwise compiled on import, cached per torch build.
+  Its fallback is `python/copyengine/_mode.py` (TorchDispatchMode) with
+  identical semantics: behavior may differ only in speed, never in results,
+  and `tests/python/test_scope.py` runs under both.
 - The version lives only in `project(... VERSION ...)` in `CMakeLists.txt`.
 
 ## Invariants

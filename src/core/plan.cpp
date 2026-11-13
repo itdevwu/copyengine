@@ -201,13 +201,30 @@ Plan build_plan(const std::vector<Op>& ops) {
       it->runs.append(op.runs());
     }
     for (Group& g : groups) {
-      std::vector<i64> lo, len;
-      for (int k : g.ops) lo.push_back(ops[k].src_lo), len.push_back(ops[k].src_hi - ops[k].src_lo);
-      g.src_extent = interval_union(lo, len);
+      const i64 ss = static_cast<i64>(itemsize(g.src.dtype)), ds = static_cast<i64>(itemsize(g.dst.dtype));
+      std::vector<i64> sc, dc, s_lo, s_len, d_lo, d_len;  // cuts; allocation ranges (run units)
+      for (int k : g.ops) {
+        const Op& op = ops[k];
+        g.src_allocs.emplace_back(op.src_lo, op.src_hi);
+        sc.push_back(op.src_lo / ss), sc.push_back(op.src_hi / ss);
+        dc.push_back(op.dst_lo / ds), dc.push_back(op.dst_hi / ds);
+        s_lo.push_back(op.src_lo / ss), s_len.push_back(op.src_hi / ss - op.src_lo / ss);
+        d_lo.push_back(op.dst_lo / ds), d_len.push_back(op.dst_hi / ds - op.dst_lo / ds);
+      }
+      for (auto* v : {&sc, &dc}) {
+        std::sort(v->begin(), v->end());
+        v->erase(std::unique(v->begin(), v->end()), v->end());
+      }
+      std::sort(g.src_allocs.begin(), g.src_allocs.end());
+      g.src_allocs.erase(std::unique(g.src_allocs.begin(), g.src_allocs.end()), g.src_allocs.end());
+      // Real allocations never overlap: a cut inside one described allocation
+      // is the same memory described twice, not a boundary.
+      g.src_cuts = real_cuts(sc, s_lo, s_len);
+      g.dst_cuts = real_cuts(dc, d_lo, d_len);
       if (std::all_of(g.ops.begin(), g.ops.end(), [&](int k) { return ops[k].form != nullptr; }))
         for (int k : g.ops) g.forms.push_back(ops[k].form);
-      g.runs = g.runs.coalesce();
-      g.rects = recover_2d(g.runs);
+      g.runs = g.runs.coalesce(g.src_cuts, g.dst_cuts);
+      g.rects = recover_2d(g.runs, 2, g.src_cuts, g.dst_cuts);
       if (!g.runs.empty()) plan.groups.push_back(std::move(g));
     }
   }

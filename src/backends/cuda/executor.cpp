@@ -867,7 +867,15 @@ class CudaExecutor final : public Executor {
       if (!P.h2d && b - a + 1 != f.numel) return FusedPlan{};
       lo[i] = a * sz, len[i] = (b - a + 1) * sz;
     }
-    const Intervals iv = interval_union(lo, len);
+    // One raw copy per interval: never across an allocation boundary. A cut
+    // inside a statement's extent would split its staging; that is the same
+    // memory described twice, but leave such groups to other strategies.
+    const std::vector<i64>& cuts = P.h2d ? g.src_cuts : g.dst_cuts;
+    const i64 cut_scale = static_cast<i64>(itemsize(P.h2d ? g.src.dtype : g.dst.dtype));
+    std::vector<i64> byte_cuts;
+    for (i64 c : cuts) byte_cuts.push_back(c * cut_scale);
+    if (real_cuts(byte_cuts, lo, len).size() != byte_cuts.size()) return FusedPlan{};
+    const Intervals iv = split_at(interval_union(lo, len), byte_cuts);
     // Staging offsets keep each interval's alignment modulo 8.
     std::vector<i64> off(iv.start.size());
     i64 cur = 0, payload = 0;
@@ -1016,15 +1024,22 @@ class CudaExecutor final : public Executor {
 
     // Link-side intervals (elements of lt), sorted.
     const std::vector<i64>& link = h2d ? g.runs.src : g.runs.dst;
-    Intervals iv = interval_union(link, g.runs.len);
+    // One raw copy per interval: never across an allocation boundary.
+    Intervals iv = split_at(interval_union(link, g.runs.len), h2d ? g.src_cuts : g.dst_cuts);
     if (h2d) {  // widen across small read gaps that stay inside one source allocation
-      const Intervals& ext = g.src_extent;
+      // Allocations by start, with the furthest end among each prefix.
+      std::vector<i64> alo, reach;
+      for (const auto& [lo, hi] : g.src_allocs) {
+        alo.push_back(lo);
+        reach.push_back(reach.empty() ? hi : std::max(reach.back(), hi));
+      }
       Intervals m;
       for (size_t k = 0; k < iv.start.size(); ++k) {
         if (!m.empty()) {
           const i64 gap_lo = m.end.back() * isz, gap_hi = iv.start[k] * isz;
-          auto e = std::upper_bound(ext.start.begin(), ext.start.end(), gap_lo);
-          const bool inside = e != ext.start.begin() && ext.end[(e - ext.start.begin()) - 1] >= gap_hi;
+          // One allocation holds the element before the gap and the one after it.
+          const size_t a = static_cast<size_t>(std::lower_bound(alo.begin(), alo.end(), gap_lo) - alo.begin());
+          const bool inside = a > 0 && reach[a - 1] > gap_hi;
           if (gap_hi - gap_lo < kGapBytes && inside) {
             m.end.back() = iv.end[k];
             continue;

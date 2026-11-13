@@ -1,6 +1,7 @@
 #include "copyengine/ir.hpp"
 
 #include <algorithm>
+#include <climits>
 #include <numeric>
 #include <string>
 
@@ -70,12 +71,21 @@ Runs Runs::from_indices(std::span<const i64> s, std::span<const i64> d) {
   return r;
 }
 
-Runs Runs::coalesce() const {
+namespace {
+bool is_cut(std::span<const i64> cuts, i64 p) { return std::binary_search(cuts.begin(), cuts.end(), p); }
+// Index of the region between cuts that holds p.
+size_t region(std::span<const i64> cuts, i64 p) {
+  return static_cast<size_t>(std::upper_bound(cuts.begin(), cuts.end(), p) - cuts.begin());
+}
+}  // namespace
+
+Runs Runs::coalesce(std::span<const i64> src_cuts, std::span<const i64> dst_cuts) const {
   if (size() <= 1) return *this;
   Runs r;
   r.reserve(size());
   for (size_t k : argsort(dst)) {
-    if (!r.empty() && src[k] == r.src.back() + r.len.back() && dst[k] == r.dst.back() + r.len.back()) {
+    if (!r.empty() && src[k] == r.src.back() + r.len.back() && dst[k] == r.dst.back() + r.len.back() &&
+        !is_cut(src_cuts, src[k]) && !is_cut(dst_cuts, dst[k])) {
       r.len.back() += len[k];
     } else {
       r.push(src[k], dst[k], len[k]);
@@ -158,6 +168,43 @@ bool intersects(const Intervals& a, const Intervals& b) {
   return false;
 }
 
+Intervals split_at(const Intervals& iv, std::span<const i64> cuts) {
+  if (cuts.empty()) return iv;
+  Intervals out;
+  for (size_t k = 0; k < iv.start.size(); ++k) {
+    i64 a = iv.start[k];
+    for (auto c = std::upper_bound(cuts.begin(), cuts.end(), a); c != cuts.end() && *c < iv.end[k]; ++c) {
+      out.start.push_back(a);
+      out.end.push_back(*c);
+      a = *c;
+    }
+    out.start.push_back(a);
+    out.end.push_back(iv.end[k]);
+  }
+  return out;
+}
+
+std::vector<i64> real_cuts(std::span<const i64> cuts, std::span<const i64> start, std::span<const i64> len) {
+  // Ranges by start, with the furthest end among each prefix. Touching ranges
+  // are not merged: a cut where one ends and the next begins is real.
+  std::vector<size_t> order(start.size());
+  std::iota(order.begin(), order.end(), size_t{0});
+  std::sort(order.begin(), order.end(), [&](size_t a, size_t b) { return start[a] < start[b]; });
+  std::vector<i64> st(order.size()), reach(order.size());
+  i64 far = INT64_MIN;
+  for (size_t i = 0; i < order.size(); ++i) {
+    st[i] = start[order[i]];
+    far = std::max(far, start[order[i]] + len[order[i]]);
+    reach[i] = far;
+  }
+  std::vector<i64> out;
+  for (i64 c : cuts) {
+    const size_t k = static_cast<size_t>(std::lower_bound(st.begin(), st.end(), c) - st.begin());  // ranges starting before c
+    if (!(k > 0 && reach[k - 1] > c)) out.push_back(c);
+  }
+  return out;
+}
+
 // ---- Rects ---------------------------------------------------------------------
 
 void Rects::push(i64 s, i64 d, i64 w, i64 h, i64 sp, i64 dp) {
@@ -178,7 +225,7 @@ void Rects::expand(std::vector<i64>& si, std::vector<i64>& di) const {
       }
 }
 
-Rects recover_2d(const Runs& runs, int min_height) {
+Rects recover_2d(const Runs& runs, int min_height, std::span<const i64> src_cuts, std::span<const i64> dst_cuts) {
   const auto &s = runs.src, &d = runs.dst, &n = runs.len;
   const size_t m = runs.size();
   const size_t need = static_cast<size_t>(std::max(min_height, 2));
@@ -190,9 +237,12 @@ Rects recover_2d(const Runs& runs, int min_height) {
     if (i + 1 < m && n[i + 1] == n[i]) {
       sp = s[i + 1] - s[i];
       dp = d[i + 1] - d[i];
-      if (sp >= n[i] && dp >= n[i]) {
+      const size_t rs = region(src_cuts, s[i]), rd = region(dst_cuts, d[i]);
+      if (sp >= n[i] && dp >= n[i] && region(src_cuts, s[i + 1]) == rs && region(dst_cuts, d[i + 1]) == rd) {
         j = i + 1;
-        while (j + 1 < m && n[j + 1] == n[i] && s[j + 1] - s[j] == sp && d[j + 1] - d[j] == dp) ++j;
+        while (j + 1 < m && n[j + 1] == n[i] && s[j + 1] - s[j] == sp && d[j + 1] - d[j] == dp &&
+               region(src_cuts, s[j + 1]) == rs && region(dst_cuts, d[j + 1]) == rd)
+          ++j;
       }
     }
     if (j - i + 1 >= need) {

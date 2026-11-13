@@ -40,7 +40,9 @@ struct Runs {
   static Runs from_indices(std::span<const i64> src, std::span<const i64> dst);
 
   // Sort by dst and merge runs that are adjacent on both sides.
-  Runs coalesce() const;
+  // Never merges at a cut (sorted positions on each side: allocation
+  // boundaries, which one copy call must not cross).
+  Runs coalesce(std::span<const i64> src_cuts = {}, std::span<const i64> dst_cuts = {}) const;
   // Keep only the parts whose source lies in the given (possibly overlapping) intervals.
   Runs clip_src(std::span<const i64> valid_start, std::span<const i64> valid_len) const;
   // Split into pieces of at most max_elems elements, cutting long runs.
@@ -60,6 +62,11 @@ struct Intervals {
 // Union of [off*scale, (off+len)*scale) — scale converts elements to bytes.
 Intervals interval_union(std::span<const i64> off, std::span<const i64> len, i64 scale = 1);
 bool intersects(const Intervals& a, const Intervals& b);
+// Splits every interval at the cuts strictly inside it (cuts sorted).
+Intervals split_at(const Intervals& iv, std::span<const i64> cuts);
+// The cuts that are real boundaries: those not strictly inside any of the
+// half-open ranges [start, start + len) (each known to be one allocation).
+std::vector<i64> real_cuts(std::span<const i64> cuts, std::span<const i64> start, std::span<const i64> len);
 
 // ---- L2 ----------------------------------------------------------------------
 
@@ -73,7 +80,9 @@ struct Rects {
 
 // L1 -> L2: consecutive equal-length runs with constant src and dst pitch
 // (pitch >= width on both sides) become one block of >= min_height rows.
-Rects recover_2d(const Runs& runs, int min_height = 2);
+// A block's rows all lie between the same two cuts on each side.
+Rects recover_2d(const Runs& runs, int min_height = 2, std::span<const i64> src_cuts = {},
+                 std::span<const i64> dst_cuts = {});
 
 // ---- L4 / L3 -------------------------------------------------------------------
 

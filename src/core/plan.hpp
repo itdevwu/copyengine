@@ -103,7 +103,13 @@ struct Group {
   std::vector<int> ops;  // indices into the flushed queue (original order)
   Runs runs;             // merged, coalesced
   Rects rects;           // structure recovered from runs
-  Intervals src_extent;  // union of the source allocations (bytes): gap filling stays inside
+  // Allocation boundaries on each side, in run units: one copy call never
+  // crosses them (separate allocations, even adjacent ones, are not one range
+  // for the driver). Cuts strictly inside another described allocation are
+  // dropped (the same memory described twice); runs never cross a cut.
+  std::vector<i64> src_cuts, dst_cuts;
+  // The source allocations, [lo, hi) bytes, not merged: gap filling stays in one.
+  std::vector<std::pair<i64, i64>> src_allocs;
   std::vector<std::shared_ptr<const Form>> forms;  // one per op when every op is structured, else empty
   int wave = 0;
   // filled at plan time

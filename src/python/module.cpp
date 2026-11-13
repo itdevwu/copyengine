@@ -149,7 +149,7 @@ NB_MODULE(_core, m) {
       .def_prop_ro("src_off", [](const ce::Runs& r) { return to_numpy(r.src); })
       .def_prop_ro("dst_off", [](const ce::Runs& r) { return to_numpy(r.dst); })
       .def_prop_ro("length", [](const ce::Runs& r) { return to_numpy(r.len); })
-      .def("coalesce", &ce::Runs::coalesce)
+      .def("coalesce", [](const ce::Runs& r) { return r.coalesce(); })
       .def("clip_src", [](const ce::Runs& r, nb::handle s, nb::handle n) {
         auto a = i64_arg(s), b = i64_arg(n);
         return r.clip_src(a.span(), b.span());

@@ -487,3 +487,52 @@ def test_profiles_from_another_version_are_not_trusted():
     e2.load_profile(json.dumps(prof))
     p2 = json.loads(e2.dump_profile())
     assert not p2["buckets"] and set(p2["uncovered"]) >= set(prof["buckets"])
+
+
+# ---- allocation boundaries -----------------------------------------------------------------
+
+
+def _endpoint(arr, base_off, nbytes):
+    p = arr.__array_interface__["data"][0]
+    return ce._core.Endpoint("host", 0, p + base_off, nbytes, "float32", False)
+
+
+def test_copies_never_merge_across_allocations():
+    # Two allocations that happen to be adjacent in memory: one copy call may
+    # not span both (the CUDA driver rejects it), so runs merge only inside one.
+    buf = np.arange(256, dtype=np.float32)
+    dst = np.zeros(256, np.float32)
+    a, b = _endpoint(buf, 0, 512), _endpoint(buf, 512, 512)
+    d = _endpoint(dst, 0, 1024)
+    e = engine()
+    with e.scope():
+        e._e.copy_runs(a, d, [0], [0], [128], ce.Elementwise())
+        e._e.copy_runs(b, d, [0], [128], [128], ce.Elementwise())
+    assert e.stats()["last"]["calls"] == 2
+    np.testing.assert_array_equal(dst, buf)
+    # Rows alternating between the two allocations: no 2-D block across them either.
+    dst[:] = 0
+    e = engine()
+    with e.scope():
+        for r in range(8):
+            src = a if r % 2 == 0 else b
+            e._e.copy_runs(src, d, [(r // 2) * 16], [r * 32], [16], ce.Elementwise())
+    assert e.stats()["last"]["calls"] >= 2
+    want = np.zeros(256, np.float32)
+    for r in range(8):
+        off = (r // 2) * 16 + (0 if r % 2 == 0 else 128)
+        want[r * 32:r * 32 + 16] = buf[off:off + 16]
+    np.testing.assert_array_equal(dst, want)
+
+
+def test_the_same_memory_described_twice_still_merges():
+    buf = np.arange(256, dtype=np.float32)
+    dst = np.zeros(256, np.float32)
+    whole, first = _endpoint(buf, 0, 1024), _endpoint(buf, 0, 512)  # overlapping descriptions
+    d = _endpoint(dst, 0, 1024)
+    e = engine()
+    with e.scope():
+        e._e.copy_runs(first, d, [0], [0], [128], ce.Elementwise())
+        e._e.copy_runs(whole, d, [128], [128], [128], ce.Elementwise())
+    assert e.stats()["last"]["calls"] == 1  # the cut at 512 bytes is inside `whole`
+    np.testing.assert_array_equal(dst, buf)

@@ -117,6 +117,8 @@ struct Engine::Impl {
     op.dst = {dst.device, dst.dtype, dst.pinned};
     op.fn = fn;
     op.ctx = hints.ctx;
+    op.src_lo = static_cast<int64_t>(src.base);
+    op.src_hi = static_cast<int64_t>(src.base) + src.nbytes;
     // Absolute element indices. Pure copies become bytes so any dtypes merge.
     const bool pure = fn.identity() && src.dtype == dst.dtype;
     const i64 scale = pure ? ssz : 1;

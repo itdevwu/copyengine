@@ -16,9 +16,10 @@ enum class Strategy : uint8_t {
   runs_parallel,  // host: merged runs split across worker threads
   batch,          // CUDA: one cuMemcpyBatchAsync (+ 2-D copies)
   kernel,         // CUDA: table-driven gather/scatter kernel (with cast / affine)
-  staged,         // CUDA: raw copy to/from device staging + kernel on the device side
+  staged,         // CUDA: dense raw copy to/from device staging + kernel on the device side
+  bounce,         // CUDA: pageable host side packed through pinned buffers on the CPU
 };
-inline constexpr int kNumStrategies = 6;
+inline constexpr int kNumStrategies = 7;
 std::string_view strategy_name(Strategy s);
 Strategy parse_strategy(std::string_view name);
 

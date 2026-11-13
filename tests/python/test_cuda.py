@@ -227,11 +227,47 @@ def test_pageable_fragments_use_bounce(direction):
     def check():
         torch.testing.assert_close(dst[perm].cpu(), src.cpu(), rtol=0, atol=0)
 
-    _, seen = explore(body, check=check, rounds=6)
-    assert "staged" in seen
+    _, seen = explore(body, check=check, rounds=8)
+    assert {"staged", "bounce"} <= seen
 
 
 def test_stats_report_admission():
     st = ce.Engine(tune=False).stats()
     dev0 = st["cuda"][0]
     assert dev0["kernels"] is True and dev0["batch"] is True
+
+
+@pytest.mark.parametrize("pinned", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_dense_permute_h2d_moves_once_and_permutes_on_device(pinned, dtype):
+    x = torch.randn(64, 8, 128).to(dtype)
+    x = x.pin_memory() if pinned else x
+    for src in (x.permute(1, 0, 2), x.transpose(1, 2)):      # 256-byte rows, then 2-4 byte elements
+        dst = torch.empty(src.shape, dtype=dtype, device=DEV)
+        e = ce.Engine(tune=False)
+        e.copy_(dst, src)
+        torch.testing.assert_close(dst.cpu(), src.contiguous(), rtol=0, atol=0)
+        assert e.stats()["last"]["strategies"] == ["staged"]
+        assert e.stats()["last"]["calls"] == 2              # one dense H2D + one kernel
+
+
+def test_dense_permute_d2h_with_cast():
+    x = torch.randn(32, 16, 64, device=DEV)
+    src = x.permute(2, 0, 1)
+    dst = torch.empty(src.shape, dtype=torch.float16)
+    e = ce.Engine(tune=False)
+    e.copy_(dst, src)
+    torch.testing.assert_close(dst, src.cpu().half(), rtol=0, atol=0)
+
+
+def test_gap_filling_stays_correct():
+    src = torch.randn(4096)
+    dst = torch.full((4096,), -1.0, device=DEV)
+    e = ce.Engine(tune=False)
+    with e.scope():
+        for i in range(0, 4096, 64):                      # every other 128-byte block
+            e.copy_(dst[i:i + 32], src[i:i + 32])
+    want = torch.full((4096,), -1.0)
+    for i in range(0, 4096, 64):
+        want[i:i + 32] = src[i:i + 32]
+    torch.testing.assert_close(dst.cpu(), want, rtol=0, atol=0)

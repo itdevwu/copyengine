@@ -46,6 +46,7 @@ struct Op {
   Runs runs;  // absolute element indices
   Elementwise fn;
   std::string ctx;
+  int64_t src_lo = 0, src_hi = 0;  // the source allocation, absolute bytes: reads may widen within it
   Hash128 fp;  // content fingerprint
   // byte-interval read / write sets (absolute addresses), computed lazily
   mutable std::unique_ptr<Intervals> rd, wr;
@@ -68,6 +69,7 @@ struct Group {
   std::vector<int> ops;  // indices into the flushed queue (original order)
   Runs runs;             // merged, coalesced
   Rects rects;           // structure recovered from runs
+  Intervals src_extent;  // union of the source allocations (bytes): gap filling stays inside
   int wave = 0;
   // filled at plan time
   std::vector<Strategy> candidates;

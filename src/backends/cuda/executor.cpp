@@ -36,6 +36,8 @@ constexpr int kSlots = 16;
 constexpr long long kTypedChunk = 4096;      // elements per warp
 constexpr long long kByteChunk = 16 << 10;   // bytes per warp
 constexpr size_t kBatchMax = 1 << 16;        // copies per cuMemcpyBatchAsync call
+constexpr int64_t kSmallRect = 4 << 10;      // rows below this are "fragmented"
+constexpr int64_t kGapBytes = 4 << 10;       // read gaps below this are copied, not skipped
 
 void check(CUresult r, const char* what) {
   if (r != CUDA_SUCCESS) fail(Errc::backend, std::string(what) + ": " + cuda::error_name(r));
@@ -109,12 +111,21 @@ class CudaExecutor final : public Executor {
         if (s.batch) c.push_back(Strategy::batch);
         c.push_back(Strategy::runs);
         if (rects <= 2) std::stable_partition(c.begin(), c.end(), [](Strategy x) { return x == Strategy::runs; });
-      } else {
-        const bool host_ok = (src_cuda || g.src.pinned) && (dst_cuda || g.dst.pinned);
-        if (s.batch && host_ok) c.push_back(Strategy::batch);
-        if (!host_ok && !(src_cuda && dst_cuda)) c.push_back(Strategy::staged);  // pinned bounce
+      } else if (src_cuda && dst_cuda) {
+        if (s.batch) c.push_back(Strategy::batch);
         c.push_back(Strategy::runs);
         if (rects <= 2) std::reverse(c.begin(), c.end());
+      } else {
+        const bool host_ok = (src_cuda || g.src.pinned) && (dst_cuda || g.dst.pinned);
+        int64_t rows = 0;
+        for (i64 h : g.rects.height) rows += h;
+        const bool fragmented = rows > 2 && g.bytes() / rows < kSmallRect;  // small rows DMA poorly
+        if (fragmented && s.kernels) c.push_back(Strategy::staged);  // dense link copy + device-side kernel
+        if (s.batch && host_ok) c.push_back(Strategy::batch);
+        if (!host_ok) c.push_back(Strategy::bounce);
+        if (!fragmented && s.kernels && rects > 2) c.push_back(Strategy::staged);
+        c.push_back(Strategy::runs);
+        if (rects <= 2) std::stable_partition(c.begin(), c.end(), [](Strategy x) { return x == Strategy::runs; });
       }
       return c;
     }
@@ -137,7 +148,8 @@ class CudaExecutor final : public Executor {
       case Strategy::runs: return runs(g, st);
       case Strategy::batch: return batch(s, g.src, g.dst, rows_raw(g), st);
       case Strategy::kernel: return kernel(s, g, st);
-      case Strategy::staged: return g.pure() ? bounce(s, g.src, g.dst, rows_raw(g), st) : staged(s, g, st);
+      case Strategy::staged: return staged(s, g, st);
+      case Strategy::bounce: return bounce(s, g.src, g.dst, rows_raw(g), st);
       default: fail(Errc::unsupported, "CUDA backend cannot run strategy " + std::string(strategy_name(strat)));
     }
   }
@@ -578,44 +590,96 @@ class CudaExecutor final : public Executor {
     s.staging_stream = st;
   }
 
-  // Host <-> device with conversion: raw bytes cross the link, the kernel converts on the device.
+  // Host <-> device through device staging. Only dense intervals cross the
+  // link (read gaps below kGapBytes inside one source allocation are copied
+  // too); a kernel on the device side scatters / gathers and converts. This is
+  // the "cut point on the device" transform: layout changes happen in HBM.
   int64_t staged(Dev& s, const Group& g, CUstream st) {
     const bool h2d = g.dst.device.kind == DeviceKind::cuda;
-    const DType dev_t = h2d ? g.src.dtype : g.dst.dtype;  // dtype living in staging
-    const size_t isz = itemsize(dev_t);
+    const DType lt = h2d ? g.src.dtype : g.dst.dtype;  // dtype crossing the link
+    const i64 isz = static_cast<i64>(itemsize(lt));
     const int64_t budget = std::max<int64_t>(opt_.staging_budget, 1 << 20);
-    const i64 per = std::max<i64>(1, budget / static_cast<int64_t>(isz));
+    const i64 per = std::max<i64>(1, budget / isz);
     const std::string name = kernel_name(g);
     const cv::Fn fn = to_cv(g.fn);
+
+    // Link-side intervals (elements of lt), sorted.
+    const std::vector<i64>& link = h2d ? g.runs.src : g.runs.dst;
+    Intervals iv = interval_union(link, g.runs.len);
+    if (h2d) {  // widen across small read gaps that stay inside one source allocation
+      const Intervals& ext = g.src_extent;
+      Intervals m;
+      for (size_t k = 0; k < iv.start.size(); ++k) {
+        if (!m.empty()) {
+          const i64 gap_lo = m.end.back() * isz, gap_hi = iv.start[k] * isz;
+          auto e = std::upper_bound(ext.start.begin(), ext.start.end(), gap_lo);
+          const bool inside = e != ext.start.begin() && ext.end[(e - ext.start.begin()) - 1] >= gap_hi;
+          if (gap_hi - gap_lo < kGapBytes && inside) {
+            m.end.back() = iv.end[k];
+            continue;
+          }
+        }
+        m.start.push_back(iv.start[k]);
+        m.end.push_back(iv.end[k]);
+      }
+      iv = std::move(m);
+    }
+    // Pieces: intervals cut so each fits the staging budget.
+    std::vector<std::pair<i64, i64>> pieces;
+    for (size_t k = 0; k < iv.start.size(); ++k)
+      for (i64 a = iv.start[k]; a < iv.end[k]; a += per) pieces.push_back({a, std::min(iv.end[k], a + per)});
+
+    // Runs ordered by their link-side offset.
+    std::vector<size_t> order(g.runs.size());
+    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+    std::sort(order.begin(), order.end(), [&](size_t a, size_t b) { return link[a] < link[b]; });
+
     int64_t calls = 0;
-    for (const Runs& part : g.runs.chunks(per)) {
-      const size_t bytes = static_cast<size_t>(part.total()) * isz;
-      const CUdeviceptr stg = staging(s, bytes, st);
-      const long long base = static_cast<long long>(stg / isz);
+    size_t p = 0, ri = 0;
+    i64 r_done = 0;  // elements of run order[ri] already emitted
+    while (p < pieces.size()) {
+      // Chunk: consecutive pieces within the budget.
+      size_t q = p;
+      i64 total = 0;
+      while (q < pieces.size() && total + (pieces[q].second - pieces[q].first) <= per) total += pieces[q].second - pieces[q].first, ++q;
+      if (q == p) ++q, total = pieces[p].second - pieces[p].first;
+      const CUdeviceptr stg = staging(s, static_cast<size_t>(total * isz), st);
+      const i64 base = static_cast<i64>(stg) / isz;
       std::vector<Raw> raws;
       std::vector<Chunk> ch;
-      long long off = 0;
-      for (size_t i = 0; i < part.size(); ++i) {
-        const long long n = part.len[i];
-        if (h2d) {
-          raws.push_back({static_cast<uintptr_t>(part.src[i]) * isz, stg + off * isz, static_cast<size_t>(n) * isz});
-          split(ch, base + off, part.dst[i], n, kTypedChunk);
-        } else {
-          split(ch, part.src[i], base + off, n, kTypedChunk);
-          raws.push_back({stg + off * isz, static_cast<uintptr_t>(part.dst[i]) * isz, static_cast<size_t>(n) * isz});
+      i64 off = 0;
+      for (size_t k = p; k < q; ++k) {
+        const auto [a, b] = pieces[k];
+        if (h2d) raws.push_back({static_cast<uintptr_t>(a * isz), static_cast<uintptr_t>((base + off) * isz), static_cast<size_t>((b - a) * isz)});
+        else raws.push_back({static_cast<uintptr_t>((base + off) * isz), static_cast<uintptr_t>(a * isz), static_cast<size_t>((b - a) * isz)});
+        // Emit the parts of runs that fall in [a, b).
+        while (ri < order.size()) {
+          const size_t r = order[ri];
+          const i64 lo = link[r] + r_done, hi = link[r] + g.runs.len[r];
+          if (lo >= b) break;
+          const i64 take = std::min(hi, b) - lo;
+          const i64 stg_idx = base + off + (lo - a);
+          const i64 other = (h2d ? g.runs.dst[r] : g.runs.src[r]) + r_done;
+          if (h2d) split(ch, stg_idx, other, take, kTypedChunk);
+          else split(ch, other, stg_idx, take, kTypedChunk);
+          r_done += take;
+          if (r_done == g.runs.len[r]) ++ri, r_done = 0;
+          else break;  // continues in the next piece
         }
-        off += n;
+        off += b - a;
       }
-      const Side dev_side{h2d ? g.dst.device : g.src.device, dev_t, false};
+      const Side dev_side{h2d ? g.dst.device : g.src.device, lt, false};
+      const std::string kname = g.pure() ? "ce_bytes" : name;
       if (h2d) {
         copy_raws(s, g.src, dev_side, raws, st);
-        launch(s, name, ch, fn, st);
+        launch(s, kname, ch, fn, st);
       } else {
-        launch(s, name, ch, fn, st);
+        launch(s, kname, ch, fn, st);
         copy_raws(s, dev_side, g.dst, raws, st);
       }
       staging_release(s, st);
       calls += 2;
+      p = q;
     }
     return calls;
   }

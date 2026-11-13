@@ -52,6 +52,8 @@ Hash128 fingerprint(const Op& op) {
   h.add(std::bit_cast<uint32_t>(op.fn.lo));
   h.add(std::bit_cast<uint32_t>(op.fn.hi));
   h.add(op.ctx);
+  h.add(static_cast<uint64_t>(op.src_lo));
+  h.add(static_cast<uint64_t>(op.src_hi));
   h.add(op.runs.src);
   h.add(op.runs.dst);
   h.add(op.runs.len);
@@ -161,6 +163,9 @@ Plan build_plan(const std::vector<Op>& ops) {
       it->runs.append(op.runs);
     }
     for (Group& g : groups) {
+      std::vector<i64> lo, len;
+      for (int k : g.ops) lo.push_back(ops[k].src_lo), len.push_back(ops[k].src_hi - ops[k].src_lo);
+      g.src_extent = interval_union(lo, len);
       g.runs = g.runs.coalesce();
       g.rects = recover_2d(g.runs);
       if (!g.runs.empty()) plan.groups.push_back(std::move(g));

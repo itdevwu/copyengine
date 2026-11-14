@@ -52,7 +52,11 @@ scope: it runs as usual, ordered correctly around the copies.
    own `copy_` is always a candidate. Anything else is measured against it,
    including the time copyengine itself spends planning and submitting, and is
    kept only if it is clearly faster. Decisions keep being re-checked while
-   your program runs. The explicit API has the same protection where torch can
+   your program runs. A scope as a whole is held to the same rule: each scope
+   call site compares running intercepted with not intercepting at all (host
+   and GPU time), and stops intercepting where that does not clearly win, for
+   example around ops copyengine does not take (`index_copy_`) or copies torch
+   already does best (`stats()["scopes"]`). The explicit API has the same protection where torch can
    express the copy: `ce.lazy` views, `ce.gather`, `ce.scatter_`,
    `ce.segments` and `ce.indices` are measured against the same copy written
    with torch ops (indexing, `index_copy_`, slices) from the same host

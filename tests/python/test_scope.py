@@ -188,19 +188,65 @@ def test_shim_compiles_from_the_installed_sources(tmp_path):
         assert hasattr(lib, sym)
 
 
-def test_python_mode_site_switch_keeps_torch_unless_the_mode_clearly_wins():
+@pytest.mark.parametrize("on", ["shim", "mode"])
+def test_site_switch_keeps_torch_unless_interception_clearly_wins(on):
     from copyengine._api import _Site
-    slow = _Site()
-    while slow.decided is None:
-        kind, timed = slow.choose()
-        assert timed
-        slow.report(kind == "mode", 2.0 if kind == "mode" else 1.0)
+
+    def run(site, cost_on, tuning_entries=0):
+        k = 0
+        while site.decided is None:
+            kind, timed = site.choose()
+            if timed == "warm":
+                assert kind == on
+                site.warmed(quiet=k >= tuning_entries)  # the engine explores during the first entries
+            else:
+                assert timed
+                site.sample(kind is not None, cost_on if kind else 1.0)
+            k += 1
+        return k
+
+    slow = _Site(on)
+    n = run(slow, 2.0, tuning_entries=5)
     assert slow.decided is False and slow.choose() == (None, False)
-    fast = _Site()
-    while fast.decided is None:
-        kind, _ = fast.choose()
-        fast.report(kind == "mode", 0.5 if kind == "mode" else 1.0)
-    assert fast.decided is True and fast.choose() == ("mode", False)
+    assert n >= 5 + _Site.SETTLE + 2 * _Site.PAIRS
+    tie = _Site(on)
+    run(tie, 0.99)  # within noise: torch's own copy stays
+    assert tie.decided is False
+    fast = _Site(on)
+    run(fast, 0.5)
+    assert fast.decided is True and fast.choose() == (on, False)
+
+
+def test_scope_site_without_copies_stops_intercepting():
+    # A scope around ops copyengine does not take (here index_copy_) only pays
+    # for interception: the site settles on running torch directly.
+    e = ce.Engine()
+    dst, src = torch.zeros(64, 8), torch.randn(16, 8)
+    idx = torch.randperm(64)[:16]
+
+    def body():
+        with e.scope():
+            dst.index_copy_(0, idx, src)
+            return dst.sum()
+
+    for _ in range(_Site_entries()):
+        body()
+    site = next(iter(e._sites.values()))
+    assert site.decided is False
+    assert e.stats()["scopes"] == [{"site": site_name(body), "intercept": False}]
+    assert torch.equal(dst[idx], src)
+
+
+def site_name(fn):
+    import inspect
+    lines, first = inspect.getsourcelines(fn)
+    k = next(i for i, l in enumerate(lines) if "e.scope()" in l)
+    return f"{fn.__code__.co_filename}:{first + k}"
+
+
+def _Site_entries():
+    from copyengine._api import _Site
+    return _Site.SETTLE + 2 * _Site.PAIRS + 40
 
 
 @pytest.mark.parametrize("dev", DEVS)

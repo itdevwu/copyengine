@@ -39,9 +39,13 @@ Read `why` in the decisions:
   torch's result differs" (e.g. float to int) and "autograd" are by design;
   "layout, device or dtype copyengine does not handle" lists sparse, complex,
   conjugated or non-CPU/CUDA tensors.
-- `shim: False`: scopes intercept in Python, ~9 us per op, and a call site
-  where that loses runs torch natively. Fix the shim (below) for loops of many
-  small copies.
+- `stats()["scopes"]` with `"intercept": false`: that scope site measured
+  intercepting against not intercepting and torch won, so it runs torch's
+  copies directly (no cost, no gain). Typical when the scope holds no `copy_`
+  (an `index_copy_`, a vectorized op: use `ce.scatter_` / `ce.lazy` instead) or
+  only copies torch already does best. `null`: still deciding.
+- `shim: False`: scopes intercept in Python, ~9 us per op, so fewer sites win.
+  Fix the shim (below) for loops of many small copies.
 - Host overhead dominates tiny copies (a few us each): batch them in one scope,
   or `freeze()` a fixed set and `plan.run()` it.
 - An index given as a CUDA tensor costs a device sync per call: pass host

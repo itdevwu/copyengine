@@ -4,6 +4,16 @@ copyengine follows [semantic versioning](https://semver.org). From 0.1.0 on,
 the Python API, the C ABI (`CE_ABI_VERSION`) and the tuning profile format
 change incompatibly only in a new minor (0.x) or major release.
 
+## 0.2.2
+
+- A scope no longer costs time where copyengine does not help: each scope
+  call site compares intercepting with not intercepting at all (end to end,
+  host and GPU), after the engine has settled there, and stops intercepting
+  unless that clearly wins. Before, with the compiled shim, a scope always
+  intercepted, so a scope around ops copyengine does not take, or around
+  copies torch already did best, ran slower than torch. `stats()["scopes"]`
+  shows each site's decision.
+
 ## 0.2.1
 
 - Wheels for Linux aarch64 (manylinux_2_28; server ARM such as Grace: GH200,

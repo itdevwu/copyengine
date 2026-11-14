@@ -346,6 +346,7 @@ NB_MODULE(_core, m) {
       .def_prop_ro("depth", &ce::Engine::depth)
       .def_prop_ro("queued", &ce::Engine::queued)
       .def("stats_json", &ce::Engine::stats_json)
+      .def_prop_ro("tuning_runs", &ce::Engine::tuning_runs)
       .def("dump_profile", &ce::Engine::dump_profile)
       .def("load_profile", &ce::Engine::load_profile)
       .def("freeze", &ce::Engine::freeze);

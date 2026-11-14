@@ -185,6 +185,7 @@ struct Engine::Impl {
   bool host_pending = false;
   FlushStats last;
   int64_t total_flushes = 0, total_ops = 0, total_calls = 0, total_bytes = 0, plan_hits = 0;
+  int64_t tuning_runs = 0;  // see Engine::tuning_runs
   std::shared_ptr<std::vector<Op>> last_ops;
   Ran last_ran;
 
@@ -668,6 +669,7 @@ struct Engine::Impl {
           (opt.disable || tuner.locked(g.bucket)))
         memo = {true, ops.front().fp, pp, p.strategy, 0};
       run_group(g, p.strategy, ops, stream, p.measure, &st);
+      tuning_runs += p.measure;
       ran.strategies.push_back(p.strategy);
       for (int k : g.ops) {
         if (capturing) break;
@@ -847,6 +849,11 @@ void Engine::flush() {
 void Engine::synchronize() {
   Locked lk(*impl_);
   impl_->synchronize();
+}
+
+int64_t Engine::tuning_runs() const {
+  Locked lk(*impl_);
+  return impl_->tuning_runs;
 }
 
 int Engine::depth() const {

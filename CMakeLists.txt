@@ -17,6 +17,9 @@ else()
 endif()
 option(CE_BUILD_PYTHON "Build the Python extension" ${_ce_python_default})
 
+# Pre-release builds (".dev1", "rc1") append a suffix from the tag; the
+# version itself lives only in project() above.
+set(CE_VERSION_SUFFIX "" CACHE STRING "pre-release suffix of the version string, e.g. .dev1")
 configure_file(src/core/config.hpp.in ${CMAKE_CURRENT_BINARY_DIR}/generated/copyengine/config.hpp @ONLY)
 
 # Planner core, host backend and C ABI. Platform backends are added below.
@@ -182,7 +185,7 @@ if(CE_BUILD_PYTHON)
       execute_process(COMMAND "${Python_EXECUTABLE}" -c "import torch; print(int(torch._C._GLIBCXX_USE_CXX11_ABI), end='')"
                       OUTPUT_VARIABLE _torch_abi)
       execute_process(COMMAND "${Python_EXECUTABLE}" ${CMAKE_CURRENT_SOURCE_DIR}/python/copyengine/_shim_key.py
-                              ${_shim_src} ${PROJECT_VERSION}
+                              ${_shim_src} ${PROJECT_VERSION}${CE_VERSION_SUFFIX}
                       OUTPUT_VARIABLE _shim_key RESULT_VARIABLE _shim_key_rc)
       find_library(CE_TORCH_LIB torch PATHS ${_torch_lib} NO_DEFAULT_PATH)
       if(_shim_key_rc EQUAL 0)

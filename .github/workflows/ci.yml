@@ -129,7 +129,11 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
           want=$(sed -n 's/^project(copyengine VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt)
-          test "${GITHUB_REF_NAME#v}" = "$want" || { echo "tag $GITHUB_REF_NAME, CMakeLists.txt $want"; exit 1; }
+          tag=${GITHUB_REF_NAME#v}
+          suffix=${tag#"$want"}  # a pre-release: vX.Y.Z.devN or vX.Y.ZrcN
+          [ "$tag" != "$suffix" ] || { echo "tag $GITHUB_REF_NAME, CMakeLists.txt $want"; exit 1; }
+          [[ -z "$suffix" || "$suffix" =~ ^\.dev[0-9]+$|^rc[0-9]+$ ]] || { echo "bad pre-release tag $GITHUB_REF_NAME"; exit 1; }
+          echo "CE_WHEEL_VERSION_SUFFIX=$suffix" >> "$GITHUB_ENV"
       - run: docker/build-wheels.sh
       - uses: actions/upload-artifact@v5
         with:
@@ -150,7 +154,10 @@ jobs:
           path: dist
       - env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes
+        run: |
+          pre=""
+          [[ "$GITHUB_REF_NAME" =~ (dev|rc)[0-9]+$ ]] && pre="--prerelease"
+          gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes $pre
 
   # PyPI trusted publishing (OIDC): the pypi.org project trusts this workflow
   # and the `pypi` environment; no token is stored.

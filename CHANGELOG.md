@@ -29,6 +29,15 @@ change incompatibly only in a new minor (0.x) or major release.
 - `Engine.warmup(fn)` runs until every copy pattern `fn` hits has locked its
   decision (it ran 4 times regardless) and returns the number of runs.
 - Agent Skills `copyengine-adopt` and `copyengine-diagnose` (`skills/`).
+- Torch baselines for the explicit API: `ce.lazy` views (index_select,
+  permute, slice, select, flip, unsqueeze, expand, reshape) as source, views
+  or a single index_select as destination, and `ce.gather`, `ce.scatter_`,
+  `ce.segments`, `ce.indices` now carry the same copy written with torch ops,
+  so the A/B protects them too and `CE_DISABLE` runs them natively. Copies
+  with a torch baseline record into CUDA graphs without a prior run.
+- A/B fixes: a run that set a strategy up (resident tables) is no longer a
+  sample, and submit cost counts on both sides; both had biased decisions
+  toward torch's copy.
 - The no-regression and same-results guarantees now state what holds for
   NaN: NaN stays NaN, its payload is not kept (torch's differs per device).
 ## 0.1.1

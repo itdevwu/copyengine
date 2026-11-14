@@ -20,13 +20,16 @@ from ._tensor import (
     lazy,
     broadcast_to,
     current_stream,
+    device_index,
     flat_endpoint,
     index_array,
     is_tensor,
     raw_stream,
     torch,
+    torch_dst,
     torch_fast,
     torch_parts,
+    torch_replay,
     view,
 )
 
@@ -61,6 +64,78 @@ def native_copy(dst, src) -> None:
         dst.copy_(src, non_blocking=True)
     else:
         np.copyto(dst, src)
+
+
+# ---- torch equivalents of the explicit API (the baselines; built only when run) ------------
+
+
+def _dtype_of(x):
+    if isinstance(x, Lazy):
+        x = x._base.obj
+    return x.dtype if is_tensor(x) else None
+
+
+def _lazy_payload(dst, src, fn):
+    """Payload replaying ce.copy_ with lazy views as torch ops, or None."""
+    if fn is not None and fn is not _IDENTITY:
+        return None
+    sd, dd = _dtype_of(src), _dtype_of(dst)
+    if sd is None or dd is None or not (dd == sd or (dd in _FLOATS and sd != torch.bool)):
+        return None
+    if isinstance(src, Lazy) and any(op[0] == "slice" and (op[4] or 1) < 0 for op in src._ops):
+        return None
+    if isinstance(dst, Lazy) and torch_dst(dst) is None:
+        return None
+    return (_native_lazy, dst, src)
+
+
+def _native_lazy(dst, src) -> None:
+    s = torch_replay(src) if isinstance(src, Lazy) else src
+    if not isinstance(dst, Lazy):
+        dst.copy_(s, non_blocking=True)
+        return
+    kind = torch_dst(dst)
+    if kind[0] == "view":
+        kind[1].copy_(s, non_blocking=True)
+    else:
+        _, base, dim, idx = kind
+        shape = list(base.shape)
+        shape[dim] = len(idx)
+        base.index_copy_(dim, device_index(idx, base.device), s.expand(shape).to(base.dtype))
+
+
+def _native_gather(out, src, dim, idx) -> None:
+    out.copy_(src.index_select(dim, device_index(idx, src.device)), non_blocking=True)
+
+
+def _native_scatter(dst, src, dim, idx) -> None:
+    shape = list(dst.shape)
+    shape[dim] = len(idx)
+    dst.index_copy_(dim, device_index(idx, dst.device), src.expand(shape).to(dst.dtype))
+
+
+def _native_flat(dst, src, si, di) -> None:
+    """dst.flat[di] = src.flat[si] (element indices into contiguous tensors)."""
+    dst.view(-1).index_copy_(0, device_index(di, dst.device),
+                             src.reshape(-1).index_select(0, device_index(si, src.device)).to(dst.dtype))
+
+
+def _native_segments(dst, src, so, do, n) -> None:
+    if len(n) <= 64:  # few segments: slices, as a torch user would write them
+        sf, df = src.reshape(-1), dst.view(-1)
+        for a, b, k in zip(so.tolist(), do.tolist(), n.tolist()):
+            df[b:b + k].copy_(sf[a:a + k], non_blocking=True)
+        return
+    rep = np.repeat(np.arange(len(n)), n)
+    within = np.arange(int(n.sum())) - np.repeat(np.cumsum(n) - n, n)
+    _native_flat(dst, src, so[rep] + within, do[rep] + within)
+
+
+def _flat_payload(dst, src, fn):
+    """Whether a flat-index torch equivalent gives ce's bits for these tensors."""
+    if fn is not None and fn is not _IDENTITY or not (is_tensor(dst) and is_tensor(src)):
+        return False
+    return dst.dtype == src.dtype or (dst.dtype in _FLOATS and src.dtype != torch.bool)
 
 
 class Engine:
@@ -231,8 +306,12 @@ class Engine:
         sacc = broadcast_to(s.access, list(d.access.shape))
         stmt = _core.Stmt(d.access, sacc)
         with self._lock:
+            if isinstance(dst, Lazy) or isinstance(src, Lazy):
+                native = _lazy_payload(dst, src, fn)
+            else:
+                native = (self._native, dst, src) if _same_bits(dst, src, fn) else None
             self._e.copy_stmt(s.endpoint, d.endpoint, stmt, fn or _IDENTITY, ctx=ctx, stream=current_stream(d, s),
-                              native=(self._native, dst, src) if _same_bits(dst, src, fn) else None)
+                              native=native)
             self._after(s.obj, d.obj)
         return dst
 
@@ -251,9 +330,13 @@ class Engine:
         if valid_src is not None:
             vs = np.asarray(valid_src[0], dtype=np.int64).reshape(-1) + sbase
             vl = np.asarray(valid_src[1], dtype=np.int64).reshape(-1)
+        n = np.asarray(length, dtype=np.int64).reshape(-1)
+        native = None
+        if valid_src is None and _flat_payload(dst, src, fn):
+            native = (_native_segments, dst, src, so - sbase, do - dbase, n)
         with self._lock:
             self._e.copy_runs(sep, dep, so, do, length, fn or _IDENTITY, vs, vl, ctx=ctx,
-                              stream=current_stream(dv, sv))
+                              stream=current_stream(dv, sv), native=native)
             self._after(sv.obj, dv.obj)
 
     def indices(self, src, dst, src_idx, dst_idx, *, fn: Optional[Elementwise] = None, ctx: str = "") -> None:
@@ -262,15 +345,18 @@ class Engine:
         dep, dbase, dv = flat_endpoint(dst, writable=True)
         si = index_array(src_idx) + sbase
         di = index_array(dst_idx) + dbase
+        native = (_native_flat, dst, src, si - sbase, di - dbase) if _flat_payload(dst, src, fn) else None
         with self._lock:
-            self._e.copy_indices(sep, dep, si, di, fn or _IDENTITY, ctx=ctx, stream=current_stream(dv, sv))
+            self._e.copy_indices(sep, dep, si, di, fn or _IDENTITY, ctx=ctx, stream=current_stream(dv, sv),
+                                 native=native)
             self._after(sv.obj, dv.obj)
 
     def gather(self, src, index, dim: int = 0, *, out=None, fn: Optional[Elementwise] = None,
                dtype=None, ctx: str = ""):
         """``out = fn(src.index_select(dim, index))``; allocates ``out`` like ``src`` if omitted."""
         s = view(src)
-        sacc = s.access.index_select(dim, index_array(index))
+        idx = index_array(index)
+        sacc = s.access.index_select(dim, idx)
         if out is None:
             shape = list(sacc.shape)
             if is_tensor(src):
@@ -279,18 +365,23 @@ class Engine:
                 out = np.empty(shape, dtype=dtype or src.dtype)
         d = view(out, writable=True)
         stmt = _core.Stmt(d.access, sacc)
+        native = (_native_gather, out, src, dim, idx) if _flat_payload(out, src, fn) else None
         with self._lock:
-            self._e.copy_stmt(s.endpoint, d.endpoint, stmt, fn or _IDENTITY, ctx=ctx, stream=current_stream(d, s))
+            self._e.copy_stmt(s.endpoint, d.endpoint, stmt, fn or _IDENTITY, ctx=ctx, stream=current_stream(d, s),
+                              native=native)
             self._after(s.obj, d.obj)
         return out
 
     def scatter_(self, dst, index, src, dim: int = 0, *, fn: Optional[Elementwise] = None, ctx: str = ""):
         """``dst.index_copy_(dim, index, fn(src))``. Duplicate indices raise UnsafeCopy."""
         d, s = view(dst, writable=True), view(src)
-        dacc = d.access.index_select(dim, index_array(index))
+        idx = index_array(index)
+        dacc = d.access.index_select(dim, idx)
         stmt = _core.Stmt(dacc, broadcast_to(s.access, list(dacc.shape)))
+        native = (_native_scatter, dst, src, dim, idx) if _flat_payload(dst, src, fn) else None
         with self._lock:
-            self._e.copy_stmt(s.endpoint, d.endpoint, stmt, fn or _IDENTITY, ctx=ctx, stream=current_stream(d, s))
+            self._e.copy_stmt(s.endpoint, d.endpoint, stmt, fn or _IDENTITY, ctx=ctx, stream=current_stream(d, s),
+                              native=native)
             self._after(s.obj, d.obj)
         return dst
 

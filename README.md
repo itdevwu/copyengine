@@ -86,6 +86,12 @@ once on import (needs a C++ compiler, takes seconds, cached). If that is not
 possible, scopes fall back to a pure-Python interception with the same
 results, only slower, and a warning says so.
 
+**Use torch 2.10 or newer for the best performance.** Every torch from 2.9 on
+gives the same results, but from 2.10 the explicit API (`ce.copy_`,
+`ce.lazy`, ...) runs as a compiled torch op; on 2.9 it goes through Python and
+costs a few more microseconds per call, which matters for many small copies.
+`scope()` interception is compiled on every supported version.
+
 ## Use
 
 ```python

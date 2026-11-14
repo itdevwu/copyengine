@@ -26,7 +26,8 @@ First release.
 - dtypes: float64/32/16, bfloat16, int64/32/16/8, uint8, bool. Host and GPU
   conversions are bit-identical.
 - Platforms: Linux x86_64, Python 3.10+, CUDA 12.x and 13.x drivers (loaded at
-  runtime), torch 2.9+ for the torch integration. A stable C ABI and CMake
+  runtime), torch 2.9+ for `scope()` interception, 2.10+ for the explicit API
+  as torch custom ops (older torch runs it from Python). A stable C ABI and CMake
   package for C and C++ callers.
 
 Known limits: no fp8 dtypes; copies between two GPUs are implemented but have

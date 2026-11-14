@@ -1,6 +1,6 @@
 """Loads copyengine._torch_stable, the explicit copy API as torch custom ops.
 
-The library is built on torch's stable ABI (2.9+). When it is missing, or torch
+The library is built on torch's stable ABI (2.10+). When it is missing, or torch
 is older, the Python layer issues copies itself; results are the same.
 """
 
@@ -28,6 +28,9 @@ def _load() -> None:
     global copy_, copy_fn_, error
     if torch is None:
         error = "torch is not installed"
+        return
+    if tuple(int(x) for x in torch.__version__.split("+")[0].split(".")[:2]) < (2, 10):
+        error = f"torch {torch.__version__} predates the stable ABI the torch ops use (2.10)"
         return
     path = Path(__file__).with_name("_torch_stable.so")
     if not path.exists():

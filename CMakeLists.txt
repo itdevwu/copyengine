@@ -151,13 +151,13 @@ if(CE_BUILD_PYTHON)
   install(DIRECTORY ${_shim_src} DESTINATION copyengine)
 
   # copyengine._torch_stable: explicit APIs as torch custom ops on the stable
-  # libtorch ABI (torch >= 2.9), one binary for every later torch. Optional:
+  # libtorch ABI (torch >= 2.10), one binary for every later torch. Optional:
   # without it the Python layer issues copies itself.
-  set(CE_TORCH "AUTO" CACHE STRING "Build the stable-ABI torch extension: ON, OFF or AUTO (if torch >= 2.9 imports)")
+  set(CE_TORCH "AUTO" CACHE STRING "Build the stable-ABI torch extension: ON, OFF or AUTO (if torch >= 2.10 imports)")
   if(NOT CE_TORCH STREQUAL "OFF")
     string(CONCAT _q "import torch; from torch.utils import cpp_extension as c; "
            "v = tuple(int(x) for x in torch.__version__.split('+')[0].split('.')[:2]); "
-           "assert v >= (2, 9), torch.__version__; ")
+           "assert v >= (2, 10), torch.__version__; ")
     execute_process(COMMAND "${Python_EXECUTABLE}" -c "${_q}print(';'.join(c.include_paths()), end='')"
                     RESULT_VARIABLE _torch_rc OUTPUT_VARIABLE _torch_inc ERROR_VARIABLE _torch_err)
     execute_process(COMMAND "${Python_EXECUTABLE}" -c "${_q}print(';'.join(c.library_paths()), end='')"
@@ -168,8 +168,8 @@ if(CE_BUILD_PYTHON)
       add_library(copyengine_torch MODULE src/torch/ops.cpp)
       target_include_directories(copyengine_torch SYSTEM PRIVATE ${_torch_inc})
       target_include_directories(copyengine_torch PRIVATE $<TARGET_PROPERTY:copyengine,INTERFACE_INCLUDE_DIRECTORIES>)
-      # Only the stable ABI as of torch 2.9 may be used.
-      target_compile_definitions(copyengine_torch PRIVATE TORCH_TARGET_VERSION=0x0209000000000000)
+      # Only the stable ABI as of torch 2.10 may be used.
+      target_compile_definitions(copyengine_torch PRIVATE TORCH_TARGET_VERSION=0x020A000000000000)
       target_link_libraries(copyengine_torch PRIVATE ${CE_TORCH_CPU} ${CE_TORCH_C10} ${CMAKE_DL_LIBS})
       set_target_properties(copyengine_torch PROPERTIES PREFIX "" OUTPUT_NAME "_torch_stable"
                             CXX_VISIBILITY_PRESET hidden)
@@ -195,9 +195,9 @@ if(CE_BUILD_PYTHON)
         install(TARGETS copyengine_shim LIBRARY DESTINATION copyengine/shims/${_shim_key})
       endif()
     elseif(CE_TORCH STREQUAL "ON")
-      message(FATAL_ERROR "CE_TORCH=ON but torch >= 2.9 is not importable: ${_torch_err}")
+      message(FATAL_ERROR "CE_TORCH=ON but torch >= 2.10 is not importable: ${_torch_err}")
     else()
-      message(STATUS "copyengine: stable-ABI torch extension OFF (torch >= 2.9 not importable at build time)")
+      message(STATUS "copyengine: stable-ABI torch extension OFF (torch >= 2.10 not importable at build time)")
     endif()
   endif()
 endif()

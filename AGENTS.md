@@ -21,7 +21,7 @@
 - torch integration is layered, and all logic stays in the torch-free core,
   reached through the `FrontendApi` table that `_core` exports:
   `src/torch/ops.cpp` on the stable libtorch ABI (descriptors, explicit APIs as
-  custom ops; one build for every torch >= 2.9), and `src/torch/shim.cpp`, the
+  custom ops; one build for every torch >= 2.10), and `src/torch/shim.cpp`, the
   scope interception, holding only dispatch-key registration and redispatch.
   The shim uses the DeferredInit key, refuses to load if something else holds
   it, and is admitted only after a verified copy; it is prebuilt for the

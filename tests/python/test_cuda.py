@@ -532,3 +532,10 @@ def test_intercepted_non_blocking_keeps_pinned_sources_alive(intercept):
             a.copy_(b)
 
     _reuse_pinned_after_free(start, later)
+
+
+def test_sparse_tensors_take_the_general_path():
+    dense = torch.eye(8)
+    sparse = dense.to_sparse()
+    with pytest.raises((TypeError, ValueError, ce.CopyEngineError, RuntimeError)):
+        ce.Engine(prior_only=True).copy_(torch.zeros(8, 8), sparse)

@@ -54,7 +54,8 @@ jobs:
         run: CE_SHIM=0 pytest -q
       - name: Check both torch layers loaded
         working-directory: /tmp
-        run: python -c "import copyengine as ce; assert ce._torch_ops.copy_ is not None, ce._torch_ops.error; assert ce._shim.lib is not None, ce._shim.error"
+        # The stable-ABI ops need torch >= 2.10; older torch uses the Python path for explicit copies.
+        run: python -c "import torch, copyengine as ce; v = tuple(map(int, torch.__version__.split('+')[0].split('.')[:2])); assert (ce._torch_ops.copy_ is not None) == (v >= (2, 10)), ce._torch_ops.error; assert ce._shim.lib is not None, ce._shim.error"
 
   # The stable ABI claim and the compile-on-import path: built with the newest
   # torch, run with the oldest supported one.
@@ -72,9 +73,9 @@ jobs:
       - run: pip wheel --no-build-isolation --no-deps . -w dist
       - run: pip install "torch==2.9.1" --index-url "$TORCH_CPU_INDEX"
       - run: pip install --no-deps dist/*.whl
-      - name: Stable ops load on older torch; the shim compiles on import
+      - name: On torch older than the ops' stable ABI, the ops stay off and the shim still loads
         working-directory: /tmp
-        run: python -c "import copyengine as ce; assert ce._torch_ops.copy_ is not None, ce._torch_ops.error; assert ce._shim.lib is not None, ce._shim.error; print(ce._shim.lib._name)"
+        run: python -c "import copyengine as ce; assert ce._torch_ops.copy_ is None; assert ce._shim.lib is not None, ce._shim.error; print(ce._torch_ops.error); print(ce._shim.lib._name)"
       - run: pytest -q
 
   # Release wheels and sdist (docker/build-wheels.sh, which also runs locally):

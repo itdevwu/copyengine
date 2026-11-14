@@ -33,6 +33,7 @@ from ._tensor import (
 Elementwise = _core.Elementwise
 _IDENTITY = _core.Elementwise()
 _Tensor = torch.Tensor if torch is not None else None
+_STRIDED = torch.strided if torch is not None else None
 
 if torch is not None:
     _FLOATS = (torch.float16, torch.bfloat16, torch.float32, torch.float64)
@@ -169,7 +170,9 @@ class Engine:
     def copy_(self, dst, src, *, fn: Optional[Elementwise] = None, ctx: str = "") -> Any:
         """``dst[...] = fn(src)`` for any strided views; ``src`` broadcasts to ``dst``."""
         op = _torch_ops.copy_
-        if op is not None and not ctx and type(dst) is _Tensor and type(src) is _Tensor:
+        # Strided only: the stable ABI the op targets cannot tell it a tensor's layout.
+        if (op is not None and not ctx and type(dst) is _Tensor and type(src) is _Tensor
+                and dst.layout is _STRIDED and src.layout is _STRIDED):
             # Descriptors, checks and the native baseline in C++; the engine locks itself.
             try:
                 if fn is None or fn is _IDENTITY:

@@ -12,6 +12,20 @@ namespace ce {
 // without a CUDA driver).
 bool host_is_pinned(uintptr_t p);
 
+// Where copyengine's own device memory (staging, resident tables, upload
+// buffers) comes from, when a framework provides it: then it counts in the
+// framework's statistics and limits. Process-wide; null means cuMemAlloc.
+struct DeviceAllocator {
+  // `bytes` on `device`; returns the address (0 when out of memory), the
+  // owning handle, and the stream the allocator associated it with (memory is
+  // reused only by later allocations on that stream).
+  uintptr_t (*alloc)(int device, size_t bytes, void** handle, uintptr_t* stream) = nullptr;
+  void (*free)(void* handle) = nullptr;
+  const char* name = "";
+};
+void set_device_allocator(const DeviceAllocator* a);
+const DeviceAllocator* device_allocator();
+
 // Entry points for framework extensions (copyengine._torch). They receive this
 // table from copyengine._core, so the process holds one copy of the engine and
 // extensions need not link the core. Both sides come from the same build;
@@ -37,6 +51,7 @@ struct FrontendApi {
   size_t (*queued)(const Engine& engine) = nullptr;
   // Engine::decline.
   void (*decline)(Engine& engine, const char* reason) = nullptr;
+  void (*set_device_allocator)(const DeviceAllocator* a) = nullptr;
 };
 
 const FrontendApi* frontend_api();

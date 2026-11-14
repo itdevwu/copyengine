@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "backends/cuda/driver.hpp"
+#include "copyengine/frontend.hpp"
 #include "backends/host/host.hpp"
 #include "copyengine/error.hpp"
 
@@ -197,7 +198,7 @@ class CudaExecutor final : public Executor {
       for (Slot& sl : s.slots) {
         if (sl.used) d_->cuEventSynchronize(sl.done);
         if (sl.host) d_->cuMemFreeHost(sl.host);
-        if (sl.dev) d_->cuMemFree(sl.dev);
+        dev_free(s, sl.dev);
         if (sl.done) d_->cuEventDestroy(sl.done);
       }
       if (s.sm_stream) {
@@ -213,7 +214,8 @@ class CudaExecutor final : public Executor {
         if (b.done) d_->cuEventDestroy(b.done);
       }
       if (s.staging_used) d_->cuEventSynchronize(s.staging_done);
-      if (s.staging) d_->cuMemFree(s.staging);
+      dev_free(s, s.staging);
+      if (s.ev_free) d_->cuEventDestroy(s.ev_free);
       for (CUevent e : {s.ev_in, s.ev_out, s.staging_done})
         if (e) d_->cuEventDestroy(e);
       if (s.side) d_->cuStreamDestroy(s.side);
@@ -300,6 +302,7 @@ class CudaExecutor final : public Executor {
     const NvtxRange range(strat);
     const int di = device_of(g);
     Dev& s = state(di);
+    note_stream(s, stream);
     Push push(*d_, s.ctx);
     const CUstream st = reinterpret_cast<CUstream>(stream);
     switch (strat) {
@@ -385,15 +388,25 @@ class CudaExecutor final : public Executor {
                     .set("index", static_cast<int>(i))
                     .set("kernels", s.kernels ? Json(true) : Json(s.kernel_error))
                     .set("batch", s.batch ? Json(true) : Json(s.batch_error))
-                    .set("sm_limit", s.sm_limit));
+                    .set("sm_limit", s.sm_limit)
+                    .set("allocator", device_allocator() ? device_allocator()->name : "cuda"));
     }
     return devs;
   }
 
  private:
+  // Device memory of copyengine's own: from the framework's allocator when one
+  // is registered (its handle, and the stream that allocator ties it to), else
+  // from cuMemAlloc.
+  struct DevMem {
+    CUdeviceptr ptr = 0;
+    void* handle = nullptr;
+    uintptr_t stream = 0;
+  };
+
   struct Slot {
     void* host = nullptr;
-    CUdeviceptr dev = 0;
+    DevMem dev;
     size_t cap = 0;
     CUevent done = nullptr;
     bool used = false;
@@ -419,7 +432,7 @@ class CudaExecutor final : public Executor {
     CUevent ev_in{}, ev_out{};
     std::array<Slot, kSlots> slots;
     int next = 0;
-    CUdeviceptr staging = 0;
+    DevMem staging;
     size_t staging_cap = 0;
     CUevent staging_done{};
     CUstream staging_stream{};
@@ -431,7 +444,59 @@ class CudaExecutor final : public Executor {
     CUevent sm_in{}, sm_out{};
     unsigned grid_cap = 0;      // soft limit: max thread blocks per launch (0: none)
     std::string sm_limit = "none";
+    // Streams this device's work ran on, for ordering a framework allocator's
+    // reuse of freed memory after it (kMaxStreams, then: the whole device).
+    std::vector<uintptr_t> streams;
+    bool many_streams = false;
+    CUevent ev_free{};
   };
+  static constexpr size_t kMaxStreams = 32;
+
+  DevMem dev_alloc(Dev& s, size_t bytes, const char* what) {
+    if (const DeviceAllocator* a = device_allocator()) {
+      DevMem m;
+      m.ptr = static_cast<CUdeviceptr>(a->alloc(s.index, bytes, &m.handle, &m.stream));
+      if (!m.ptr) fail(Errc::backend, std::string(what) + ": out of memory (" + a->name + " allocator, " +
+                                          std::to_string(bytes) + " bytes)");
+      return m;
+    }
+    DevMem m;
+    check(d_->cuMemAlloc(&m.ptr, bytes), what);
+    return m;
+  }
+
+  // Releases `m`. Memory from the framework's allocator is reused only by later
+  // allocations on m.stream, so that stream first waits for every stream this
+  // device's copies used: nothing reuses it before they are done. Never blocks
+  // the host. Plain cuMemFree waits for the device itself.
+  void dev_free(Dev& s, DevMem& m) {
+    if (!m.ptr) return;
+    if (m.handle) {
+      const DeviceAllocator* a = device_allocator();
+      if (s.many_streams) {
+        d_->cuCtxSynchronize();
+      } else {
+        if (!s.ev_free) d_->cuEventCreate(&s.ev_free, CU_EVENT_DISABLE_TIMING);
+        std::vector<uintptr_t> all = s.streams;
+        for (CUstream x : {s.side, s.staging_stream, s.sm_stream}) all.push_back(reinterpret_cast<uintptr_t>(x));
+        for (uintptr_t x : all) {
+          if (x == m.stream || !s.ev_free) continue;
+          d_->cuEventRecord(s.ev_free, reinterpret_cast<CUstream>(x));
+          d_->cuStreamWaitEvent(reinterpret_cast<CUstream>(m.stream), s.ev_free, 0);
+        }
+      }
+      if (a) a->free(m.handle);
+    } else {
+      d_->cuMemFree(m.ptr);
+    }
+    m = DevMem{};
+  }
+
+  void note_stream(Dev& s, uintptr_t st) {
+    if (s.many_streams || std::find(s.streams.begin(), s.streams.end(), st) != s.streams.end()) return;
+    if (s.streams.size() == kMaxStreams) s.many_streams = true;
+    else s.streams.push_back(st);
+  }
 
   // Makes `c` current for a scope. torch and ce share each device's primary
   // context, so it usually already is: then nothing is pushed or popped.
@@ -784,16 +849,16 @@ class CudaExecutor final : public Executor {
     if (sl.used) check(d_->cuEventSynchronize(sl.done), "cuEventSynchronize");
     if (sl.cap < need) {
       if (sl.host) d_->cuMemFreeHost(sl.host);
-      if (sl.dev) d_->cuMemFree(sl.dev);
-      sl.host = nullptr, sl.dev = 0;
+      dev_free(s, sl.dev);
+      sl.host = nullptr;
       size_t cap = 64 << 10;
       while (cap < need) cap <<= 1;
       check(d_->cuMemHostAlloc(&sl.host, cap, 0), "cuMemHostAlloc");
-      check(d_->cuMemAlloc(&sl.dev, cap), "cuMemAlloc");
+      sl.dev = dev_alloc(s, cap, "upload buffer");
       sl.cap = cap;
     }
     std::memcpy(sl.host, data, need);
-    check(d_->cuMemcpyHtoDAsync(sl.dev, sl.host, need, st), "cuMemcpyHtoDAsync");
+    check(d_->cuMemcpyHtoDAsync(sl.dev.ptr, sl.host, need, st), "cuMemcpyHtoDAsync");
     return sl;
   }
 
@@ -901,17 +966,17 @@ class CudaExecutor final : public Executor {
   // A parameter table in device memory for the life of the group that built
   // it: launches read it in place, so the hot path uploads nothing.
   struct DevTable {
-    const Driver* d = nullptr;
-    CUcontext ctx{};
+    CudaExecutor* owner = nullptr;
+    int device = 0;
+    DevMem mem;
     CUdeviceptr ptr = 0;
     size_t count = 0;
     std::weak_ptr<int> alive;  // the executor
     ~DevTable() {
-      if (!ptr || alive.expired()) return;
-      d->cuCtxPushCurrent(ctx);
-      d->cuMemFree(ptr);
-      CUcontext dummy{};
-      d->cuCtxPopCurrent(&dummy);
+      if (!mem.ptr || alive.expired()) return;
+      Dev& s = owner->devs_[device];
+      Push push(*owner->d_, s.ctx);
+      owner->dev_free(s, mem);
     }
   };
 
@@ -919,10 +984,11 @@ class CudaExecutor final : public Executor {
   template <class T>
   std::shared_ptr<DevTable> resident(Dev& s, const std::vector<T>& v) {
     auto t = std::make_shared<DevTable>();
-    t->d = d_, t->ctx = s.ctx, t->alive = alive_, t->count = v.size();
+    t->owner = this, t->device = s.index, t->alive = alive_, t->count = v.size();
     if (v.empty()) return t;
     const size_t bytes = v.size() * sizeof(T);
-    check(d_->cuMemAlloc(&t->ptr, bytes), "cuMemAlloc (table)");
+    t->mem = dev_alloc(s, bytes, "copy table");
+    t->ptr = t->mem.ptr;
     check(d_->cuMemcpyHtoDAsync(t->ptr, v.data(), bytes, s.side), "cuMemcpyHtoDAsync");
     check(d_->cuStreamSynchronize(s.side), "cuStreamSynchronize");
     return t;
@@ -957,7 +1023,7 @@ class CudaExecutor final : public Executor {
   void launch(Dev& s, const std::string& name, const std::vector<Chunk>& chunks, const cv::Fn& fn, CUstream st) {
     if (chunks.empty()) return;
     Slot& sl = upload(s, chunks.data(), chunks.size() * sizeof(Chunk), st);
-    launch_table(s, name, sl.dev, chunks.size(), fn, 0, 0, st);
+    launch_table(s, name, sl.dev.ptr, chunks.size(), fn, 0, 0, st);
     check(d_->cuEventRecord(sl.done, st), "cuEventRecord");
     sl.used = true;
   }
@@ -1182,19 +1248,18 @@ class CudaExecutor final : public Executor {
 
   CUdeviceptr staging(Dev& s, size_t bytes, CUstream st) {
     if (s.staging_cap < bytes) {
-      if (s.staging_used) check(d_->cuEventSynchronize(s.staging_done), "cuEventSynchronize");
-      if (s.staging) d_->cuMemFree(s.staging);
-      s.staging = 0;
+      if (s.staging_used && !s.staging.handle) check(d_->cuEventSynchronize(s.staging_done), "cuEventSynchronize");
+      dev_free(s, s.staging);  // a framework allocator's memory is ordered, not waited for
       size_t cap = 1 << 20;
       while (cap < bytes) cap <<= 1;
       cap = std::min<size_t>(cap, static_cast<size_t>(std::max<int64_t>(opt_.staging_budget, 1 << 20)));
       if (cap < bytes) fail(Errc::invalid_argument, "staging request exceeds the budget");
-      check(d_->cuMemAlloc(&s.staging, cap), "cuMemAlloc (staging)");
+      s.staging = dev_alloc(s, cap, "staging");
       s.staging_cap = cap;
       s.staging_used = false;
     }
     if (s.staging_used && s.staging_stream != st) check(d_->cuStreamWaitEvent(st, s.staging_done, 0), "cuStreamWaitEvent");
-    return s.staging;
+    return s.staging.ptr;
   }
 
   void staging_release(Dev& s, CUstream st) {

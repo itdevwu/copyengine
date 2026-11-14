@@ -122,18 +122,61 @@ void copy_fn_(Tensor dst, Tensor src, int64_t engine, double scale, double bias,
   copy_with(std::move(dst), std::move(src), engine, fn);
 }
 
+// copyengine's own device memory from torch's caching allocator, as uint8
+// tensors: it counts in torch.cuda.memory_allocated() and torch's limits, and
+// freeing it never synchronizes. Tied to torch's current stream at allocation
+// (the core orders that stream after its own use before freeing).
+bool g_shutdown = false;  // torch may be gone at interpreter exit: then leave memory to the process
+
+uintptr_t torch_alloc(int device, size_t bytes, void** handle, uintptr_t* stream) {
+  try {
+    const int64_t size = static_cast<int64_t>(bytes), stride = 1;
+    AtenTensorHandle t = nullptr;
+    if (aoti_torch_empty_strided(1, &size, &stride, aoti_torch_dtype_uint8(), aoti_torch_device_type_cuda(), device,
+                                 &t) != AOTI_TORCH_SUCCESS || !t)
+      return 0;
+    void* p = nullptr;
+    if (aoti_torch_get_data_ptr(t, &p) != AOTI_TORCH_SUCCESS || !p) {
+      aoti_torch_delete_tensor_object(t);
+      return 0;
+    }
+    *handle = t;
+    *stream = current_stream(device);
+    return reinterpret_cast<uintptr_t>(p);
+  } catch (...) {
+    return 0;
+  }
+}
+
+void torch_free(void* handle) {
+  if (!g_shutdown) aoti_torch_delete_tensor_object(static_cast<AtenTensorHandle>(handle));
+}
+
+const ce::DeviceAllocator kTorchAllocator = [] {
+  ce::DeviceAllocator a;
+  a.alloc = &torch_alloc;
+  a.free = &torch_free;
+  a.name = "torch";
+  return a;
+}();
+
 void copy_meta(Tensor, Tensor, int64_t) {}
 void copy_fn_meta(Tensor, Tensor, int64_t, double, double, bool, bool, double, double) {}
 
 }  // namespace
 
-// Called once by copyengine with the address of copyengine._core's table.
-extern "C" __attribute__((visibility("default"))) int copyengine_torch_bind(uintptr_t api) {
+// Called once by copyengine with the address of copyengine._core's table;
+// `allocator`: also give copyengine's device memory to torch's allocator.
+extern "C" __attribute__((visibility("default"))) int copyengine_torch_bind(uintptr_t api, int allocator) {
   const auto* a = reinterpret_cast<const ce::FrontendApi*>(api);
   if (!a || a->version != ce::FrontendApi::kVersion) return 1;
   g_api = a;
+  if (allocator && a->set_device_allocator) a->set_device_allocator(&kTorchAllocator);
   return 0;
 }
+
+// At interpreter exit (atexit, before torch's own teardown completes).
+extern "C" __attribute__((visibility("default"))) void copyengine_torch_shutdown() { g_shutdown = true; }
 
 STABLE_TORCH_LIBRARY(copyengine, m) {
   m.def("copy_(Tensor(a!) dst, Tensor src, int engine) -> ()");

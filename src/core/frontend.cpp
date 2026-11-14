@@ -1,5 +1,6 @@
 #include "copyengine/frontend.hpp"
 
+#include <atomic>
 #include <span>
 #include <vector>
 
@@ -24,6 +25,13 @@ bool host_is_pinned(uintptr_t p) {
   return false;
 #endif
 }
+
+namespace {
+std::atomic<const DeviceAllocator*> g_allocator{nullptr};
+}  // namespace
+
+void set_device_allocator(const DeviceAllocator* a) { g_allocator.store(a); }
+const DeviceAllocator* device_allocator() { return g_allocator.load(); }
 
 namespace {
 
@@ -84,6 +92,7 @@ const FrontendApi* frontend_api() {
     a.fence = &fence;
     a.queued = &queued;
     a.decline = &decline;
+    a.set_device_allocator = &set_device_allocator;
     return a;
   }();
   return &api;

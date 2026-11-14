@@ -1,6 +1,8 @@
 """CUDA paths, checked against torch. Skipped without torch or a GPU."""
 
 import numpy as np
+import time
+
 import pytest
 
 import copyengine as ce
@@ -601,3 +603,70 @@ def test_hard_sm_limit_keeps_kernels_on_its_sms():
     e.copy_(out, big)
     torch.cuda.synchronize()
     torch.testing.assert_close(out, big.half(), rtol=0, atol=0)
+
+
+# ---- copyengine's own device memory through torch's allocator --------------------------------
+
+
+def _skip_unless_torch_allocator():
+    if ce._torch_ops.copy_ is None:
+        pytest.skip(ce._torch_ops.error)
+    e = ce.Engine(prior_only=True)
+    e.copy_(torch.zeros(4, device=DEV), torch.ones(4, device=DEV))
+    if e.stats()["cuda"][0]["allocator"] != "torch":
+        pytest.skip("torch's allocator is off (CE_TORCH_ALLOCATOR=0)")
+
+
+def test_own_memory_counts_in_torch_statistics():
+    _skip_unless_torch_allocator()
+    e = ce.Engine(prior_only=True)
+    src = torch.randn(64, 32).pin_memory()
+    dst = torch.zeros(32, 64, device=DEV)
+    before = torch.cuda.memory_allocated()
+    e.copy_(dst, src.t())  # through device staging
+    torch.cuda.synchronize()
+    assert e.stats()["cuda"][0]["allocator"] == "torch"
+    assert torch.cuda.memory_allocated() - before >= 1 << 20
+    torch.testing.assert_close(dst.cpu(), src.t(), rtol=0, atol=0)
+
+
+def test_freed_memory_is_not_reused_before_pending_copies():
+    # Staging allocated on stream A is still read by a copy queued on stream B
+    # (behind a long kernel) when growth frees it; torch then hands that block
+    # to new tensors on A, filled with garbage. The pending copy must still
+    # read its own data.
+    _skip_unless_torch_allocator()
+    e = ce.Engine(prior_only=True, allow_async=True)  # the host does not wait for B
+    a, b = torch.cuda.Stream(), torch.cuda.Stream()
+    small = torch.randn(64, 32).pin_memory()
+    with torch.cuda.stream(a):  # staging (1 MB) belongs to A
+        e.copy_(torch.zeros(32, 64, device=DEV), small.t())
+    torch.cuda.synchronize()
+    out = torch.zeros(32, 64, device=DEV)
+    big_src = torch.randn(1024, 512).pin_memory()
+    big = torch.zeros(512, 1024, device=DEV)
+    with torch.cuda.stream(b):
+        torch.cuda._sleep(1_000_000_000)
+        e.copy_(out, small.t())    # pending: reads the 1 MB staging
+        e.copy_(big, big_src.t())  # needs 2 MB: the old staging is freed
+    with torch.cuda.stream(a):  # 1 MB blocks on A: one of them is likely the freed staging
+        fresh = [torch.full((1 << 18,), -1.0, device=DEV) for _ in range(8)]
+    time.sleep(0.05)
+    # Freeing ordered A after B's pending copies: A's new work waits for them.
+    assert not a.query(), "freed memory was handed to stream A before the copies using it finished"
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out.cpu(), small.t(), rtol=0, atol=0)
+    torch.testing.assert_close(big.cpu(), big_src.t(), rtol=0, atol=0)
+    # Without the ordering, B's late staging write lands in A's new tensors.
+    assert all(bool((f == -1.0).all()) for f in fresh), "a pending copy wrote into reused memory"
+
+
+def test_cuda_allocator_when_torch_allocator_is_off():
+    import subprocess
+    import sys
+    code = ("import torch, copyengine as ce; e = ce.Engine(prior_only=True); "
+            "e.copy_(torch.zeros(32, 64, device='cuda'), torch.randn(64, 32).pin_memory().t()); "
+            "print(e.stats()['cuda'][0]['allocator'])")
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                         env={**__import__("os").environ, "CE_TORCH_ALLOCATOR": "0"})
+    assert out.stdout.strip() == "cuda", out.stderr

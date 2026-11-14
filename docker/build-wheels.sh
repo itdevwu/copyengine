@@ -1,10 +1,11 @@
 #!/bin/bash
-# Release wheels and sdist, built inside quay.io/pypa/manylinux_2_28_x86_64 (CI
-# runs exactly this):
+# Release wheels and sdist, built inside quay.io/pypa/manylinux_2_28_<arch>
+# for x86_64 and aarch64 (CI runs exactly this, on a runner of that arch):
 #
 #   docker run --rm -e HOST_UID=$(id -u) -v "$PWD":/work -w /work \
 #     quay.io/pypa/manylinux_2_28_x86_64 docker/build-wheels.sh
 #
+# CE_WHEEL_SDIST=0 skips the sdist (one architecture provides it).
 # Python 3.12+ gets one abi3 wheel; older versions one wheel each. Every wheel
 # carries the CUDA kernels for all architectures, the stable-ABI torch ops, and
 # a prebuilt interception shim per supported torch release (other releases
@@ -12,6 +13,12 @@
 set -euo pipefail
 
 CUDA=${CE_WHEEL_CUDA:-12-9}                              # toolkit for nvcc and headers only
+ARCH=$(uname -m)                                         # x86_64 or aarch64
+case "$ARCH" in
+  x86_64) CUDA_REPO=x86_64 ;;
+  aarch64) CUDA_REPO=sbsa ;;                             # server ARM: Grace (GH200, GB200), GB10
+  *) echo "unsupported architecture $ARCH"; exit 1 ;;
+esac
 PYTHONS=${CE_WHEEL_PYTHONS:-"cp310 cp311 cp312"}
 TORCH_BUILD=${CE_WHEEL_TORCH:-2.11.0}                    # built against: stable ops, its own shim
 TORCH_SHIMS=${CE_WHEEL_SHIM_TORCH:-"2.9.1 2.10.0"}       # further releases with a prebuilt shim
@@ -33,7 +40,7 @@ step() { echo "== $*"; }
 
 step "CUDA $CUDA toolkit (nvcc, headers)"
 dnf -y -q install dnf-plugins-core
-dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo
+dnf config-manager --add-repo "https://developer.download.nvidia.com/compute/cuda/repos/rhel8/$CUDA_REPO/cuda-rhel8.repo"
 dnf -y -q install "cuda-nvcc-$CUDA" "cuda-cudart-devel-$CUDA" "cuda-driver-devel-$CUDA" "cuda-nvtx-$CUDA"
 export PATH=/usr/local/cuda/bin:$PATH
 
@@ -76,15 +83,17 @@ for whl in "$WORK"/raw/*.whl; do
   cp -r "$WORK"/shims-cache/copyengine/shim/* "$pkg/shims/"
   "$W/python" -m wheel pack -d "$WORK/packed" "$WORK"/unpacked/*
 done
-"$W/auditwheel" repair -w "$OUT" --plat manylinux_2_28_x86_64 \
+"$W/auditwheel" repair -w "$OUT" --plat "manylinux_2_28_$ARCH" \
   --exclude 'libtorch*.so*' --exclude 'libc10*.so*' "$WORK"/packed/*.whl
-"$W/python" -m build --sdist --no-isolation -o "$OUT" "$SRC"
+if [ "${CE_WHEEL_SDIST:-1}" != 0 ]; then
+  "$W/python" -m build --sdist --no-isolation -o "$OUT" "$SRC"
+fi
 
 step "smoke test: each wheel in a fresh environment"
 for py in $PYTHONS; do
   venv "$py" "$WORK/t-$py"
   "$WORK/t-$py/bin/pip" install -q numpy pytest "torch==$TORCH_BUILD" --index-url "$INDEX" --extra-index-url https://pypi.org/simple
-  "$WORK/t-$py/bin/pip" install -q --no-deps --find-links "$OUT" copyengine
+  "$WORK/t-$py/bin/pip" install -q --no-deps --no-index --only-binary :all: --find-links "$OUT" copyengine
   (cd "$WORK" && CE_CACHE_DIR="$WORK/empty-cache" "$WORK/t-$py/bin/python" -I -c '
 import copyengine as ce, copyengine._shim as s, os
 assert ce._torch_ops.copy_ is not None, ce._torch_ops.error

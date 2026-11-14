@@ -102,7 +102,8 @@ dtypes: float64/32/16, bfloat16, float8 (e4m3fn, e5m2, e8m0fnu), int64/32/16/8,
 uint8 and bool convert into each other; packed FP4 (`float4_e2m1fn_x2`) is
 copied unconverted.
 
-Requirements: Linux x86_64, Python ≥ 3.10. GPU support runs on CUDA 12.x and
+Requirements: Linux on x86_64 or aarch64 (server ARM such as Grace: GH200,
+GB200, GB10; not Jetson), Python ≥ 3.10. GPU support runs on CUDA 12.x and
 13.x drivers; the driver is loaded at runtime, nothing links against `libcuda`
 or `cudart`.
 

@@ -280,22 +280,25 @@ NB_MODULE(_core, m) {
       .def(nb::init<ce::EngineOptions>(), "options"_a)
       .def("copy_runs", [make_hints](ce::Engine& e, const ce::Endpoint& src, const ce::Endpoint& dst, nb::handle so,
                                      nb::handle d_o, nb::handle n, const ce::Elementwise& fn, nb::handle valid_start,
-                                     nb::handle valid_len, const std::string& ctx, uintptr_t stream) {
+                                     nb::handle valid_len, const std::string& ctx, uintptr_t stream, nb::handle native) {
         auto a = i64_arg(so), b = i64_arg(d_o), c = i64_arg(n);
         ce::Runs runs = ce::Runs::of(a.span(), b.span(), c.span());
         ce::Hints h = make_hints(valid_start, valid_len, ctx);
+        h.native = py_payload(native);
         nb::gil_scoped_release release;
         e.copy(src, dst, runs, fn, h, stream);
       }, "src"_a, "dst"_a, "src_off"_a, "dst_off"_a, "length"_a, "fn"_a, "valid_start"_a = nb::none(),
-         "valid_len"_a = nb::none(), "ctx"_a = "", "stream"_a = 0)
+         "valid_len"_a = nb::none(), "ctx"_a = "", "stream"_a = 0, "native"_a = nb::none())
       .def("copy_indices", [make_hints](ce::Engine& e, const ce::Endpoint& src, const ce::Endpoint& dst, nb::handle si,
-                                        nb::handle di, const ce::Elementwise& fn, const std::string& ctx, uintptr_t stream) {
+                                        nb::handle di, const ce::Elementwise& fn, const std::string& ctx, uintptr_t stream,
+                                        nb::handle native) {
         auto a = i64_arg(si), b = i64_arg(di);
         ce::Runs runs = ce::Runs::from_indices(a.span(), b.span());
         ce::Hints h = make_hints(nb::none(), nb::none(), ctx);
+        h.native = py_payload(native);
         nb::gil_scoped_release release;
         e.copy(src, dst, runs, fn, h, stream);
-      }, "src"_a, "dst"_a, "src_idx"_a, "dst_idx"_a, "fn"_a, "ctx"_a = "", "stream"_a = 0)
+      }, "src"_a, "dst"_a, "src_idx"_a, "dst_idx"_a, "fn"_a, "ctx"_a = "", "stream"_a = 0, "native"_a = nb::none())
       .def("copy_stmt", [make_hints](ce::Engine& e, const ce::Endpoint& src, const ce::Endpoint& dst, const ce::Stmt& stmt,
                                      const ce::Elementwise& fn, nb::handle valid_start, nb::handle valid_len,
                                      const std::string& ctx, uintptr_t stream, nb::handle native) {

@@ -52,10 +52,16 @@ scope: it runs as usual, ordered correctly around the copies.
    own `copy_` is always a candidate. Anything else is measured against it,
    including the time copyengine itself spends planning and submitting, and is
    kept only if it is clearly faster. Decisions keep being re-checked while
-   your program runs. Copies only copyengine can express (`ce.lazy` gathers,
-   `ce.segments`, conversions with `fn=`) have no original to compare with:
-   there it picks the fastest of its own strategies, which can still lose to a
-   torch rewrite of the same thing.
+   your program runs. The explicit API has the same protection where torch can
+   express the copy: `ce.lazy` views, `ce.gather`, `ce.scatter_`,
+   `ce.segments` and `ce.indices` are measured against the same copy written
+   with torch ops (indexing, `index_copy_`, slices) from the same host
+   indices. Conversions with `fn=` and views torch has no form for (a reversed
+   slice) have no torch equivalent: there copyengine picks the fastest of its
+   own strategies. Either way it cannot beat torch code that does less work,
+   for example indices already on the GPU, and each explicit call costs a few
+   microseconds of host time: for a few small copies per step, `freeze()` or
+   a CUDA graph is the fast path.
 2. **The same results.** copyengine only takes a copy when it can produce
    exactly torch's result; otherwise torch runs it. Host and GPU conversions
    are bit-identical. (NaN stays NaN, but its sign and payload bits are not

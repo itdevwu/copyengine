@@ -49,13 +49,15 @@ class Lazy:
 
     ``ce.lazy(cache).index_select(0, ids).permute(0, 2, 1, 3)`` describes a view
     torch cannot express without materializing; the engine copies it in one pass.
+    The ops are also kept, so the same copy can be replayed with torch ops: that
+    is the baseline copyengine must beat (see :func:`torch_replay`).
     """
 
-    def __init__(self, base: View, access: _core.Access):
-        self._base, self._access = base, access
+    def __init__(self, base: View, access: _core.Access, ops: tuple = ()):
+        self._base, self._access, self._ops = base, access, ops
 
-    def _with(self, access) -> "Lazy":
-        return Lazy(self._base, access)
+    def _with(self, access, op) -> "Lazy":
+        return Lazy(self._base, access, self._ops + (op,))
 
     @property
     def shape(self) -> tuple:
@@ -63,7 +65,7 @@ class Lazy:
 
     def permute(self, *dims):
         dims = dims[0] if len(dims) == 1 and isinstance(dims[0], (list, tuple)) else dims
-        return self._with(self._access.permute(list(dims)))
+        return self._with(self._access.permute(list(dims)), ("permute", tuple(dims)))
 
     def transpose(self, a: int, b: int):
         p = list(range(len(self.shape)))
@@ -71,31 +73,91 @@ class Lazy:
         return self.permute(p)
 
     def index_select(self, dim: int, index):
-        return self._with(self._access.index_select(dim, index_array(index)))
+        idx = index_array(index)
+        return self._with(self._access.index_select(dim, idx), ("index_select", dim, idx))
 
     def slice(self, dim: int, start=None, stop=None, step: int = 1):
-        return self._with(self._access.slice(dim, start, stop, step))
+        return self._with(self._access.slice(dim, start, stop, step), ("slice", dim, start, stop, step))
 
     def select(self, dim: int, index: int):
-        return self._with(self._access.select(dim, index))
+        return self._with(self._access.select(dim, index), ("select", dim, index))
 
     def flip(self, dim: int):
-        return self._with(self._access.flip(dim))
+        return self._with(self._access.flip(dim), ("flip", dim))
 
     def unsqueeze(self, dim: int):
-        return self._with(self._access.unsqueeze(dim))
+        return self._with(self._access.unsqueeze(dim), ("unsqueeze", dim))
 
     def expand(self, *shape):
         shape = shape[0] if len(shape) == 1 and isinstance(shape[0], (list, tuple)) else shape
-        return self._with(broadcast_to(self._access, list(shape)))
+        return self._with(broadcast_to(self._access, list(shape)), ("expand", tuple(shape)))
 
     def reshape(self, *shape):
         shape = shape[0] if len(shape) == 1 and isinstance(shape[0], (list, tuple)) else shape
-        return self._with(self._access.reshape(list(shape)))
+        return self._with(self._access.reshape(list(shape)), ("reshape", tuple(shape)))
 
     def as_view(self) -> View:
         b = self._base
         return View(b.obj, b.endpoint, self._access, b.is_cuda, b.device_index)
+
+
+def device_index(idx: np.ndarray, device) -> "torch.Tensor":
+    """`idx` as an int64 tensor on `device`, sent from pinned memory without
+    making the host wait (what a torch user would do with host indices)."""
+    t = torch.from_numpy(idx)
+    if device.type == "cuda":
+        return t.pin_memory().to(device, non_blocking=True)
+    return t
+
+
+_COPYING = ("index_select", "flip")  # torch materializes these: not views
+
+
+def torch_replay(x: "Lazy"):
+    """The lazy view rebuilt with torch ops on its base tensor, or None if the
+    base is not a tensor or torch cannot express an op (a negative step)."""
+    t = x._base.obj
+    if not is_tensor(t):
+        return None
+    for op in x._ops:
+        name = op[0]
+        if name == "permute":
+            t = t.permute(*op[1])
+        elif name == "index_select":
+            t = t.index_select(op[1], device_index(op[2], t.device))
+        elif name == "slice":
+            _, dim, start, stop, step = op
+            if step is not None and step < 0:
+                return None
+            t = t[(slice(None),) * dim + (slice(start, stop, step),)]
+        elif name == "select":
+            t = t.select(op[1], op[2])
+        elif name == "flip":
+            t = t.flip(op[1])
+        elif name == "unsqueeze":
+            t = t.unsqueeze(op[1])
+        elif name == "expand":
+            t = t.expand(*op[1])
+        elif name == "reshape":
+            t = t.reshape(*op[1])
+        else:
+            return None
+    return t
+
+
+def torch_dst(x: "Lazy"):
+    """How torch would write into the lazy destination `x`: ("view", v) for a
+    view, ("index_copy", base, dim, index) for exactly one index_select, else None."""
+    t = x._base.obj
+    if not is_tensor(t):
+        return None
+    ops = x._ops
+    if len(ops) == 1 and ops[0][0] == "index_select":
+        return ("index_copy", t, ops[0][1], ops[0][2])
+    if any(op[0] in _COPYING for op in ops):
+        return None
+    v = torch_replay(x)
+    return None if v is None else ("view", v)
 
 
 def lazy(x) -> Lazy:

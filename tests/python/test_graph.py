@@ -83,16 +83,27 @@ def test_h2d_from_pinned(warm):
 
 @pytest.mark.filterwarnings("ignore:The CUDA Graph is empty")  # the refused capture records nothing
 def test_copy_without_torch_equivalent_needs_a_run_first():
+    # A reversed slice: torch has no view for it, so there is no torch copy to record.
     cache = torch.randn(512, 4, 32, device=DEV)
     ids = torch.randperm(512)[:200].tolist()
     out = torch.zeros(200, 32, 4, device=DEV)
     e = ce.Engine()
-    src = lambda: ce.lazy(cache).index_select(0, ids).permute(0, 2, 1)
+    src = lambda: ce.lazy(cache).index_select(0, ids).slice(1, None, None, -1).permute(0, 2, 1)
     with pytest.raises(ce.Unsupported, match="run it once before capturing"):
         capture(lambda: e.copy_(out, src()))
     for _ in range(40):  # explored and locked: its tables are resident now
         e.copy_(out, src())
     g = capture(lambda: e.copy_(out, src()))
+    idx = torch.tensor(ids, device=DEV)
+    replayed(g, cache, out, lambda: cache[idx].flip(1).permute(0, 2, 1))
+
+
+def test_lazy_gather_with_a_torch_equivalent_captures_cold():
+    cache = torch.randn(512, 4, 32, device=DEV)
+    ids = torch.randperm(512)[:200].tolist()
+    out = torch.zeros(200, 32, 4, device=DEV)
+    e = ce.Engine()
+    g = capture(lambda: e.copy_(out, ce.lazy(cache).index_select(0, ids).permute(0, 2, 1)))
     idx = torch.tensor(ids, device=DEV)
     replayed(g, cache, out, lambda: cache[idx].permute(0, 2, 1))
 
@@ -135,17 +146,17 @@ def test_capture_leaves_the_engine_usable():
 
 
 def test_sm_limited_kernels_inside_a_graph():
-    # The green-context stream joins the capture through events. A lazy gather
-    # has no torch equivalent, so a ce kernel is what gets recorded.
+    # The green-context stream joins the capture through events. A reversed
+    # slice has no torch equivalent, so a ce kernel is what gets recorded.
     sms = torch.cuda.get_device_properties(0).multi_processor_count
     e = ce.Engine(max_sms=max(2, sms // 4))
     cache = torch.randn(512, 4, 32, device=DEV)
     ids = torch.randperm(512)[:200].tolist()
     out = torch.zeros(200, 32, 4, device=DEV)
-    src = lambda: ce.lazy(cache).index_select(0, ids).permute(0, 2, 1)
+    src = lambda: ce.lazy(cache).index_select(0, ids).slice(1, None, None, -1).permute(0, 2, 1)
     for _ in range(40):
         e.copy_(out, src())
     assert e.stats()["last"]["strategies"] != ["native"]
     g = capture(lambda: e.copy_(out, src()))
     idx = torch.tensor(ids, device=DEV)
-    replayed(g, cache, out, lambda: cache[idx].permute(0, 2, 1))
+    replayed(g, cache, out, lambda: cache[idx].flip(1).permute(0, 2, 1))

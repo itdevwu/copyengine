@@ -71,6 +71,13 @@ to skip the warmup next time on the same machine.
 ## Install
 
 ```bash
+pip install copyengine
+```
+
+The wheels include the GPU kernels and the torch integration; they use the
+torch you already have. To build from source instead:
+
+```bash
 pip install .                      # needs CMake >= 3.26 and a C++20 compiler
                                    # GPU support: CUDA toolkit headers + nvcc at build time
 pip install --no-build-isolation . # same, with torch already installed: also builds the torch integration

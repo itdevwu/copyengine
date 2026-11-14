@@ -67,6 +67,7 @@ struct FlushStats {
   int64_t calls = 0;     // backend calls issued
   int64_t bytes = 0;
   bool plan_hit = false;
+  double plan_us = 0;  // planning on a plan-cache miss (outside the strategies' measured times)
   std::vector<std::string> strategies;
 };
 

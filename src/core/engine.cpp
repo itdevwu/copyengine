@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
+#include <list>
 #include <map>
 #include <mutex>
 #include <string>
@@ -99,6 +100,39 @@ struct PendingSample {
   Executor* ex;
 };
 
+// A bounded map that evicts the least recently used entry: a working set
+// slightly larger than the cache degrades gradually instead of losing every
+// entry at once.
+template <class V>
+class Lru {
+ public:
+  explicit Lru(size_t cap = 1) : cap_(cap) {}
+  void set_capacity(size_t cap) { cap_ = std::max<size_t>(cap, 1); }
+  V* find(const Hash128& k) {
+    auto it = map_.find(k);
+    if (it == map_.end()) return nullptr;
+    order_.splice(order_.begin(), order_, it->second);  // most recent first
+    return &it->second->second;
+  }
+  V& insert(const Hash128& k, V v) {
+    if (V* hit = find(k)) return *hit = std::move(v);
+    while (map_.size() >= cap_) {
+      map_.erase(order_.back().first);
+      order_.pop_back();
+    }
+    order_.emplace_front(k, std::move(v));
+    map_.emplace(k, order_.begin());
+    return order_.front().second;
+  }
+  size_t size() const { return map_.size(); }
+  void clear() { map_.clear(), order_.clear(); }
+
+ private:
+  size_t cap_;
+  std::list<std::pair<Hash128, V>> order_;
+  std::unordered_map<Hash128, typename std::list<std::pair<Hash128, V>>::iterator, Hash128Hasher> map_;
+};
+
 }  // namespace
 
 struct Engine::Impl {
@@ -110,8 +144,8 @@ struct Engine::Impl {
   int async_depth = 0;            // open scopes with host_async
   std::vector<Op> queue;
   uintptr_t stream = 0;
-  std::unordered_map<Hash128, std::shared_ptr<const Plan>, Hash128Hasher> plans;
-  std::unordered_set<Hash128, Hash128Hasher> safe;
+  Lru<std::shared_ptr<const Plan>> plans;
+  Lru<char> safe;  // ops already checked (check_safe)
   Tuner tuner;
   std::unordered_map<Hash128, KeyStat, Hash128Hasher> keys;
   std::vector<Alloc> q_reads, q_writes;  // allocations the queue reads / writes
@@ -187,6 +221,7 @@ struct Engine::Impl {
   FlushStats last;
   int64_t total_flushes = 0, total_ops = 0, total_calls = 0, total_bytes = 0, plan_hits = 0;
   int64_t tuning_runs = 0;  // see Engine::tuning_runs
+  double total_plan_us = 0;  // planning on plan-cache misses
   std::shared_ptr<std::vector<Op>> last_ops;
   Ran last_ran;
 
@@ -200,6 +235,10 @@ struct Engine::Impl {
         }()),
         host(o.host_threads > 0 ? o.host_threads
                                 : static_cast<int>(std::min(8u, std::max(1u, std::thread::hardware_concurrency())))) {
+    const size_t cap = static_cast<size_t>(std::max(1, o.plan_cache));
+    plans.set_capacity(cap);
+    stmt_cache.set_capacity(cap * 4);
+    safe.set_capacity(cap * 4);
 #if CE_WITH_CUDA
     try {
       cuda = make_cuda_executor(opt);
@@ -271,10 +310,9 @@ struct Engine::Impl {
     kh.add(static_cast<uint64_t>(lg2(static_cast<int64_t>(op.runs().size()))));
     kh.add(uint64_t{op.form != nullptr});
     op.key = kh.done();
-    if (!safe.count(op.fp)) {
+    if (!safe.find(op.fp)) {
       check_safe(op);
-      if (static_cast<int>(safe.size()) >= opt.plan_cache * 4) safe.clear();
-      safe.insert(op.fp);
+      safe.insert(op.fp, 1);
     }
     return op;
   }
@@ -482,7 +520,7 @@ struct Engine::Impl {
 
   // Statement cache: an identical copy (same buffers, layouts, tables,
   // function) reuses the lowered, checked op without touching its runs.
-  std::unordered_map<Hash128, Op, Hash128Hasher> stmt_cache;
+  Lru<Op> stmt_cache;
 
   static void add_access(Hasher& h, const Access& a) {
     h.add(static_cast<uint64_t>(a.base()));
@@ -567,8 +605,8 @@ struct Engine::Impl {
     h.add(std::span<const i64>(hints.valid_start));
     h.add(std::span<const i64>(hints.valid_len));
     const Hash128 key = h.done();
-    if (auto it = stmt_cache.find(key); it != stmt_cache.end()) {
-      Op op = it->second;
+    if (const Op* cached = stmt_cache.find(key)) {
+      Op op = *cached;
       op.native = hints.native;
       op.host_async = hints.host_async;
       op.enqueue_us = us_since(t0);
@@ -577,8 +615,7 @@ struct Engine::Impl {
     }
     std::shared_ptr<const Form> form = hints.has_valid ? nullptr : make_form(src, dst, stmt);
     Op op = make_op(src, dst, lower(stmt), fn, hints, std::move(form));
-    if (static_cast<int>(stmt_cache.size()) >= opt.plan_cache * 4) stmt_cache.clear();
-    stmt_cache.emplace(key, op);
+    stmt_cache.insert(key, op);
     op.native = hints.native;
     op.host_async = hints.host_async;
     op.enqueue_us = us_since(t0);
@@ -731,12 +768,14 @@ struct Engine::Impl {
     Hasher h;
     for (const Op& op : ops) h.add(op.fp.a), h.add(op.fp.b);
     const Hash128 key = h.done();
-    auto it = plans.find(key);
-    const bool hit = it != plans.end();
+    const std::shared_ptr<const Plan>* found = plans.find(key);
+    const bool hit = found != nullptr;
     std::shared_ptr<const Plan> pp;
+    double plan_us = 0;
     if (hit) {
-      pp = it->second;
+      pp = *found;
     } else {
+      const auto tp = Clock::now();
       auto p = std::make_shared<Plan>(build_plan(ops));
       for (Group& g : p->groups) {
         // Candidates may initialize the device (allocations): not while capturing,
@@ -747,13 +786,15 @@ struct Engine::Impl {
       }
       if (opt.log_plan) log(*p, ops.size());
       if (!capturing) {
-        if (static_cast<int>(plans.size()) >= opt.plan_cache) plans.clear();
-        plans.emplace(key, p);
+        plans.insert(key, p);
       }
       pp = std::move(p);
+      plan_us = us_since(tp);
+      total_plan_us += plan_us;
     }
     const Plan& plan = *pp;
     FlushStats st;
+    st.plan_us = plan_us;
     st.ops = static_cast<int>(ops.size());
     st.waves = plan.waves;
     st.groups = static_cast<int>(plan.groups.size());
@@ -996,6 +1037,7 @@ std::string Engine::stats_json() const {
                   .set("calls", m.last.calls)
                   .set("bytes", m.last.bytes)
                   .set("plan_cache", m.last.plan_hit ? "hit" : "miss")
+                  .set("plan_us", m.last.plan_us)
                   .set("strategies", std::move(strategies));
   // Why each group of the last flush ran what it did (worked out here, not per flush).
   Json decisions = Json::array();
@@ -1027,6 +1069,7 @@ std::string Engine::stats_json() const {
       .set("calls", m.total_calls)
       .set("bytes", m.total_bytes)
       .set("plan_hits", m.plan_hits)
+      .set("plan_us", m.total_plan_us)
       .set("native_ops", m.native_ops)
       .set("declined", std::move(declined))
       .set("kept", static_cast<uint64_t>(m.kept.size()))  // in-flight copies whose buffers are held

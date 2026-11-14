@@ -221,15 +221,17 @@ class CudaExecutor final : public Executor {
         if (sl.done) d_->cuEventDestroy(sl.done);
       }
       // Device memory first: freeing orders it after every stream, so they must still exist.
-      if (s.staging_used) d_->cuEventSynchronize(s.staging_done);
-      dev_free(s, s.staging);
+      for (Staging& g : s.stagings) {
+        if (g.used) d_->cuEventSynchronize(g.done);
+        dev_free(s, g.mem);
+      }
       dev_free(s, s.err);
       dev_free(s, s.pace);
-      if (s.sm_stream) {
-        d_->cuStreamSynchronize(s.sm_stream);
-        d_->cuStreamDestroy(s.sm_stream);
-        d_->cuEventDestroy(s.sm_in);
-        d_->cuEventDestroy(s.sm_out);
+      for (Lane& l : s.lanes) {  // lanes[0] is sm_stream
+        d_->cuStreamSynchronize(l.sm);
+        d_->cuStreamDestroy(l.sm);
+        d_->cuEventDestroy(l.in);
+        d_->cuEventDestroy(l.out);
       }
       if (s.green) d_->cuGreenCtxDestroy(s.green);
       for (Bounce& b : s.bounce) {
@@ -238,7 +240,9 @@ class CudaExecutor final : public Executor {
         if (b.done) d_->cuEventDestroy(b.done);
       }
       if (s.ev_free) d_->cuEventDestroy(s.ev_free);
-      for (CUevent e : {s.ev_in, s.ev_out, s.staging_done})
+      for (Staging& g : s.stagings)
+        if (g.done) d_->cuEventDestroy(g.done);
+      for (CUevent e : {s.ev_in, s.ev_out})
         if (e) d_->cuEventDestroy(e);
       if (s.side) d_->cuStreamDestroy(s.side);
       CUcontext dummy{};
@@ -482,6 +486,21 @@ class CudaExecutor final : public Executor {
     bool used = false;
   };
 
+  struct Lane {
+    CUstream caller{};  // the stream it serves (null: not yet assigned)
+    CUstream sm{};
+    CUevent in{}, out{};
+  };
+
+  struct Staging {
+    CUstream caller{};
+    DevMem mem;
+    size_t cap = 0;
+    CUevent done{};
+    bool used = false;
+    uint64_t last = 0;
+  };
+
   struct Dev {
     bool init = false;
     int index = 0;
@@ -495,16 +514,18 @@ class CudaExecutor final : public Executor {
     CUevent ev_in{}, ev_out{};
     std::array<Slot, kSlots> slots;
     int next = 0;
-    DevMem staging;
-    size_t staging_cap = 0;
-    CUevent staging_done{};
-    CUstream staging_stream{};
-    bool staging_used = false;
+    // Device staging, one buffer per caller stream (kLanes, then shared):
+    // copies on one stream never wait for another stream's use of it.
+    std::vector<Staging> stagings;
+    uint64_t staging_clock = 0;
     std::array<Bounce, 2> bounce;
     // SM limit (EngineOptions::max_sms)
     CUgreenCtx green{};
-    CUstream sm_stream{};       // copy kernels run here when the limit is hard
+    CUstream sm_stream{};       // set when the limit is hard: the verified green-context stream (lanes[0])
     CUevent sm_in{}, sm_out{};
+    // Copy kernels run on a green-context lane per caller stream (kLanes,
+    // then shared), so one stream's copies never queue behind another's.
+    std::vector<Lane> lanes;
     unsigned grid_cap = 0;      // soft limit: max thread blocks per launch (0: none)
     std::string sm_limit = "none";
     // Streams this device's work ran on, for ordering a framework allocator's
@@ -532,6 +553,7 @@ class CudaExecutor final : public Executor {
     return s.err.ptr;
   }
   static constexpr size_t kMaxStreams = 32;
+  static constexpr size_t kLanes = 8;
 
   DevMem dev_alloc(Dev& s, size_t bytes, const char* what) {
     if (const DeviceAllocator* a = device_allocator()) {
@@ -559,7 +581,9 @@ class CudaExecutor final : public Executor {
       } else {
         if (!s.ev_free) d_->cuEventCreate(&s.ev_free, CU_EVENT_DISABLE_TIMING);
         std::vector<uintptr_t> all = s.streams;
-        for (CUstream x : {s.side, s.staging_stream, s.sm_stream}) all.push_back(reinterpret_cast<uintptr_t>(x));
+        all.push_back(reinterpret_cast<uintptr_t>(s.side));
+        for (const Lane& l : s.lanes) all.push_back(reinterpret_cast<uintptr_t>(l.sm));
+        for (const Staging& g : s.stagings) all.push_back(reinterpret_cast<uintptr_t>(g.caller));
         for (uintptr_t x : all) {
           if (x == m.stream || !s.ev_free) continue;
           d_->cuEventRecord(s.ev_free, reinterpret_cast<CUstream>(x));
@@ -638,7 +662,7 @@ class CudaExecutor final : public Executor {
     check(d_->cuStreamCreate(&s.side, CU_STREAM_NON_BLOCKING), "cuStreamCreate");
     check(d_->cuEventCreate(&s.ev_in, CU_EVENT_DISABLE_TIMING), "cuEventCreate");
     check(d_->cuEventCreate(&s.ev_out, CU_EVENT_DISABLE_TIMING), "cuEventCreate");
-    check(d_->cuEventCreate(&s.staging_done, CU_EVENT_DISABLE_TIMING), "cuEventCreate");
+    s.stagings.reserve(kLanes);
     for (Slot& sl : s.slots) check(d_->cuEventCreate(&sl.done, CU_EVENT_DISABLE_TIMING), "cuEventCreate");
     admit_kernels(s);
     admit_batch(s);
@@ -974,10 +998,11 @@ class CudaExecutor final : public Executor {
   void run_kernel(Dev& s, CUfunction f, std::array<unsigned, 3> grid, std::array<unsigned, 3> block, void** args,
                   CUstream st, const char* what) {
     CUstream on = st;
-    if (s.sm_stream) {
-      check(d_->cuEventRecord(s.sm_in, st), "cuEventRecord");
-      check(d_->cuStreamWaitEvent(s.sm_stream, s.sm_in, 0), "cuStreamWaitEvent");
-      on = s.sm_stream;
+    Lane* lane = s.sm_stream ? &lane_for(s, st) : nullptr;
+    if (lane) {
+      check(d_->cuEventRecord(lane->in, st), "cuEventRecord");
+      check(d_->cuStreamWaitEvent(lane->sm, lane->in, 0), "cuStreamWaitEvent");
+      on = lane->sm;
     } else if (s.grid_cap) {
       const unsigned cap = s.grid_cap;
       grid[2] = std::min(grid[2], cap);
@@ -986,10 +1011,29 @@ class CudaExecutor final : public Executor {
     }
     check(d_->cuLaunchKernel(f, grid[0], grid[1], grid[2], block[0], block[1], block[2], 0, on, args, nullptr),
           (std::string("cuLaunchKernel ") + what).c_str());
-    if (s.sm_stream) {
-      check(d_->cuEventRecord(s.sm_out, s.sm_stream), "cuEventRecord");
-      check(d_->cuStreamWaitEvent(st, s.sm_out, 0), "cuStreamWaitEvent");
+    if (lane) {
+      check(d_->cuEventRecord(lane->out, lane->sm), "cuEventRecord");
+      check(d_->cuStreamWaitEvent(st, lane->out, 0), "cuStreamWaitEvent");
     }
+  }
+
+  // The green-context lane serving `st`: its own while there are lanes to
+  // spare, then one shared by hash (ordered, still correct).
+  Lane& lane_for(Dev& s, CUstream st) {
+    for (Lane& l : s.lanes)
+      if (l.caller == st) return l;
+    for (Lane& l : s.lanes)
+      if (!l.caller) return l.caller = st, l;
+    if (s.lanes.size() < kLanes) {
+      Lane l;
+      l.caller = st;
+      check(d_->cuGreenCtxStreamCreate(&l.sm, s.green, CU_STREAM_NON_BLOCKING, 0), "cuGreenCtxStreamCreate");
+      check(d_->cuEventCreate(&l.in, CU_EVENT_DISABLE_TIMING), "cuEventCreate");
+      check(d_->cuEventCreate(&l.out, CU_EVENT_DISABLE_TIMING), "cuEventCreate");
+      s.lanes.push_back(l);
+      return s.lanes.back();
+    }
+    return s.lanes[std::hash<const void*>{}(st) % s.lanes.size()];
   }
 
   // ---- SM limit ------------------------------------------------------------------------
@@ -1059,6 +1103,7 @@ class CudaExecutor final : public Executor {
       check(d_->cuEventCreate(&s.sm_in, CU_EVENT_DISABLE_TIMING), "cuEventCreate");
       check(d_->cuEventCreate(&s.sm_out, CU_EVENT_DISABLE_TIMING), "cuEventCreate");
       s.grid_cap = 0;
+      s.lanes.push_back({nullptr, s.sm_stream, s.sm_in, s.sm_out});
       s.sm_limit = "hard: green context of " + std::to_string(granted) + " SMs (verified)";
     } catch (const std::exception& e) {
       if (s.sm_stream) d_->cuStreamDestroy(s.sm_stream);
@@ -1469,26 +1514,46 @@ class CudaExecutor final : public Executor {
 
   // ---- staging --------------------------------------------------------------------------
 
+  // `st`'s staging buffer: reused in stream order on its own stream; another
+  // stream takes one over (and waits for its last use) only beyond kLanes.
+  Staging& staging_of(Dev& s, CUstream st) {
+    for (Staging& g : s.stagings)
+      if (g.caller == st) return g;
+    if (s.stagings.size() < kLanes) {
+      Staging g;
+      g.caller = st;
+      check(d_->cuEventCreate(&g.done, CU_EVENT_DISABLE_TIMING), "cuEventCreate");
+      s.stagings.push_back(std::move(g));
+      return s.stagings.back();
+    }
+    Staging& g = *std::min_element(s.stagings.begin(), s.stagings.end(),
+                                   [](const Staging& a, const Staging& b) { return a.last < b.last; });
+    if (g.used) check(d_->cuStreamWaitEvent(st, g.done, 0), "cuStreamWaitEvent");
+    g.caller = st;
+    return g;
+  }
+
   CUdeviceptr staging(Dev& s, size_t bytes, CUstream st) {
-    if (s.staging_cap < bytes) {
-      if (s.staging_used && !s.staging.handle) check(d_->cuEventSynchronize(s.staging_done), "cuEventSynchronize");
-      dev_free(s, s.staging);  // a framework allocator's memory is ordered, not waited for
+    Staging& g = staging_of(s, st);
+    g.last = ++s.staging_clock;
+    if (g.cap < bytes) {
+      if (g.used && !g.mem.handle) check(d_->cuEventSynchronize(g.done), "cuEventSynchronize");
+      dev_free(s, g.mem);  // a framework allocator's memory is ordered, not waited for
       size_t cap = 1 << 20;
       while (cap < bytes) cap <<= 1;
       cap = std::min<size_t>(cap, static_cast<size_t>(std::max<int64_t>(opt_.staging_budget, 1 << 20)));
       if (cap < bytes) fail(Errc::invalid_argument, "staging request exceeds the budget");
-      s.staging = dev_alloc(s, cap, "staging");
-      s.staging_cap = cap;
-      s.staging_used = false;
+      g.mem = dev_alloc(s, cap, "staging");
+      g.cap = cap;
+      g.used = false;
     }
-    if (s.staging_used && s.staging_stream != st) check(d_->cuStreamWaitEvent(st, s.staging_done, 0), "cuStreamWaitEvent");
-    return s.staging.ptr;
+    return g.mem.ptr;
   }
 
   void staging_release(Dev& s, CUstream st) {
-    check(d_->cuEventRecord(s.staging_done, st), "cuEventRecord");
-    s.staging_used = true;
-    s.staging_stream = st;
+    Staging& g = staging_of(s, st);
+    check(d_->cuEventRecord(g.done, st), "cuEventRecord");
+    g.used = true;
   }
 
   // Host <-> device through device staging. Only dense intervals cross the

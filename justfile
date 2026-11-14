@@ -19,6 +19,14 @@ test-python:
 
 test: test-cpp test-python
 
+# The GPU suite again under the configurations users run: Python interception,
+# copyengine's memory from the driver instead of torch, torch's expandable
+# segments. Run after `just test` on each GPU generation before a release.
+test-gpu-matrix:
+    CE_SHIM=0 pytest -q
+    CE_TORCH_ALLOCATOR=0 pytest -q
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True pytest -q
+
 # Dev shell with the GPU, CUDA 12.9 toolkit and this checkout mounted at /work.
 docker-shell:
     docker build -t copyengine-dev docker

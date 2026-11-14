@@ -667,33 +667,33 @@ def test_own_pinned_memory_counts_in_torch_statistics():
 
 
 def test_freed_memory_is_not_reused_before_pending_copies():
-    # Staging allocated on stream A is still read by a copy queued on stream B
-    # (behind a long kernel) when growth frees it; torch then hands that block
-    # to new tensors on A, filled with garbage. The pending copy must still
-    # read its own data.
+    # Staging belongs to the stream it was allocated on. With more streams than
+    # staging buffers, stream B takes over the least recently used one (from
+    # S0), queues a copy through it behind a long kernel, then needs a bigger
+    # one: the old buffer is freed while B's copy still uses it, and torch
+    # hands that block to new tensors on S0 at once. S0's work must wait for B,
+    # else B's late staging writes land in S0's new tensors.
     _skip_unless_torch_allocator()
     e = ce.Engine(prior_only=True, allow_async=True)  # the host does not wait for B
-    a, b = torch.cuda.Stream(), torch.cuda.Stream()
     small = torch.randn(64, 32).pin_memory()
-    with torch.cuda.stream(a):  # staging (1 MB) belongs to A
-        e.copy_(torch.zeros(32, 64, device=DEV), small.t())
+    streams = [torch.cuda.Stream() for _ in range(9)]
+    for st in streams[:8]:  # one staging buffer (1 MB) per stream, all lanes taken
+        with torch.cuda.stream(st):
+            e.copy_(torch.zeros(32, 64, device=DEV), small.t())
     torch.cuda.synchronize()
+    s0, b = streams[0], streams[8]
     out = torch.zeros(32, 64, device=DEV)
     big_src = torch.randn(1024, 512).pin_memory()
     big = torch.zeros(512, 1024, device=DEV)
     with torch.cuda.stream(b):
         torch.cuda._sleep(1_000_000_000)
-        e.copy_(out, small.t())    # pending: reads the 1 MB staging
-        e.copy_(big, big_src.t())  # needs 2 MB: the old staging is freed
-    with torch.cuda.stream(a):  # 1 MB blocks on A: one of them is likely the freed staging
+        e.copy_(out, small.t())    # takes over S0's buffer; pending
+        e.copy_(big, big_src.t())  # needs 2 MB: the 1 MB buffer is freed
+    with torch.cuda.stream(s0):  # 1 MB blocks on S0: one of them is likely the freed staging
         fresh = [torch.full((1 << 18,), -1.0, device=DEV) for _ in range(8)]
-    time.sleep(0.05)
-    # Freeing ordered A after B's pending copies: A's new work waits for them.
-    assert not a.query(), "freed memory was handed to stream A before the copies using it finished"
     torch.cuda.synchronize()
     torch.testing.assert_close(out.cpu(), small.t(), rtol=0, atol=0)
     torch.testing.assert_close(big.cpu(), big_src.t(), rtol=0, atol=0)
-    # Without the ordering, B's late staging write lands in A's new tensors.
     assert all(bool((f == -1.0).all()) for f in fresh), "a pending copy wrote into reused memory"
 
 

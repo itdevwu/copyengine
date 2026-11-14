@@ -127,3 +127,19 @@ def test_empty_device_index_is_a_no_op():
     e.scatter_(src.clone(), i0, torch.empty(0, 4, device=DEV), 0)
     e.copy_(torch.empty(0, 4, device=DEV), ce.lazy(src).index_select(0, i0))
     e.synchronize()
+
+
+def test_gathers_into_disjoint_slices_are_one_launch():
+    # Their writes are known exactly (no table on the destination): no false
+    # dependencies, one wave, one group.
+    caches = [torch.randn(128, 32, device=DEV) for _ in range(6)]
+    pool = torch.empty(6, 8, 32, device=DEV)
+    ids = torch.randperm(128, device=DEV)[:8]
+    e = ce.Engine(prior_only=True)
+    with e.scope():
+        for l, c in enumerate(caches):
+            e.gather(c, ids, 0, out=pool[l])
+    last = e.stats()["last"]
+    assert last["waves"] == 1 and last["groups"] == 1 and last["calls"] == 1, last
+    torch.cuda.synchronize()
+    assert torch.equal(pool, torch.stack([c[ids] for c in caches]))

@@ -6,6 +6,11 @@ change incompatibly only in a new minor (0.x) or major release.
 
 ## Unreleased
 
+- Copies on one stream no longer wait for the same engine's copies on another
+  stream: with `max_sms`, each caller stream gets its own green-context lane,
+  and device staging is one buffer per caller stream (up to 8 of each, then
+  shared). Before, a copy on the compute stream could queue behind a large
+  background copy.
 - Step plans: `ce.plan(step)` / `eng.plan(step)` trace a step of copies per
   argument layout and replay it without running its Python or planning; CUDA
   int64 index tensors are read anew each call, other buffers are guarded by

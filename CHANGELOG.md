@@ -17,6 +17,11 @@ change incompatibly only in a new minor (0.x) or major release.
   GPU, through a green context where its confinement verifies on start
   (rounded down to the driver's SM granularity), else by launching at most N
   thread blocks. `stats()["cuda"]` reports which. DMA copies are unaffected.
+- `scope(stream="copy")` (or a `torch.cuda.Stream`): the scope runs on that
+  stream after the current one's queued work, the host never waits, and the
+  `Pending` handle it binds (`wait()`, `synchronize()`, `done()`, `event`)
+  orders it against other streams; buffers are kept alive until done. Works
+  inside CUDA graph capture (fork / join).
 - The no-regression and same-results guarantees now state what holds for
   NaN: NaN stays NaN, its payload is not kept (torch's differs per device).
 ## 0.1.1

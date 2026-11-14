@@ -123,9 +123,10 @@ class TorchCopy final : public ce::NativeOp {
  public:
   TorchCopy(at::Tensor dst, at::Tensor src, bool non_blocking)
       : dst_(std::move(dst)), src_(std::move(src)), non_blocking_(non_blocking) {}
-  void run(uintptr_t) override {
+  void run(uintptr_t) override { run(0, false); }
+  void run(uintptr_t, bool host_async) override {
     c10::impl::ExcludeDispatchKeyGuard guard(kKey);
-    copy_op().call(dst_, src_, non_blocking_);
+    copy_op().call(dst_, src_, non_blocking_ || host_async);
   }
 
  private:

@@ -70,6 +70,12 @@ class NativeOp {
   virtual ~NativeOp() = default;
   // Runs the copy on `stream`, ordered like any other work on it.
   virtual void run(uintptr_t stream) = 0;
+  // The same, where the host must not wait for it even if the caller asked
+  // for a blocking copy (an async scope): runs it as non_blocking.
+  virtual void run(uintptr_t stream, bool host_async) {
+    (void)host_async;
+    run(stream);
+  }
 };
 
 struct Hints {

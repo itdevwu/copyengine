@@ -104,6 +104,8 @@ struct Engine::Impl {
   EngineOptions opt;
   mutable std::recursive_mutex mu;
   int depth = 0;
+  std::vector<bool> scope_async;  // per open scope: begin_scope(host_async)
+  int async_depth = 0;            // open scopes with host_async
   std::vector<Op> queue;
   uintptr_t stream = 0;
   std::unordered_map<Hash128, std::shared_ptr<const Plan>, Hash128Hasher> plans;
@@ -366,7 +368,7 @@ struct Engine::Impl {
       flush();
     const bool host_only = op.src.device.kind == DeviceKind::host && op.dst.device.kind == DeviceKind::host;
     if (host_only && host_pending && !capturing) synchronize();  // host work may touch what CUDA work still uses
-    op.native->run(strm);
+    op.native->run(strm, op.host_async);
     note_pending(op.src, op.dst, strm, !op.host_async);
     bury(std::move(op.native));
     ++native_ops;
@@ -375,6 +377,7 @@ struct Engine::Impl {
 
   void push(Op op, uintptr_t strm) {
     if (op.runs().empty()) return;
+    if (async_depth > 0) op.host_async = true;
     // Only work that touches the device now asks about capture: a copy queued
     // in a scope costs nothing extra.
     std::optional<Capture> cap;
@@ -535,7 +538,7 @@ struct Engine::Impl {
     const auto t0 = Clock::now();
     int64_t calls = 0;
     if (s == Strategy::native) {
-      for (int k : g.ops) ops[k].native->run(strm);
+      for (int k : g.ops) ops[k].native->run(strm, ops[k].host_async);
       calls = static_cast<int64_t>(g.ops.size());
     } else {
       calls = ex.run(s, g, ops, strm);
@@ -762,10 +765,14 @@ void Engine::fence(std::span<const Range> reads, std::span<const Range> writes) 
   impl_->fence(reads, writes);
 }
 
-void Engine::begin_scope() {
+void Engine::begin_scope() { begin_scope(false); }
+
+void Engine::begin_scope(bool host_async) {
   Locked lk(*impl_);
   impl_->check_thread();
   if (impl_->depth++ == 0) impl_->owner = std::this_thread::get_id();
+  impl_->scope_async.push_back(host_async);
+  impl_->async_depth += host_async;
 }
 
 int64_t Engine::mark_pending() {
@@ -796,6 +803,8 @@ void Engine::end_scope() {
   Locked lk(*impl_);
   impl_->check_thread();
   if (impl_->depth == 0) fail(Errc::invalid_argument, "end_scope without begin_scope");
+  impl_->async_depth -= impl_->scope_async.back();
+  impl_->scope_async.pop_back();
   if (--impl_->depth == 0) {
     impl_->flush();
     impl_->finish(impl_->stream);

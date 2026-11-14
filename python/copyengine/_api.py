@@ -107,21 +107,40 @@ class Engine:
         self._inflight: collections.deque = collections.deque()  # allow_async: (token, buffers) until done
         self._lock = threading.RLock()
         self._force = _intercept  # tests: "shim" or "mode" regardless of what is installed
+        self._copy_streams: dict = {}  # device index -> torch.cuda.Stream (scope(stream="copy"))
+        self._async_depth = 0          # open scope(stream=...)s
         self._set_depth(0)        # scope depth as seen from Python: whether queued copies need references held
         self._sites: dict = {}    # call site -> _Site (Python-mode on/off decision)
 
     # ---- scope ----------------------------------------------------------------
 
-    def scope(self, _site=None) -> "_Scope":
+    def scope(self, stream=None, _site=None) -> "_Scope":
         """Queue copies until exit, then plan and issue them together.
 
         Inside a scope ``Tensor.copy_`` is intercepted too, and every other op is
         ordered after the queued copies it touches. Results are always torch's.
+
+        ``stream="copy"`` (this engine's own stream for the current device) or a
+        ``torch.cuda.Stream`` runs the scope's work on that stream, after what is
+        already queued on the current one, and never makes the host wait:
+        ``with engine.scope(stream="copy") as h:`` gives a :class:`Pending`, and
+        ``h.wait()`` orders the current stream after the copies.
         """
         if _site is None:
             f = sys._getframe(1)
             _site = (f.f_code, f.f_lineno)
-        return _Scope(self, _site)
+        return _Scope(self, _site, stream)
+
+    def copy_stream(self, device=None):
+        """This engine's copy stream for `device` (created on first use)."""
+        dev = torch.device("cuda", torch.cuda.current_device() if device is None else torch.device(device).index or 0)
+        st = self._copy_streams.get(dev.index)
+        if st is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise _core.Unsupported("the copy stream is created on first use; use scope(stream='copy') once "
+                                        "before capturing a CUDA graph")
+            st = self._copy_streams[dev.index] = torch.cuda.Stream(dev)
+        return st
 
     def _interception(self, site):
         """'shim', 'mode' or None for one scope entry; also whether to time it."""
@@ -346,19 +365,63 @@ def _sign_test(n: int) -> int:
     return n + 1
 
 
-class _Scope:
-    __slots__ = ("engine", "site", "kind", "mode", "timed", "t0")
+class Pending:
+    """The copies of one ``scope(stream=...)``, in flight on that stream.
 
-    def __init__(self, engine: Engine, site):
+    ``wait()`` makes a stream (default: the current one) wait for them on the
+    GPU; ``synchronize()`` makes the host wait; ``done()`` asks without
+    waiting. ``event`` is the ``torch.cuda.Event`` behind all three. The
+    copies' buffers stay alive until they are done. Inside a CUDA graph
+    capture, ``wait()`` is the join of the stream the scope forked.
+    """
+
+    __slots__ = ("event", "stream", "_keep")
+
+    def __init__(self, event, stream, keep):
+        self.event, self.stream, self._keep = event, stream, keep
+
+    def wait(self, stream=None) -> None:
+        (stream if stream is not None else torch.cuda.current_stream()).wait_event(self.event)
+
+    def synchronize(self) -> None:
+        self.event.synchronize()
+        self._keep = None
+
+    def done(self) -> bool:
+        if self.event.query():
+            self._keep = None
+            return True
+        return False
+
+
+class _Scope:
+    __slots__ = ("engine", "site", "kind", "mode", "timed", "t0", "stream", "stream_ctx", "outer_held", "pending")
+
+    def __init__(self, engine: Engine, site, stream=None):
         self.engine, self.site = engine, site
         self.kind = self.mode = None
         self.timed, self.t0 = False, 0.0
+        self.stream, self.stream_ctx, self.outer_held, self.pending = stream, None, None, None
 
-    def __enter__(self) -> Engine:
+    def __enter__(self):
         e = self.engine
+        st = self.stream
+        if st is not None:
+            if torch is None or not torch.cuda.is_available():
+                raise ValueError("scope(stream=...) needs CUDA")
+            if isinstance(st, str):
+                if st != "copy":
+                    raise ValueError(f"stream must be 'copy' or a torch.cuda.Stream, got {st!r}")
+                st = self.stream = e.copy_stream()
+            st.wait_stream(torch.cuda.current_stream())  # sees what was queued before the scope
+            self.stream_ctx = torch.cuda.stream(st)
+            self.stream_ctx.__enter__()
         with e._lock:
-            e._e.begin_scope()
+            e._e.begin_scope(host_async=st is not None)
             e._set_depth(e._depth + 1)
+            e._async_depth += st is not None
+            if st is not None:
+                self.outer_held, e._held = e._held, []
         self.kind, self.timed = e._interception(self.site)
         if self.timed:
             self.t0 = time.perf_counter()
@@ -370,7 +433,7 @@ class _Scope:
             from . import _mode
             self.mode = _mode.Intercept(e)
             self.mode.__enter__()
-        return e
+        return e if self.stream is None else _PendingSlot(self)
 
     def __exit__(self, *exc) -> None:
         e = self.engine
@@ -381,15 +444,61 @@ class _Scope:
                 self.mode.__exit__(*exc)
                 self.mode = None
         finally:
-            with e._lock:
-                e._set_depth(e._depth - 1)
-                e._e.end_scope()
-                if e._depth == 0:
-                    held, e._held = e._held, []
-                    if e._opts.allow_async:
+            try:
+                with e._lock:
+                    e._set_depth(e._depth - 1)
+                    e._async_depth -= self.stream is not None
+                    e._e.end_scope()
+                    if self.stream is not None:
+                        e._e.flush()  # issue now, also inside an outer scope: the event follows the copies
+                        held, e._held = e._held, self.outer_held
+                        event = torch.cuda.Event()
+                        event.record(self.stream)
                         e._retire(held)
+                        self.pending = Pending(event, self.stream, held)
+                    elif e._depth == 0:
+                        held, e._held = e._held, []
+                        if e._opts.allow_async:
+                            e._retire(held)
+            finally:
+                if self.stream_ctx is not None:
+                    self.stream_ctx.__exit__(*exc)
+                    self.stream_ctx = None
         if self.timed:
             e._sites[self.site].report(self.kind == "mode", time.perf_counter() - self.t0)
+
+
+class _PendingSlot:
+    """What ``with scope(stream=...) as h`` binds: the scope's Pending, once
+    the scope has exited (its copies are issued then)."""
+
+    __slots__ = ("_scope",)
+
+    def __init__(self, scope):
+        self._scope = scope
+
+    def _get(self) -> Pending:
+        p = self._scope.pending
+        if p is None:
+            raise RuntimeError("the scope is still open: its copies are issued when it exits")
+        return p
+
+    @property
+    def event(self):
+        return self._get().event
+
+    @property
+    def stream(self):
+        return self._scope.stream
+
+    def wait(self, stream=None) -> None:
+        self._get().wait(stream)
+
+    def synchronize(self) -> None:
+        self._get().synchronize()
+
+    def done(self) -> bool:
+        return self._get().done()
 
 
 class FrozenPlan:
@@ -426,9 +535,9 @@ def default_engine() -> Engine:
     return e
 
 
-def scope():
+def scope(stream=None):
     f = sys._getframe(1)
-    return default_engine().scope(_site=(f.f_code, f.f_lineno))
+    return default_engine().scope(stream, _site=(f.f_code, f.f_lineno))
 
 
 def copy_(dst, src, **kw):

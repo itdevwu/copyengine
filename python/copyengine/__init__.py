@@ -9,6 +9,7 @@ from ._api import (
     lazy,
     Engine,
     FrozenPlan,
+    Pending,
     barrier,
     copy_,
     default_engine,
@@ -36,7 +37,7 @@ from ._core import (
 )
 
 __all__ = [
-    "ABI_VERSION", "Access", "BackendError", "CopyEngineError", "Elementwise", "Engine", "FrozenPlan",
+    "ABI_VERSION", "Access", "BackendError", "CopyEngineError", "Elementwise", "Engine", "FrozenPlan", "Pending",
     "NeedsMaterialize", "Rects", "Runs", "Stmt", "Unsupported", "UnsafeCopy", "__version__", "barrier",
     "copy_", "default_engine", "gather", "hardware_fingerprint", "indices", "lazy", "Lazy", "lower", "probe", "scatter_",
     "scope", "segments", "stats",

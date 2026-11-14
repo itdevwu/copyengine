@@ -131,7 +131,14 @@ ce.copy_(q_int8, x, fn=ce.Elementwise(scale=1 / qs, round=True, clamp=(-127, 127
 # 4. Ragged or CSR layouts: many segments in one call.
 ce.segments(src, dst, src_off, dst_off, length)
 
-# 5. Replay a planned copy without planning again.
+# 5. Overlap copies with compute: run them on a copy stream, the host never waits.
+with ce.scope(stream="copy") as h:      # or stream=<a torch.cuda.Stream>
+    for l in range(num_layers):
+        next_kv[l].copy_(host_kv[l, ids])
+...                                     # compute keeps running on the current stream
+h.wait()                                # the current stream waits for the copies (GPU side)
+
+# 6. Replay a planned copy without planning again.
 eng = ce.Engine()
 with eng.scope():
     ...
@@ -176,6 +183,14 @@ fastest.
 - CUDA Graphs: copies inside `torch.cuda.graph` (scopes, `ce.copy_`,
   `FrozenPlan.run()`) are recorded and replay correctly. Copies torch has no
   equivalent for must run once before capturing.
+- `scope(stream=...)`: the scope's work (its copies, and any other op written
+  in it) runs on that stream, after what the current stream had queued. The
+  host waits for none of it, even for copies that would otherwise block; the
+  returned handle (`wait()`, `synchronize()`, `done()`, `event`) orders it
+  against the rest. Its buffers stay alive until the copies are done. Inside a
+  CUDA graph capture this is a fork, and `h.wait()` the join. Copies
+  copyengine leaves to torch (for example a float-to-int cast) keep torch's
+  own semantics.
 - Each destination element must be written once per copy: duplicate scatter
   indices and a source overlapping its own destination raise `UnsafeCopy` in
   the explicit API (an intercepted `copy_` leaves those to torch).

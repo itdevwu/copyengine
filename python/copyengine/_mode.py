@@ -94,8 +94,10 @@ def intercepted_copy(engine, dst, src, non_blocking=False):
         sep, ss, sst, soff, scuda = torch_parts(src)
         stream = raw_stream(dst if dcuda else src) if (dcuda or scuda) else 0
         try:
+            # In an async scope the host never waits: torch's copy runs non_blocking too.
+            nb = non_blocking or engine._async_depth > 0
             engine._e.copy_strided(sep, dep, ss, sst, soff, ds, dst_, doff, _core.Elementwise(), stream,
-                                   (native_copy, dst, src, non_blocking), host_async=non_blocking)
+                                   (native_copy, dst, src, nb), host_async=non_blocking)
             return dst
         except _core.CopyEngineError:
             pass  # torch decides (and raises) as it would

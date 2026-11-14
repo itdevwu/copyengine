@@ -333,7 +333,7 @@ NB_MODULE(_core, m) {
         nb::gil_scoped_release release;
         e.fence(r, w);
       }, "reads"_a, "writes"_a)
-      .def("begin_scope", &ce::Engine::begin_scope)
+      .def("begin_scope", nb::overload_cast<bool>(&ce::Engine::begin_scope), "host_async"_a = false)
       .def("end_scope", &ce::Engine::end_scope, nb::call_guard<nb::gil_scoped_release>())
       .def("flush", &ce::Engine::flush, nb::call_guard<nb::gil_scoped_release>())
       .def("synchronize", &ce::Engine::synchronize, nb::call_guard<nb::gil_scoped_release>())

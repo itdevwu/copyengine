@@ -17,7 +17,7 @@ bool host_is_pinned(uintptr_t p);
 // extensions need not link the core. Both sides come from the same build;
 // errors cross as codes because exception types do not cross shared objects.
 struct FrontendApi {
-  static constexpr uint32_t kVersion = 2;
+  static constexpr uint32_t kVersion = 3;
   enum Flags : uint32_t {
     kHostAsync = 1,  // see Hints::host_async
   };

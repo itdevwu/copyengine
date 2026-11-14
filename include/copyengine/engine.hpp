@@ -97,6 +97,10 @@ class Engine {
   void fence(std::span<const Range> reads, std::span<const Range> writes);
 
   void begin_scope();
+  // A scope whose copies the host never waits for, as if every one were
+  // non_blocking: buffers stay alive until the GPU is done (Python's
+  // scope(stream=...)). Scopes nest; one async scope makes its inner ones async.
+  void begin_scope(bool host_async);
   // Flushes at depth 0. Copies are ordered on the caller's stream; the call
   // waits only when host memory is involved (unless allow_async).
   void end_scope();

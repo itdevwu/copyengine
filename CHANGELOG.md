@@ -4,7 +4,7 @@ copyengine follows [semantic versioning](https://semver.org). From 0.1.0 on,
 the Python API, the C ABI (`CE_ABI_VERSION`) and the tuning profile format
 change incompatibly only in a new minor (0.x) or major release.
 
-## Unreleased
+## 0.2.0
 
 - FP8 dtypes: `float8_e4m3fn`, `float8_e5m2`, `float8_e8m0fnu`, converted to
   and from every other dtype with torch's exact bits (round to nearest even;

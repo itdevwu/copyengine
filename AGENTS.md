@@ -94,11 +94,16 @@
   `master`.
 - Emoji conventional commits, for example `✨ feat: add Runs IR`.
 - CI has no GPU. A pull request that touches GPU paths (kernels, CUDA graphs,
-  async scopes, SM limits) states which GPU tests ran locally, on what GPU,
-  and their result.
+  async scopes, SM limits) states which GPU tests ran locally, on which GPU
+  architecture generation (e.g. sm_86, not the product), and their result.
 - A release is a pull request whose last commit is
   `🔖 chore: prepare version X.Y.Z`: the version in `CMakeLists.txt`, the
   CHANGELOG heading, and every tag the README and `skills/` refer to. After it
   is merged, tag `vX.Y.Z` on `master`; the tag builds and publishes the wheels.
 - Release from `master`. `release/0.X` branches exist only for fixes to a
   minor older than the one on `master`.
+- Pre-releases (`vX.Y.Z.devN`, `vX.Y.ZrcN`) may be tagged on the version
+  branch to test unreleased work on other machines: its `project()` already
+  holds X.Y.Z and the tag supplies the suffix; PyPI and GitHub mark them as
+  pre-releases (`pip install --pre`). They are not releases: no CHANGELOG
+  heading, and the README and `skills/` keep the last release's tags.

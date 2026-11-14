@@ -737,3 +737,20 @@ def test_warmup_runs_until_every_pattern_is_locked():
     assert n > 4
     assert all(v["locked"] for v in json.loads(e.dump_profile())["buckets"].values())
     assert e.warmup(step, iters=3) == 3
+
+
+def test_plan_cache_evicts_least_recently_used():
+    # A working set one larger than the cache keeps its hot entry (a full clear lost it).
+    e = ce.Engine()
+    e._opts.plan_cache = 4  # not a Python option: rebuild the core engine with it
+    e._e = ce._core.Engine(e._opts)
+    e._handle = e._e.handle
+    src, dst = np.arange(64, dtype=np.float32), np.zeros(64, np.float32)
+    hot = lambda: e.segments(src, dst, [0], [0], [8])
+    hot()
+    for k in range(1, 12):
+        e.segments(src, dst, [k], [k], [1])  # a new plan each
+        hot()
+        assert e.stats()["last"]["plan_cache"] == "hit", k
+    assert e.stats()["plans"] <= 4
+    assert e.stats()["plan_us"] > 0

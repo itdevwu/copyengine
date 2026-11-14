@@ -6,6 +6,9 @@ change incompatibly only in a new minor (0.x) or major release.
 
 ## Unreleased
 
+- The plan, statement and safety caches evict the least recently used entry
+  instead of clearing when full. `stats()` reports planning time on cache
+  misses (`plan_us`, total and last flush).
 - copyengine's pinned host buffers (bounce and upload buffers) come from
   torch's pinned allocator when torch provides it, so they count in its host
   memory statistics; `stats()["cuda"][i]["host_allocator"]` reports it.

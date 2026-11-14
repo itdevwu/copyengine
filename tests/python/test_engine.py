@@ -701,3 +701,19 @@ def test_threads_with_their_own_engines_run_concurrently():
     for t in ts:
         t.join()
     assert not errors, errors
+
+
+def test_last_flush_explains_its_decisions():
+    src = np.arange(1 << 16, dtype=np.float32)
+    dst = np.zeros_like(src)
+    e = ce.Engine(tune_trials=1, ab_pairs=4, ab_max_pairs=8)
+    e.copy_(dst, src)
+    d = e.stats()["last"]["decisions"]
+    assert len(d) == 1 and d[0]["strategy"] and d[0]["why"].startswith(("exploring", "A/B")), d
+    for _ in range(40):
+        e.copy_(dst, src)
+    e._e.flush()
+    e.copy_(dst, src[::-1].copy())  # a full flush (the lone-op memo does not refresh stats)
+    d = e.stats()["last"]["decisions"][0]
+    assert d["why"].startswith(("locked", "online re-check")) and d["ops"] == 1 and d["bytes"] == src.nbytes, d
+    assert ce.Engine(prior_only=True).copy_(dst, src) is dst

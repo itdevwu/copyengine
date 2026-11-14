@@ -35,6 +35,8 @@ struct FrontendApi {
   int (*fence)(Engine& engine, const Range* reads, size_t n_reads, const Range* writes, size_t n_writes,
                std::string* error) = nullptr;
   size_t (*queued)(const Engine& engine) = nullptr;
+  // Engine::decline.
+  void (*decline)(Engine& engine, const char* reason) = nullptr;
 };
 
 const FrontendApi* frontend_api();

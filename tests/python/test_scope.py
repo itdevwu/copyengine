@@ -201,3 +201,18 @@ def test_python_mode_site_switch_keeps_torch_unless_the_mode_clearly_wins():
         kind, _ = fast.choose()
         fast.report(kind == "mode", 0.5 if kind == "mode" else 1.0)
     assert fast.decided is True and fast.choose() == ("mode", False)
+
+
+@pytest.mark.parametrize("dev", DEVS)
+def test_declined_copies_are_counted_with_a_reason(eng, dev):
+    f = torch.randn(16, device=dev)
+    with eng.scope():
+        torch.empty(16, dtype=torch.int32, device=dev).copy_(f)  # float -> int: torch's result differs
+        torch.empty(16, dtype=torch.int32, device=dev).copy_(f)
+        torch.empty(16, device=dev).copy_(f)                     # taken
+    assert eng.stats()["declined"] == {"dtype pair where torch's result differs": 2}
+    y = torch.arange(16.0, device=dev)
+    with pytest.raises(RuntimeError):
+        with eng.scope():
+            y[1:].copy_(y[:-1])
+    assert eng.stats()["declined"]["overlapping source and destination"] == 1

@@ -67,6 +67,13 @@ int fence(Engine& engine, const Range* reads, size_t n_reads, const Range* write
 
 size_t queued(const Engine& engine) { return engine.queued(); }
 
+void decline(Engine& engine, const char* reason) {
+  try {
+    engine.decline(reason);
+  } catch (...) {  // statistics only: never fails the copy
+  }
+}
+
 }  // namespace
 
 const FrontendApi* frontend_api() {
@@ -76,6 +83,7 @@ const FrontendApi* frontend_api() {
     a.host_is_pinned = &host_is_pinned;
     a.fence = &fence;
     a.queued = &queued;
+    a.decline = &decline;
     return a;
   }();
   return &api;

@@ -81,6 +81,9 @@ class Tuner {
   Pick pick(const std::string& bucket, const Choice& c, int64_t runs = 1);
   void report(const std::string& bucket, Strategy s, Sample sample);
   bool locked(const std::string& bucket) const;
+  // Why `ran` ran for `bucket` (after pick): the evidence behind a locked
+  // choice, or which phase of exploration a sample belongs to.
+  std::string explain(const std::string& bucket, const Choice& c, Strategy ran) const;
   // The locked strategy (not what an online sample just ran), if locked.
   std::optional<Strategy> locked_strategy(const std::string& bucket) const;
 

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <climits>
+#include <cstdio>
 #include <cmath>
 
 #include "copyengine/copyengine.hpp"
@@ -293,6 +294,44 @@ void Tuner::report(const std::string& bucket, Strategy s, Sample sample) {
   if (p > 0) --p;
   if (e.locked >= 0) online(e, s, sample);
   else e.samples[static_cast<int>(s)].push_back(sample);
+}
+
+namespace {
+std::string fmt_us(double v) {
+  char b[32];
+  std::snprintf(b, sizeof b, v < 10 ? "%.1f us" : "%.0f us", v);
+  return b;
+}
+double median_total(const std::vector<Sample>& v) {
+  std::vector<double> t;
+  for (const Sample& x : v) t.push_back(x.total());
+  return median(t);
+}
+}  // namespace
+
+std::string Tuner::explain(const std::string& bucket, const Choice& c, Strategy ran) const {
+  const std::string name(strategy_name(ran));
+  if (cfg_.prior_only) return "prior's first choice (no measurement)";
+  auto it = table_.find(bucket);
+  if (it == table_.end() || it->second.locked < 0) {
+    if (!cfg_.explore) return "not in the loaded profile: " + std::string(c.lead ? "copyengine's default" : "the baseline");
+    if (it == table_.end()) return "exploring";
+    const Entry& e = it->second;
+    if (e.challenger < 0) return "exploring: sampling " + name;
+    return "A/B: " + std::string(strategy_name(static_cast<Strategy>(e.challenger))) + " vs " +
+           std::string(strategy_name(c.reference())) + ", sampling " + name;
+  }
+  const Entry& e = it->second;
+  const auto locked = static_cast<Strategy>(e.locked);
+  if (ran != locked) return "online re-check of " + name + " (locked: " + std::string(strategy_name(locked)) + ")";
+  std::string why = "locked";
+  if (e.alt >= 0 && !e.samples[e.alt].empty() && !e.samples[e.locked].empty())
+    why += ": " + fmt_us(median_total(e.samples[e.locked])) + " vs " +
+           std::string(strategy_name(static_cast<Strategy>(e.alt))) + " " + fmt_us(median_total(e.samples[e.alt]));
+  else if (c.cands.empty() || (c.cands.size() == 1 && c.cands[0] == c.reference()))
+    why += ": the only choice";
+  if (e.flips) why += ", flipped online " + std::to_string(e.flips) + "x";
+  return why;
 }
 
 std::optional<Strategy> Tuner::locked_strategy(const std::string& bucket) const {

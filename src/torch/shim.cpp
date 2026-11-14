@@ -145,11 +145,32 @@ at::Tensor& native_copy(c10::DispatchKeySet ks, at::Tensor& self, const at::Tens
   return copy_op().redispatch(ks & kAfter, self, src, non_blocking);
 }
 
+// Why copyengine leaves a copy to torch (the same texts as python/copyengine/_mode.py).
+const char* decline_reason(const at::Tensor& self, const at::Tensor& src) {
+  if (!usable(self) || !usable(src)) return "layout, device or dtype copyengine does not handle";
+  if (!same_bits(self.scalar_type(), src.scalar_type())) return "dtype pair where torch's result differs";
+  if (c10::GradMode::is_enabled() && (self.requires_grad() || src.requires_grad())) return "autograd";
+  return nullptr;
+}
+
+// rc is 1 + ce::Errc (copyengine/error.hpp, not shipped with the shim):
+// 1 needs_materialize, 2 unsafe_copy, 3 unsupported.
+const char* refusal(int rc) {
+  switch (rc - 1) {
+    case 2: return "overlapping source and destination";
+    case 1: return "view copyengine cannot describe";
+    case 3: return "unsupported by copyengine";
+    default: return "refused by copyengine";
+  }
+}
+
 at::Tensor& intercepted_copy(c10::DispatchKeySet ks, at::Tensor& self, const at::Tensor& src, bool non_blocking) {
   ce::Engine* e = engine();
-  if (!e || !usable(self) || !usable(src) || !same_bits(self.scalar_type(), src.scalar_type()) || self.numel() == 0 ||
-      (c10::GradMode::is_enabled() && (self.requires_grad() || src.requires_grad())))
+  if (!e || self.numel() == 0) return native_copy(ks, self, src, non_blocking);
+  if (const char* why = decline_reason(self, src)) {
+    g_api->decline(*e, why);
     return native_copy(ks, self, src, non_blocking);
+  }
   const ce::Endpoint de = endpoint(self), se = endpoint(src);
   uintptr_t stream = 0;
   if (self.is_cuda()) stream = current_stream(self.get_device());
@@ -161,7 +182,10 @@ at::Tensor& intercepted_copy(c10::DispatchKeySet ks, at::Tensor& self, const at:
       static_cast<int>(ds.size()), self.storage_offset(), ce::Elementwise{},
       std::make_shared<TorchCopy>(self, src, non_blocking), non_blocking ? ce::FrontendApi::kHostAsync : 0u, stream,
       &err);
-  if (rc != 0) return native_copy(ks, self, src, non_blocking);  // torch decides (and raises) as it would
+  if (rc != 0) {
+    g_api->decline(*e, refusal(rc));
+    return native_copy(ks, self, src, non_blocking);  // torch decides (and raises) as it would
+  }
   // The ADInplaceOrView kernel below this key would have done this.
   if (!self.is_inference()) self.unsafeGetTensorImpl()->bump_version();
   return self;

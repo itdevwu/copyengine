@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
+#include <map>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -115,6 +116,8 @@ struct Engine::Impl {
   std::vector<Alloc> q_reads, q_writes;  // allocations the queue reads / writes
   std::vector<PendingSample> samples;
   int64_t native_ops = 0;  // ops run natively at interception
+  std::map<std::string, int64_t, std::less<>> declined;  // intercepted copies left to the frontend, by reason
+  bool last_capture = false;  // the last flush was recorded into a CUDA graph
   HostExecutor host;
   std::unique_ptr<Executor> cuda;
   std::string cuda_error;
@@ -677,6 +680,7 @@ struct Engine::Impl {
         for (int k : g.ops) bury(std::move(ops[k].native));
     }
     last = st;
+    last_capture = capturing;
     ++total_flushes;
     total_ops += st.ops;
     total_calls += st.calls;
@@ -765,6 +769,13 @@ void Engine::fence(std::span<const Range> reads, std::span<const Range> writes) 
   impl_->fence(reads, writes);
 }
 
+void Engine::decline(std::string_view reason) {
+  Locked lk(*impl_);
+  auto it = impl_->declined.find(reason);
+  if (it == impl_->declined.end()) it = impl_->declined.emplace(std::string(reason), 0).first;
+  ++it->second;
+}
+
 void Engine::begin_scope() { begin_scope(false); }
 
 void Engine::begin_scope(bool host_async) {
@@ -851,6 +862,28 @@ std::string Engine::stats_json() const {
                   .set("bytes", m.last.bytes)
                   .set("plan_cache", m.last.plan_hit ? "hit" : "miss")
                   .set("strategies", std::move(strategies));
+  // Why each group of the last flush ran what it did (worked out here, not per flush).
+  Json decisions = Json::array();
+  if (m.last_ran.plan && m.last_ops) {
+    const auto& groups = m.last_ran.plan->groups;
+    for (size_t i = 0; i < groups.size() && i < m.last_ran.strategies.size(); ++i) {
+      const Group& g = groups[i];
+      const Strategy s = m.last_ran.strategies[i];
+      std::string why;
+      if (m.last_capture) why = "CUDA graph capture: a strategy that only enqueues stream work";
+      else if (m.opt.disable) why = "CE_DISABLE";
+      else why = m.tuner.explain(g.bucket, m.choice_for(g, *m.last_ops), s);
+      decisions.push(Json::object()
+                         .set("strategy", std::string(strategy_name(s)))
+                         .set("why", why)
+                         .set("ops", static_cast<uint64_t>(g.ops.size()))
+                         .set("bytes", g.bytes())
+                         .set("bucket", g.bucket));
+    }
+  }
+  last.set("decisions", std::move(decisions));
+  Json declined = Json::object();
+  for (const auto& [k, v] : m.declined) declined.set(k, v);
   return Json::object()
       .set("last", std::move(last))
       .set("flushes", m.total_flushes)
@@ -859,6 +892,7 @@ std::string Engine::stats_json() const {
       .set("bytes", m.total_bytes)
       .set("plan_hits", m.plan_hits)
       .set("native_ops", m.native_ops)
+      .set("declined", std::move(declined))
       .set("kept", static_cast<uint64_t>(m.kept.size()))  // in-flight copies whose buffers are held
       .set("plans", static_cast<uint64_t>(m.plans.size()))
       .set("buckets", static_cast<uint64_t>(m.tuner.size()))

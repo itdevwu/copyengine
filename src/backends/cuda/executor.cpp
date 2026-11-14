@@ -127,6 +127,28 @@ void check(CUresult r, const char* what) {
   if (r != CUDA_SUCCESS) fail(Errc::backend, std::string(what) + ": " + cuda::error_name(r));
 }
 
+// An NVTX range per group, named after its strategy ("copyengine:fused"),
+// visible in Nsight Systems; free when no tool is attached. NVTX is header
+// only: without its headers the range does nothing.
+#if __has_include(<nvtx3/nvToolsExt.h>)
+#include <nvtx3/nvToolsExt.h>
+struct NvtxRange {
+  explicit NvtxRange(Strategy s) {
+    static const auto names = [] {
+      std::array<std::string, kNumStrategies> n;
+      for (int i = 0; i < kNumStrategies; ++i) n[i] = "copyengine:" + std::string(strategy_name(static_cast<Strategy>(i)));
+      return n;
+    }();
+    nvtxRangePushA(names[static_cast<int>(s)].c_str());
+  }
+  ~NvtxRange() { nvtxRangePop(); }
+};
+#else
+struct NvtxRange {
+  explicit NvtxRange(Strategy) {}
+};
+#endif
+
 std::string short_name(DType t) {
   switch (t) {
     case DType::f64: return "f64";
@@ -275,6 +297,7 @@ class CudaExecutor final : public Executor {
   }
 
   int64_t run(Strategy strat, const Group& g, const std::vector<Op>& ops, uintptr_t stream) override {
+    const NvtxRange range(strat);
     const int di = device_of(g);
     Dev& s = state(di);
     Push push(*d_, s.ctx);

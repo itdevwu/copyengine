@@ -22,6 +22,10 @@ change incompatibly only in a new minor (0.x) or major release.
   `Pending` handle it binds (`wait()`, `synchronize()`, `done()`, `event`)
   orders it against other streams; buffers are kept alive until done. Works
   inside CUDA graph capture (fork / join).
+- Observability: `stats()["last"]["decisions"]` gives every group's strategy
+  and why; `stats()["declined"]` counts intercepted copies left to torch, by
+  reason (the same in the C++ shim and the Python interception); each group
+  is an NVTX range `copyengine:<strategy>`.
 - The no-regression and same-results guarantees now state what holds for
   NaN: NaN stays NaN, its payload is not kept (torch's differs per device).
 ## 0.1.1

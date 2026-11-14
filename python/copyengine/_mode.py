@@ -45,13 +45,19 @@ def _usable(t) -> bool:
             and not t.is_conj() and not t.is_neg())
 
 
-def eligible(dst, src) -> bool:
-    """Whether ce may run ``dst.copy_(src)``: it must give torch's exact result. Mirrors the shim."""
+def decline_reason(dst, src):
+    """None if ce may run ``dst.copy_(src)`` (it gives torch's exact result), else why not. Mirrors the shim."""
     if not (isinstance(dst, torch.Tensor) and isinstance(src, torch.Tensor) and _usable(dst) and _usable(src)):
-        return False
-    if dst.numel() == 0 or not (dst.dtype == src.dtype or (dst.dtype in _FLOATS and src.dtype != torch.bool)):
-        return False
-    return not (torch.is_grad_enabled() and (dst.requires_grad or src.requires_grad))
+        return "layout, device or dtype copyengine does not handle"
+    if not (dst.dtype == src.dtype or (dst.dtype in _FLOATS and src.dtype != torch.bool)):
+        return "dtype pair where torch's result differs"
+    if torch.is_grad_enabled() and (dst.requires_grad or src.requires_grad):
+        return "autograd"
+    return None
+
+
+_REFUSALS = {"UnsafeCopy": "overlapping source and destination", "NeedsMaterialize": "view copyengine cannot describe",
+             "Unsupported": "unsupported by copyengine"}
 
 
 def _range(t):
@@ -89,7 +95,9 @@ def native_copy(dst, src, non_blocking) -> None:
 
 
 def intercepted_copy(engine, dst, src, non_blocking=False):
-    if eligible(dst, src):
+    empty = isinstance(dst, torch.Tensor) and dst.numel() == 0
+    why = None if empty else decline_reason(dst, src)
+    if why is None and not empty:
         dep, ds, dst_, doff, dcuda = torch_parts(dst)
         sep, ss, sst, soff, scuda = torch_parts(src)
         stream = raw_stream(dst if dcuda else src) if (dcuda or scuda) else 0
@@ -99,8 +107,10 @@ def intercepted_copy(engine, dst, src, non_blocking=False):
             engine._e.copy_strided(sep, dep, ss, sst, soff, ds, dst_, doff, _core.Elementwise(), stream,
                                    (native_copy, dst, src, nb), host_async=non_blocking)
             return dst
-        except _core.CopyEngineError:
-            pass  # torch decides (and raises) as it would
+        except _core.CopyEngineError as e:  # torch decides (and raises) as it would
+            why = _REFUSALS.get(type(e).__name__, "refused by copyengine")
+    if why is not None:
+        engine._e.decline(why)
     if engine._e.queued:
         engine._e.fence([_range(src)] if isinstance(src, torch.Tensor) else [], [_range(dst)])
     native_copy(dst, src, non_blocking)

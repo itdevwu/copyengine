@@ -111,6 +111,10 @@ class Engine {
   // Callers keep a copy's buffers alive until then (allow_async).
   int64_t mark_pending();
   bool done(int64_t token);
+
+  // An intercepted copy the frontend left to the framework, and why (counted
+  // per reason in stats_json()["declined"]).
+  void decline(std::string_view reason);
   int depth() const;
   size_t queued() const;
 

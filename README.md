@@ -152,6 +152,13 @@ supports (each verified by a real copy). C and C++ callers use
 `include/copyengine/copyengine.h` (a stable C ABI) or `copyengine::copyengine`
 from CMake.
 
+To see what copyengine did: `eng.stats()["last"]["decisions"]` lists each
+group of the last flush with its strategy and why (still exploring, the A/B
+result it locked on, an online re-check, a CUDA graph capture), and
+`stats()["declined"]` counts the intercepted copies it left to torch, by
+reason. In Nsight Systems every group is an NVTX range named
+`copyengine:<strategy>`.
+
 To compare against torch on your GPU: `python bench/bench_torch.py`.
 
 ## How it works
@@ -191,6 +198,9 @@ fastest.
   CUDA graph capture this is a fork, and `h.wait()` the join. Copies
   copyengine leaves to torch (for example a float-to-int cast) keep torch's
   own semantics.
+- Index tensors (`ce.lazy(...).index_select`, `ce.gather`, `ce.scatter_`) are
+  read on the host: a CUDA index tensor costs one device synchronization per
+  call. Pass host indices on hot paths.
 - Each destination element must be written once per copy: duplicate scatter
   indices and a source overlapping its own destination raise `UnsafeCopy` in
   the explicit API (an intercepted `copy_` leaves those to torch).

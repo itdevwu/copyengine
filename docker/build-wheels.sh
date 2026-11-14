@@ -34,7 +34,7 @@ step() { echo "== $*"; }
 step "CUDA $CUDA toolkit (nvcc, headers)"
 dnf -y -q install dnf-plugins-core
 dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo
-dnf -y -q install "cuda-nvcc-$CUDA" "cuda-cudart-devel-$CUDA" "cuda-driver-devel-$CUDA"
+dnf -y -q install "cuda-nvcc-$CUDA" "cuda-cudart-devel-$CUDA" "cuda-driver-devel-$CUDA" "cuda-nvtx-$CUDA"
 export PATH=/usr/local/cuda/bin:$PATH
 
 venv() {  # venv <python tag> <dir>

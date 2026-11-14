@@ -337,6 +337,7 @@ NB_MODULE(_core, m) {
       .def("end_scope", &ce::Engine::end_scope, nb::call_guard<nb::gil_scoped_release>())
       .def("flush", &ce::Engine::flush, nb::call_guard<nb::gil_scoped_release>())
       .def("synchronize", &ce::Engine::synchronize, nb::call_guard<nb::gil_scoped_release>())
+      .def("decline", [](ce::Engine& e, const std::string& why) { e.decline(why); }, "reason"_a)
       .def("mark_pending", &ce::Engine::mark_pending)
       .def("done", &ce::Engine::done, "token"_a)
       .def_prop_ro("depth", &ce::Engine::depth)

@@ -184,8 +184,8 @@ gain; `copyengine-diagnose` explains slow, declined or failing copies from
 copyengine's own stats.
 
 ```bash
-npx skills@1 add https://github.com/itdevwu/copyengine/tree/v0.2.1/skills/copyengine-adopt --global
-npx skills@1 add https://github.com/itdevwu/copyengine/tree/v0.2.1/skills/copyengine-diagnose --global
+npx skills@1 add https://github.com/itdevwu/copyengine/tree/v0.2.2/skills/copyengine-adopt --global
+npx skills@1 add https://github.com/itdevwu/copyengine/tree/v0.2.2/skills/copyengine-diagnose --global
 ```
 
 ## How it works

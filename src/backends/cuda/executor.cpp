@@ -119,7 +119,6 @@ struct FusedBatch {
   // the device each call; members[i]: position in the group of bases[i].
   bool device_tables = false;
   std::vector<int> members;
-  std::vector<std::shared_ptr<void>> captured;  // bases recorded by CUDA graph captures
   std::vector<BaseEntry> recent;                // eager: bases of recent pointer sets (see current_bases)
   uint64_t clock = 0;
 };
@@ -226,6 +225,7 @@ class CudaExecutor final : public Executor {
         dev_free(s, g.mem);
       }
       dev_free(s, s.err);
+      dev_free(s, s.capture_arena);
       dev_free(s, s.pace);
       for (Lane& l : s.lanes) {  // lanes[0] is sm_stream
         d_->cuStreamSynchronize(l.sm);
@@ -327,9 +327,14 @@ class CudaExecutor final : public Executor {
         const auto& P = *static_cast<const FusedPlan*>(slot.get());
         // Resident tables are built on first use (a host wait); device-table
         // bases are written by kernel nodes of the capture itself.
-        return P.ok && !P.cross && devs_[di].err.ptr != 0  /* made at device setup */ &&
+        const Dev& s = devs_[di];
+        size_t need = 0;
+        for (const FusedBatch& b : P.batches)
+          if (b.device_tables) need += (b.bases.size() * sizeof(Base) + 255) & ~size_t{255};
+        return P.ok && !P.cross && s.err.ptr != 0 /* made at device setup */ &&
+               s.capture_used + need <= s.capture_arena_bytes &&
                std::all_of(P.batches.begin(), P.batches.end(), [](const FusedBatch& b) {
-                 return b.device_tables ? b.captured.size() < kMaxCaptured : b.table != nullptr;
+                 return b.device_tables || b.table != nullptr;
                });
       }
       case Strategy::paced: {
@@ -536,6 +541,8 @@ class CudaExecutor final : public Executor {
     DevMem err;               // set by kernels that meet an out-of-range device index
     bool err_armed = false;   // such kernels ran since the last check
     bool err_graphs = false;  // ... or were captured: graph replays may set it at any time
+    DevMem capture_arena;     // bases recorded by CUDA graph captures (see captured_bases)
+    size_t capture_arena_bytes = 0, capture_used = 0;
     // Bandwidth limit: the pacing words (the next start time per direction,
     // on the device), and whether kernels may read and write pinned host
     // memory directly (zero-copy), checked by a test copy.
@@ -666,7 +673,11 @@ class CudaExecutor final : public Executor {
     for (Slot& sl : s.slots) check(d_->cuEventCreate(&sl.done, CU_EVENT_DISABLE_TIMING), "cuEventCreate");
     admit_kernels(s);
     admit_batch(s);
-    if (s.kernels) error_word(s);  // before any capture can need it
+    if (s.kernels) {  // before any capture can need them
+      error_word(s);
+      s.capture_arena = dev_alloc(s, kCaptureArena, "capture tables");
+      s.capture_arena_bytes = kCaptureArena;
+    }
     if (opt_.max_sms > 0 && s.kernels) setup_sm_limit(s);
     return s;
   }
@@ -832,7 +843,7 @@ class CudaExecutor final : public Executor {
       for (size_t i = 0; i < n; ++i) ds[i] = raws[at + i].dst, ss[i] = raws[at + i].src, sizes[i] = raws[at + i].bytes;
       size_t idx = 0, fail_idx = SIZE_MAX;
       const CUresult r =
-          d_->cuMemcpyBatchAsync(ds.data(), ss.data(), sizes.data(), n, &attr, &idx, 1, &fail_idx, run);
+          cuda::memcpy_batch(*d_, ds.data(), ss.data(), sizes.data(), n, &attr, &idx, 1, &fail_idx, run);
       if (r != CUDA_SUCCESS)
         fail(Errc::backend, "cuMemcpyBatchAsync: " + cuda::error_name(r) + " (failIdx " + std::to_string(fail_idx) + ")");
       ++calls;
@@ -1131,27 +1142,25 @@ class CudaExecutor final : public Executor {
   };
 
   static constexpr int kPutWords = 480;  // as in kernels.cu
-  static constexpr size_t kMaxCaptured = 64;  // captured base tables kept per batch
+  static constexpr size_t kCaptureArena = 256 << 10;  // bytes of bases CUDA graph captures may record per device
   struct Put {
     CUdeviceptr dst;
     int n;
     unsigned long long w[kPutWords];
   };
 
-  // A batch's bases for one CUDA graph capture: device memory written by
-  // ce_put nodes, so replays read the bases recorded at capture time. Kept
-  // while the group lives (the graph may replay any time).
-  CUdeviceptr captured_bases(Dev& s, FusedBatch& b, const std::vector<Base>& bases, CUstream st) {
-    if (b.captured.size() >= kMaxCaptured)
-      fail(Errc::unsupported, "too many CUDA graph captures of one copy with device indices");
-    const size_t words = bases.size() * sizeof(Base) / 8;
-    auto t = std::make_shared<DevTable>();
-    t->owner = this, t->device = s.index, t->alive = alive_, t->count = bases.size();
-    t->mem = dev_alloc(s, words * 8, "captured copy table");
-    t->ptr = t->mem.ptr;
-    put(s, t->ptr, bases, st);
-    b.captured.push_back(t);
-    return t->ptr;
+  // A batch's bases for one CUDA graph capture, written by ce_put nodes so
+  // replays read the bases recorded at capture time. They live in an arena
+  // made at device setup (nothing may be allocated during a capture) until
+  // the executor goes: a graph may replay any time.
+  CUdeviceptr captured_bases(Dev& s, const std::vector<Base>& bases, CUstream st) {
+    const size_t bytes = bases.size() * sizeof(Base);
+    if (s.capture_used + bytes > s.capture_arena_bytes)
+      fail(Errc::unsupported, "CUDA graph captures of copies with device indices used up their tables");
+    const CUdeviceptr t = s.capture_arena.ptr + s.capture_used;
+    s.capture_used += (bytes + 255) & ~size_t{255};
+    put(s, t, bases, st);
+    return t;
   }
 
   // Writes `bases` to device memory at `dst` in stream order, from kernel
@@ -1458,7 +1467,7 @@ class CudaExecutor final : public Executor {
           bases[i].stab = op.stab, bases[i].dtab = op.dtab;
         }
         if (capturing(reinterpret_cast<uintptr_t>(st))) {  // the graph owns these bases
-          const CUdeviceptr t = captured_bases(s, const_cast<FusedBatch&>(b), bases, st);
+          const CUdeviceptr t = captured_bases(s, bases, st);
           launch_stmt(t, bases.size(), b, fn, P.h2d ? add : 0, P.h2d ? 0 : add, s, st);
           continue;
         }

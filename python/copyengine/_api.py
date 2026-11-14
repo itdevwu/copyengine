@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import collections
+import itertools
 import json
 import statistics
 import sys
@@ -103,12 +104,18 @@ def _native_lazy(dst, src) -> None:
         _, base, dim, idx = kind
         shape = list(base.shape)
         shape[dim] = len(idx)
-        base.index_copy_(dim, device_index(idx, base.device), s.expand(shape).to(base.dtype))
+        base.index_copy_(dim, device_index(idx, base.device), _on(s.expand(shape), base))
+
+
+def _on(x, like):
+    """`x` with `like`'s device and dtype, as index_copy_ needs: what a torch
+    user writes. Host-bound data is waited for (the host reads it next)."""
+    return x.to(like.device, like.dtype, non_blocking=like.device.type == "cuda")
 
 
 def _native_gather(out, src, dim, idx) -> None:
     i = device_index(idx, src.device)
-    if out.dtype == src.dtype and out.is_contiguous():  # what a torch user writes: no temporary
+    if out.dtype == src.dtype and out.device == src.device and out.is_contiguous():  # no temporary
         torch.index_select(src, dim, i, out=out)
     else:
         out.copy_(src.index_select(dim, i), non_blocking=True)
@@ -117,17 +124,20 @@ def _native_gather(out, src, dim, idx) -> None:
 def _native_scatter(dst, src, dim, idx) -> None:
     shape = list(dst.shape)
     shape[dim] = len(idx)
-    dst.index_copy_(dim, device_index(idx, dst.device), src.expand(shape).to(dst.dtype))
+    dst.index_copy_(dim, device_index(idx, dst.device), _on(src.expand(shape), dst))
 
 
 def _native_flat(dst, src, si, di) -> None:
     """dst.flat[di] = src.flat[si] (element indices into contiguous tensors)."""
     dst.view(-1).index_copy_(0, device_index(di, dst.device),
-                             src.reshape(-1).index_select(0, device_index(si, src.device)).to(dst.dtype))
+                             _on(src.reshape(-1).index_select(0, device_index(si, src.device)), dst))
 
 
 def _native_segments(dst, src, so, do, n) -> None:
-    if len(n) <= 64:  # few segments: slices, as a torch user would write them
+    total = int(n.sum())
+    # Few or long segments: slices, as a torch user writes them. Many short
+    # ones: one indexed copy (its index tables are as long as the data).
+    if len(n) <= 64 or total > (1 << 22) or total >= 256 * len(n):
         sf, df = src.reshape(-1), dst.view(-1)
         for a, b, k in zip(so.tolist(), do.tolist(), n.tolist()):
             df[b:b + k].copy_(sf[a:a + k], non_blocking=True)
@@ -344,6 +354,42 @@ class Engine:
                               native=native)
             self._after(s.obj, d.obj, src, dst)  # a lazy side holds its device index tables
         return dst
+
+    def copy_many(self, dsts: Sequence[Any], srcs: Sequence[Any], *, ctx: str = "") -> None:
+        """``d.copy_(s)`` for every pair, planned together: one call for a list of
+        tensors (one per layer, say) instead of a loop of ``copy_`` calls.
+
+        Torch tensors go to C++ in one call; anything else is copied pair by
+        pair. The pairs are queued and planned as one batch, as in a scope.
+        """
+        if len(dsts) != len(srcs):
+            raise ValueError(f"copy_many: {len(dsts)} destinations, {len(srcs)} sources")
+        op = _torch_ops.copy_many_
+        fast = op is not None and not ctx and all(
+            type(t) is _Tensor and t.layout is _STRIDED and t.dtype not in _NOT_STABLE
+            for t in itertools.chain(dsts, srcs))
+        with self._lock:
+            self._e.begin_scope()
+            self._set_depth(self._depth + 1)
+            try:
+                if fast:
+                    try:
+                        op(list(dsts), list(srcs), self._handle)
+                    except RuntimeError as e:
+                        raise _torch_ops.translate(e) from None
+                else:
+                    for d, s in zip(dsts, srcs):
+                        self.copy_(d, s, ctx=ctx)
+            finally:
+                self._set_depth(self._depth - 1)
+                self._e.end_scope()
+            if fast:
+                self._held.extend(dsts)
+                self._held.extend(srcs)
+            if self._depth == 0:  # like a scope's exit: keep buffers only while copies may be pending
+                held, self._held = self._held, []
+                if self._opts.allow_async:
+                    self._retire(held)
 
     def segments(self, src, dst, src_off, dst_off, length, *, fn: Optional[Elementwise] = None,
                  valid_src: Optional[tuple] = None, ctx: str = "") -> None:
@@ -795,6 +841,10 @@ def scope(stream=None, *, bandwidth: Optional[float] = None):
 
 def copy_(dst, src, **kw):
     return default_engine().copy_(dst, src, **kw)
+
+
+def copy_many(dsts, srcs, **kw):
+    return default_engine().copy_many(dsts, srcs, **kw)
 
 
 def segments(src, dst, src_off, dst_off, length, **kw):

@@ -175,7 +175,8 @@ copy. A replay is kept only where it beats running `step` plainly.
 `eng.freeze()` / `plan.run()` replays the last flush exactly (same buffers,
 same indices).
 
-More: `ce.gather` / `ce.scatter_` for index-based copies, `ce.barrier()` to
+More: `ce.copy_many(dsts, srcs)` for lists of copies (one per layer) in one
+call, `ce.gather` / `ce.scatter_` for index-based copies, `ce.barrier()` to
 wait for queued work, `ce.probe()` to see which copy mechanisms this machine
 supports (each verified by a real copy). C and C++ callers use
 `include/copyengine/copyengine.h` (a stable C ABI) or `copyengine::copyengine`

@@ -51,6 +51,7 @@ Read [patterns](references/patterns.md) for code. In short:
 | Gather / permute / slice / cast torch can't express as one view | `ce.copy_(out, ce.lazy(src).index_select(...).permute(...))` |
 | Quantize / dequantize while copying | `ce.copy_(dst, src, fn=ce.Elementwise(scale=..., clamp=(lo, hi)))` |
 | Ragged / CSR segments | `ce.segments(src, dst, src_off, dst_off, length)` |
+| One copy per layer from Python lists of tensors (0.3+) | `ce.copy_many(dsts, srcs)` instead of a `copy_` loop |
 | The same copies every step, same buffers | `plan = eng.freeze()` once, then `plan.run()` (also inside `torch.cuda.graph`) |
 | The same step every iteration, new CUDA index tensors (0.3+) | `step = ce.plan(fn)` once, then `step(*args)`; all buffers are arguments |
 | Copies should overlap compute | `with ce.scope(stream="copy") as h:` ... `h.wait()` before use |

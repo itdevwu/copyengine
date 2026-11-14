@@ -106,6 +106,10 @@ struct Term {
   i64 stride = 0;
   Table table;      // null: no host table
   DeviceTable dev;  // dev.ptr == 0: no device table
+
+  Term() = default;
+  Term(i64 size_, i64 stride_, Table table_ = nullptr, DeviceTable dev_ = {})
+      : size(size_), stride(stride_), table(std::move(table_)), dev(dev_) {}
 };
 
 // offset(i) = base + sum_d term_d(i_d). Tables are concrete runtime values

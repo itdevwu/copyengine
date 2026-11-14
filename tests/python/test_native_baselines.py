@@ -118,3 +118,74 @@ def test_default_engine_still_correct_with_baselines():
         e.copy_(out, ce.lazy(cache).index_select(0, ids).permute(0, 2, 1))
     assert torch.equal(out, cache[torch.tensor(ids, device=dev)].permute(0, 2, 1).half())
     assert "native" in e.stats()["last"]["decisions"][0]["why"] or ran(e) == ["native"]
+
+
+# ---- across devices: the torch baselines move data the way torch needs ----------------
+
+def _rounds(fn, check, n=24):
+    fn(native_only())  # exactly the torch baseline
+    torch.cuda.synchronize()
+    check()
+    e = ce.Engine(tune_trials=1, tune_topk=4)  # explores: baseline and ce strategies
+    for _ in range(n):
+        fn(e)
+        torch.cuda.synchronize()
+        check()
+    return e
+
+
+@pytest.mark.parametrize("to_gpu", [True, False])
+def test_lazy_index_destination_across_devices(to_gpu):
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    dev_s, dev_d = ("cpu", "cuda") if to_gpu else ("cuda", "cpu")
+    src = torch.randn(16, 32, device=dev_s)
+    base = torch.zeros(64, 32, device=dev_d)
+    ids = np.random.permutation(64)[:16]
+    want = torch.zeros(64, 32)
+    want[torch.from_numpy(ids)] = src.cpu()
+    _rounds(lambda e: e.copy_(ce.lazy(base).index_select(0, ids), src),
+            lambda: torch.testing.assert_close(base.cpu(), want, rtol=0, atol=0))
+
+
+@pytest.mark.parametrize("to_gpu", [True, False])
+def test_scatter_and_indices_across_devices(to_gpu):
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    dev_s, dev_d = ("cpu", "cuda") if to_gpu else ("cuda", "cpu")
+    src = torch.randn(8, 16, device=dev_s)
+    dst = torch.zeros(32, 16, device=dev_d)
+    ids = np.random.permutation(32)[:8]
+    want = torch.zeros(32, 16)
+    want[torch.from_numpy(ids)] = src.cpu()
+    _rounds(lambda e: e.scatter_(dst, ids, src, 0),
+            lambda: torch.testing.assert_close(dst.cpu(), want, rtol=0, atol=0))
+    flat_dst = torch.zeros(256, device=dev_d)
+    si, di = np.arange(0, 128, 2), np.random.permutation(256)[:64]
+    want2 = torch.zeros(256)
+    want2[torch.from_numpy(di)] = src.cpu().reshape(-1)[torch.from_numpy(si)]
+    _rounds(lambda e: e.indices(src, flat_dst, si, di),
+            lambda: torch.testing.assert_close(flat_dst.cpu(), want2, rtol=0, atol=0))
+
+
+def test_many_long_segments_use_slices_not_element_indices():
+    # 3584 segments of 64k elements: an element-index baseline would build
+    # tables of 235M entries.
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    n_seg, seg = 512, 1 << 12
+    src = torch.randn(n_seg * seg).pin_memory()
+    dst = torch.zeros(n_seg * seg, device="cuda")
+    perm = np.random.permutation(n_seg)
+    so, do = perm * seg, np.arange(n_seg) * seg
+    want = src.view(n_seg, seg)[torch.from_numpy(perm)].reshape(-1)
+    import copyengine._api as api
+    calls = []
+    real = api._native_flat
+    api._native_flat = lambda *a: calls.append(1) or real(*a)
+    try:
+        _rounds(lambda e: e.segments(src, dst, so, do, np.full(n_seg, seg)),
+                lambda: torch.testing.assert_close(dst.cpu(), want, rtol=0, atol=0), n=12)
+    finally:
+        api._native_flat = real
+    assert not calls

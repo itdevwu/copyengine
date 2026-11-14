@@ -8,6 +8,7 @@
 #include <array>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include <torch/csrc/inductor/aoti_torch/c/shim.h>
 #include <torch/csrc/stable/library.h>
@@ -114,6 +115,13 @@ void copy_with(Tensor dst, Tensor src, int64_t engine, const ce::Elementwise& fn
 }
 
 void copy_(Tensor dst, Tensor src, int64_t engine) { copy_with(std::move(dst), std::move(src), engine, {}); }
+
+// Many pairs in one call (the caller holds a scope open, so they plan together).
+void copy_many_(std::vector<Tensor> dsts, std::vector<Tensor> srcs, int64_t engine) {
+  STD_TORCH_CHECK(dsts.size() == srcs.size(), "[copyengine:0] copy_many: ", dsts.size(), " destinations, ",
+                  srcs.size(), " sources");
+  for (size_t i = 0; i < dsts.size(); ++i) copy_with(dsts[i], srcs[i], engine, {});
+}
 
 void copy_fn_(Tensor dst, Tensor src, int64_t engine, double scale, double bias, bool round, bool clamp, double lo,
               double hi) {
@@ -290,6 +298,7 @@ void gather_meta(Tensor, Tensor, int64_t, Tensor, int64_t) {}
 void scatter_meta(Tensor, Tensor, Tensor, int64_t, int64_t) {}
 
 void copy_meta(Tensor, Tensor, int64_t) {}
+void copy_many_meta(std::vector<Tensor>, std::vector<Tensor>, int64_t) {}
 void copy_fn_meta(Tensor, Tensor, int64_t, double, double, bool, bool, double, double) {}
 
 }  // namespace
@@ -309,6 +318,7 @@ extern "C" __attribute__((visibility("default"))) void copyengine_torch_shutdown
 
 STABLE_TORCH_LIBRARY(copyengine, m) {
   m.def("copy_(Tensor(a!) dst, Tensor src, int engine) -> ()");
+  m.def("copy_many_(Tensor(a!)[] dsts, Tensor[] srcs, int engine) -> ()");
   m.def("gather_(Tensor(a!) out, Tensor src, int dim, Tensor index, int engine) -> ()");
   m.def("scatter_(Tensor(a!) dst, Tensor index, Tensor src, int dim, int engine) -> ()");
   m.def("copy_fn_(Tensor(a!) dst, Tensor src, int engine, float scale, float bias, bool round, bool clamp, "
@@ -318,6 +328,7 @@ STABLE_TORCH_LIBRARY(copyengine, m) {
 STABLE_TORCH_LIBRARY_IMPL(copyengine, CompositeExplicitAutograd, m) {
   m.impl("copy_", TORCH_BOX(&copy_));
   m.impl("copy_fn_", TORCH_BOX(&copy_fn_));
+  m.impl("copy_many_", TORCH_BOX(&copy_many_));
   m.impl("gather_", TORCH_BOX(&gather_));
   m.impl("scatter_", TORCH_BOX(&scatter_));
 }
@@ -325,6 +336,7 @@ STABLE_TORCH_LIBRARY_IMPL(copyengine, CompositeExplicitAutograd, m) {
 STABLE_TORCH_LIBRARY_IMPL(copyengine, Meta, m) {
   m.impl("copy_", TORCH_BOX(&copy_meta));
   m.impl("copy_fn_", TORCH_BOX(&copy_fn_meta));
+  m.impl("copy_many_", TORCH_BOX(&copy_many_meta));
   m.impl("gather_", TORCH_BOX(&gather_meta));
   m.impl("scatter_", TORCH_BOX(&scatter_meta));
 }

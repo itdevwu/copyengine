@@ -6,6 +6,13 @@ change incompatibly only in a new minor (0.x) or major release.
 
 ## Unreleased
 
+- `ce.copy_many(dsts, srcs)`: a list of copies (one per layer, say) in one
+  call into C++, planned together, instead of a Python loop of `copy_`.
+- Fixes: building with CUDA 13 headers (`cuMemcpyBatchAsync` lost a
+  parameter); the torch baselines of explicit copies between host and GPU
+  (`ce.lazy(...).index_select` destinations, `scatter_`, `indices`) moved the
+  data to the wrong device; the baseline of `ce.segments` with many long
+  segments built element-index tables as large as the data (now slices).
 - Copies on one stream no longer wait for the same engine's copies on another
   stream: with `max_sms`, each caller stream gets its own green-context lane,
   and device staging is one buffer per caller stream (up to 8 of each, then

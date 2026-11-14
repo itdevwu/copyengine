@@ -4,6 +4,17 @@ copyengine follows [semantic versioning](https://semver.org). From 0.1.0 on,
 the Python API, the C ABI (`CE_ABI_VERSION`) and the tuning profile format
 change incompatibly only in a new minor (0.x) or major release.
 
+## 0.1.1
+
+- CUDA Graphs: copies issued while a stream is being captured
+  (`torch.cuda.graph`) are recorded and replay correctly, in scopes, through
+  the explicit API and from `FrozenPlan.run()`. During a capture copyengine
+  does not explore, wait, time or allocate: it uses the decided strategy when
+  that only enqueues stream work, else torch's own copy. A copy torch has no
+  equivalent for (a `ce.lazy` gather, `ce.segments`) must run once before
+  capture; otherwise copyengine raises `Unsupported` instead of breaking the
+  capture.
+
 ## 0.1.0
 
 First release.

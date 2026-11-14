@@ -71,6 +71,19 @@ struct Driver {
 #undef CE_CUDA_DECL
 };
 
+// cuMemcpyBatchAsync lost its failIdx parameter in CUDA 13.0: one call site
+// for both header generations (`fail_idx` is left unset by 13.x).
+template <class D, class S, class Z, class A, class I>
+CUresult memcpy_batch(const Driver& d, D dsts, S srcs, Z sizes, size_t count, A attrs, I attr_idxs, size_t n_attrs,
+                      size_t* fail_idx, CUstream st) {
+#if CUDA_VERSION >= 13000
+  (void)fail_idx;
+  return d.cuMemcpyBatchAsync(dsts, srcs, sizes, count, attrs, attr_idxs, n_attrs, st);
+#else
+  return d.cuMemcpyBatchAsync(dsts, srcs, sizes, count, attrs, attr_idxs, n_attrs, fail_idx, st);
+#endif
+}
+
 // Loads and initializes the driver once. Returns null and fills *error on failure.
 const Driver* driver(std::string* error);
 

@@ -46,8 +46,10 @@ target_include_directories(copyengine
     $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/generated>
   PRIVATE src
 )
+option(CE_WERROR "treat compiler warnings as errors (CI)" OFF)
 target_compile_options(copyengine PRIVATE
   $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra -Wpedantic -Werror=return-type>
+  $<$<AND:$<BOOL:${CE_WERROR}>,$<CXX_COMPILER_ID:GNU,Clang>>:-Werror>
   # GCC 13 false positive on std::variant holding std::shared_ptr (core/json.hpp)
   $<$<CXX_COMPILER_ID:GNU>:-Wno-maybe-uninitialized>
 )

@@ -1,11 +1,12 @@
 build_dir := "build/dev"
 # Fast local builds compile kernels for this machine's GPU only; wheels use the full list.
 cuda_archs := env_var_or_default("CE_CUDA_ARCHS", "native")
+werror := env_var_or_default("CE_WERROR", "OFF")
 
 default: test
 
 configure:
-    cmake -S . -B {{build_dir}} -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCE_CUDA_ARCHS={{cuda_archs}}
+    cmake -S . -B {{build_dir}} -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCE_CUDA_ARCHS={{cuda_archs}} -DCE_WERROR={{werror}}
 
 build: configure
     cmake --build {{build_dir}}

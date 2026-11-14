@@ -28,7 +28,36 @@ jobs:
       - uses: taiki-e/install-action@just
       - run: sudo apt-get update && sudo apt-get install -y ninja-build
       - run: pip install scikit-build-core nanobind pytest
-      - run: just test
+      - run: CE_WERROR=ON just test
+
+  # The CUDA backend and kernels against the newest CUDA 13 headers and nvcc
+  # (entry points change shape across majors). Compiles only: CI has no GPU.
+  cuda13:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - name: CUDA 13 headers and nvcc from NVIDIA's wheels
+        run: |
+          pip download -q --no-deps -d /tmp/cu13 'nvidia-cuda-runtime==13.*' 'nvidia-cuda-nvcc==13.*' \
+            'nvidia-cuda-crt==13.*' 'nvidia-nvvm==13.*'
+          for w in /tmp/cu13/*.whl; do python -m zipfile -e "$w" /tmp/cu13/x; done
+          chmod -R +x /tmp/cu13/x/nvidia/cu13/bin /tmp/cu13/x/nvidia/cu13/nvvm/bin
+      - name: Host sources and kernels compile
+        run: |
+          C=/tmp/cu13/x/nvidia/cu13
+          cmake -S . -B build -G Ninja -DCE_CUDA_ARCHS=90 >/dev/null || true
+          for f in src/backends/cuda/*.cpp src/core/frontend.cpp; do
+            g++ -std=c++20 -fsyntax-only -Wall -Wextra -Werror -DCE_WITH_CUDA=1 -DCE_CUDA_KERNELS=1 \
+              -Iinclude -Isrc -Ibuild/generated -isystem $C/include "$f"
+          done
+          $C/bin/nvcc -std=c++17 -O3 --fmad=false -Isrc -Iinclude -Ibuild/generated \
+            -gencode arch=compute_90,code=sm_90 -gencode arch=compute_120,code=sm_120 \
+            -fatbin src/backends/cuda/kernels.cu -o /tmp/kernels.fatbin
 
   # Per torch release: the stable-ABI ops and the interception shim built for
   # it, the whole suite with the shim and again with the Python mode (the same
@@ -107,7 +136,7 @@ jobs:
   # release.
   wheel:
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
-    needs: [core, torch, arm, cross-torch]
+    needs: [core, torch, arm, cross-torch, cuda13]
     strategy:
       fail-fast: false
       matrix:

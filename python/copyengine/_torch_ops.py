@@ -22,12 +22,12 @@ _ERRORS = {
     0: ValueError, 1: _core.NeedsMaterialize, 2: _core.UnsafeCopy, 3: _core.Unsupported, 4: _core.BackendError,
 }
 
-copy_ = copy_fn_ = gather_ = scatter_ = None
+copy_ = copy_fn_ = copy_many_ = gather_ = scatter_ = None
 error = ""  # why the ops are unavailable
 
 
 def _load() -> None:
-    global copy_, copy_fn_, gather_, scatter_, error
+    global copy_, copy_fn_, copy_many_, gather_, scatter_, error
     if torch is None:
         error = "torch is not installed"
         return
@@ -51,6 +51,7 @@ def _load() -> None:
         return
     copy_ = torch.ops.copyengine.copy_.default
     copy_fn_ = torch.ops.copyengine.copy_fn_.default
+    copy_many_ = torch.ops.copyengine.copy_many_.default
     gather_ = torch.ops.copyengine.gather_.default
     scatter_ = torch.ops.copyengine.scatter_.default
 

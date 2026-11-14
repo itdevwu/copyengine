@@ -754,3 +754,26 @@ def test_plan_cache_evicts_least_recently_used():
         assert e.stats()["last"]["plan_cache"] == "hit", k
     assert e.stats()["plans"] <= 4
     assert e.stats()["plan_us"] > 0
+
+
+@pytest.mark.parametrize("dev", ["cpu", "cuda"])
+def test_copy_many_plans_the_pairs_together(dev):
+    torch = pytest.importorskip("torch")
+    if dev == "cuda" and not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    layers = 12
+    host = [torch.randn(16, 64) for _ in range(layers)]
+    if dev == "cuda":
+        host = [h.pin_memory() for h in host]
+    dst = torch.zeros(layers, 16, 64, device=dev)
+    e = ce.Engine()
+    e.copy_many(list(dst), host)
+    assert e.stats()["last"]["ops"] == layers  # one flush for all pairs
+    if dev == "cuda":
+        torch.cuda.synchronize()
+    assert torch.equal(dst.cpu(), torch.stack(host))
+    with pytest.raises(ValueError):
+        e.copy_many(list(dst), host[:-1])
+    arrs = [np.zeros(8, np.float32) for _ in range(3)]
+    e.copy_many(arrs, [np.full(8, float(i), np.float32) for i in range(3)])  # not tensors: pair by pair
+    assert [a[0] for a in arrs] == [0.0, 1.0, 2.0]

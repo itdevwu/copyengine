@@ -144,8 +144,8 @@ Json probe_memcpy_batch(const Dev& x) {
   attr.dstLocHint.type = CU_MEM_LOCATION_TYPE_DEVICE;
   attr.dstLocHint.id = static_cast<int>(x.dev);
   size_t attr_idx = 0, fail_idx = SIZE_MAX;
-  CUresult r = d.cuMemcpyBatchAsync(dsts.data(), srcs.data(), sizes.data(), segs, &attr, &attr_idx,
-                                    1, &fail_idx, x.stream);
+  CUresult r = memcpy_batch(d, dsts.data(), srcs.data(), sizes.data(), segs, &attr, &attr_idx, 1, &fail_idx,
+                            x.stream);
   if (r != CUDA_SUCCESS) {
     std::string why = "cuMemcpyBatchAsync: " + error_name(r);
     if (fail_idx != SIZE_MAX) why += " (failIdx " + std::to_string(fail_idx) + ")";
@@ -288,8 +288,7 @@ Json bench(const Dev& x, bool have_batch) {
       attr.dstLocHint.id = static_cast<int>(x.dev);
       size_t idx = 0, fail_idx = 0;
       double batch = time_s(x, [&] {
-        CE_CU(d.cuMemcpyBatchAsync(dsts.data(), srcs.data(), sizes.data(), count, &attr, &idx, 1,
-                                   &fail_idx, x.stream));
+        CE_CU(memcpy_batch(d, dsts.data(), srcs.data(), sizes.data(), count, &attr, &idx, 1, &fail_idx, x.stream));
       });
       row.set("batch_us", batch * 1e6).set("batch_gbps", bytes / batch / 1e9);
     }

@@ -50,11 +50,13 @@ def test_memory_outside_the_arguments_runs_plainly():
 
     p = ce.Engine().plan(step)
     out = torch.empty(8, 32, device=DEV)
-    for _ in range(60):
+    for _ in range(500):  # until the engine settled and the step was traced
         ids = torch.randperm(64, device=DEV)[:8]
         p(out, ids)
         torch.cuda.synchronize()
         assert torch.equal(out, src[ids])
+        if next(iter(p._layouts.values()))["traces"]:
+            break
     tr = next(iter(p._layouts.values()))["traces"][0]
     assert tr.plain and "not an argument" in tr.plain
 

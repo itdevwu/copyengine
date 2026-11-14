@@ -211,6 +211,7 @@ class CudaExecutor final : public Executor {
     }
     for (size_t i = 0; i < devs_.size(); ++i) {
       Dev& s = devs_[i];
+      if (s.light_ctx) d_->cuDevicePrimaryCtxRelease(s.light_dev);
       if (!s.init) continue;
       d_->cuCtxPushCurrent(s.ctx);
       for (Slot& sl : s.slots) {
@@ -370,16 +371,25 @@ class CudaExecutor final : public Executor {
     }
   }
 
-  // A stream handle names its own context; stream 0 is each device's legacy
-  // stream, so it is synchronized on every device in use.
-  void sync(std::span<const uintptr_t> streams) override {
-    bool first = true;
-    for (Dev& s : devs_) {
-      if (!s.init) continue;
-      Push push(*d_, s.ctx);
-      for (uintptr_t st : streams)
-        if (st == 0 || first) check(d_->cuStreamSynchronize(reinterpret_cast<CUstream>(st)), "cuStreamSynchronize");
-      first = false;
+  // A device's primary context without setting the device up (retained once).
+  CUcontext primary_ctx(int dev) {
+    Dev& s = devs_[dev];
+    if (s.init) return s.ctx;
+    if (!s.light_ctx) {
+      check(d_->cuDeviceGet(&s.light_dev, dev), "cuDeviceGet");
+      check(d_->cuDevicePrimaryCtxRetain(&s.light_ctx, s.light_dev), "cuDevicePrimaryCtxRetain");
+    }
+    return s.light_ctx;
+  }
+
+  // Each stream on the context of its device; stream 0 is that device's legacy stream.
+  void sync(std::span<const std::pair<uintptr_t, int>> streams) override {
+    for (const auto& [st, dev] : streams) {
+      // The device's primary context (torch's too), set up here or not: work
+      // left to the framework never set the device up, and must be waited for.
+      if (dev < 0 || dev >= static_cast<int>(devs_.size())) continue;
+      Push push(*d_, primary_ctx(dev));
+      check(d_->cuStreamSynchronize(reinterpret_cast<CUstream>(st)), "cuStreamSynchronize");
     }
     for (Dev& s : devs_) {  // the work is done: report device-index errors it found
       if (!s.init || !(s.err_armed || s.err_graphs)) continue;
@@ -541,6 +551,8 @@ class CudaExecutor final : public Executor {
     DevMem err;               // set by kernels that meet an out-of-range device index
     bool err_armed = false;   // such kernels ran since the last check
     bool err_graphs = false;  // ... or were captured: graph replays may set it at any time
+    CUcontext light_ctx{};    // primary context retained only to synchronize (device not set up)
+    CUdevice light_dev{};
     DevMem capture_arena;     // bases recorded by CUDA graph captures (see captured_bases)
     size_t capture_arena_bytes = 0, capture_used = 0;
     // Bandwidth limit: the pacing words (the next start time per direction,

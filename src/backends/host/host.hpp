@@ -44,7 +44,7 @@ class HostExecutor final : public Executor {
   explicit HostExecutor(int threads);
   std::vector<Strategy> candidates(const Group& g) override;
   int64_t run(Strategy s, const Group& g, const std::vector<Op>& ops, uintptr_t stream) override;
-  void sync(std::span<const uintptr_t>) override {}
+  void sync(std::span<const std::pair<uintptr_t, int>>) override {}
   bool async() const override { return false; }
 
  private:

@@ -158,7 +158,7 @@ struct Engine::Impl {
   std::string cuda_error;
   // Streams with issued, unfinished CUDA work, and whether any of it touches
   // host memory (only then must the host wait before returning or reading).
-  std::vector<uintptr_t> cuda_streams;
+  std::vector<std::pair<uintptr_t, int>> cuda_streams;  // (stream, device) with work synchronize() waits for
   std::vector<std::pair<uintptr_t, int>> pending_at;  // (stream, device) with pending work, for mark_pending
   std::unordered_map<int64_t, std::vector<int64_t>> tokens;  // mark_pending token -> executor marks
   int64_t next_token = 0;
@@ -434,8 +434,9 @@ struct Engine::Impl {
   void note_pending(const Side& s, const Side& d, uintptr_t strm, bool host_wait) {
     if (capturing) return;  // the graph's work, not the engine's
     if (s.device.kind == DeviceKind::host && d.device.kind == DeviceKind::host) return;
-    if (std::find(cuda_streams.begin(), cuda_streams.end(), strm) == cuda_streams.end()) cuda_streams.push_back(strm);
     const int dev = s.device.kind == DeviceKind::cuda ? s.device.index : d.device.index;
+    if (std::find(cuda_streams.begin(), cuda_streams.end(), std::make_pair(strm, dev)) == cuda_streams.end())
+      cuda_streams.emplace_back(strm, dev);
     if (std::find(pending_at.begin(), pending_at.end(), std::make_pair(strm, dev)) == pending_at.end())
       pending_at.emplace_back(strm, dev);
     if (host_wait && (s.device.kind == DeviceKind::host || d.device.kind == DeviceKind::host)) host_pending = true;

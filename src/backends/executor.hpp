@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <span>
+#include <utility>
 #include <vector>
 
 #include "copyengine/engine.hpp"
@@ -19,7 +20,10 @@ class Executor {
   // Issues the copy on `stream`; returns the number of backend calls made.
   virtual int64_t run(Strategy s, const Group& g, const std::vector<Op>& ops, uintptr_t stream) = 0;
   // Blocks until everything issued on these streams is done.
-  virtual void sync(std::span<const uintptr_t> streams) = 0;
+  // Each (stream, device) the work ran on; the device names the context of a
+  // legacy stream (0), even one this backend never set up itself (work it
+  // left to the framework).
+  virtual void sync(std::span<const std::pair<uintptr_t, int>> streams) = 0;
   // Whether run() may return before the copy is complete.
   virtual bool async() const = 0;
   // Timing without blocking: mark() records a point on `stream` of `device`'s

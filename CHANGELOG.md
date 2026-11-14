@@ -4,6 +4,13 @@ copyengine follows [semantic versioning](https://semver.org). From 0.1.0 on,
 the Python API, the C ABI (`CE_ABI_VERSION`) and the tuning profile format
 change incompatibly only in a new minor (0.x) or major release.
 
+## Unreleased
+
+- CUDA index tensors stay on the GPU in `ce.gather`, `ce.scatter_` and
+  `ce.lazy(...).index_select`: the statement kernel reads them (no device
+  synchronization), and new indices reuse the same plan. Out-of-range indices
+  are skipped and raise `ValueError` at the next `synchronize()`.
+
 ## 0.2.0
 
 - FP8 dtypes: `float8_e4m3fn`, `float8_e5m2`, `float8_e8m0fnu`, converted to

@@ -70,6 +70,17 @@ Hash128 fingerprint(const Op& op) {
   h.add(op.runs().src);
   h.add(op.runs().dst);
   h.add(op.runs().len);
+  if (op.opaque) {  // the structure, not this call's table pointers: new indices hit the same plan
+    const Form& f = *op.form;
+    h.add(static_cast<uint64_t>(op.dst_lo));
+    h.add(static_cast<uint64_t>(op.dst_hi));
+    h.add(static_cast<uint64_t>(f.rank));
+    for (int k = 0; k < f.rank; ++k)
+      h.add(static_cast<uint64_t>(f.shape[k])), h.add(static_cast<uint64_t>(f.ss[k])), h.add(static_cast<uint64_t>(f.ds[k]));
+    for (i64 v : {f.s_base, f.d_base, static_cast<i64>(f.stab_dim), static_cast<i64>(f.dtab_dim), f.stab_step,
+                  f.dtab_step, f.sbound, f.dbound})
+      h.add(static_cast<uint64_t>(v));
+  }
   return h.done();
 }
 
@@ -83,8 +94,16 @@ static std::pair<i64, i64> extent_of(i64 base, const std::array<i64, Form::kMaxR
   return {lo, hi};
 }
 
-std::pair<i64, i64> Form::src_extent() const { return extent_of(s_base, shape, ss, rank); }
-std::pair<i64, i64> Form::dst_extent() const { return extent_of(d_base, shape, ds, rank); }
+std::pair<i64, i64> Form::src_extent() const {
+  auto sh = shape;
+  if (stab_dim >= 0) sh[stab_dim] = sbound;  // any index within its bound
+  return extent_of(s_base, sh, ss, rank);
+}
+std::pair<i64, i64> Form::dst_extent() const {
+  auto sh = shape;
+  if (dtab_dim >= 0) sh[dtab_dim] = dbound;
+  return extent_of(d_base, sh, ds, rank);
+}
 
 // ---- safety ----------------------------------------------------------------------
 
@@ -95,12 +114,22 @@ const Runs& Op::runs() const {
 
 const Intervals& Op::read() const {
   const Runs& r = runs();
+  if (opaque && !body->rd) {  // the whole allocation: the indices are not known on the host
+    auto iv = std::make_unique<Intervals>();
+    iv->start.push_back(src_lo), iv->end.push_back(src_hi);
+    body->rd = std::move(iv);
+  }
   if (!body->rd) body->rd = std::make_unique<Intervals>(interval_union(r.src, r.len, itemsize(src.dtype)));
   return *body->rd;
 }
 
 const Intervals& Op::write() const {
   const Runs& r = runs();
+  if (opaque && !body->wr) {
+    auto iv = std::make_unique<Intervals>();
+    iv->start.push_back(dst_lo), iv->end.push_back(dst_hi);
+    body->wr = std::move(iv);
+  }
   if (!body->wr) body->wr = std::make_unique<Intervals>(interval_union(r.dst, r.len, itemsize(dst.dtype)));
   return *body->wr;
 }
@@ -133,7 +162,7 @@ std::vector<int> waves(const std::vector<Op>& ops) {
   std::map<std::pair<int, int>, std::vector<Item>> by_dev;
   for (int k = 0; k < n; ++k) {
     const Op& op = ops[k];
-    if (op.runs().empty()) continue;
+    if (op.runs().empty() && !op.opaque) continue;
     auto& r = by_dev[{int(op.src.device.kind), op.src.device.index}];
     const Intervals& rd = op.read();
     for (size_t i = 0; i < rd.start.size(); ++i) r.push_back({rd.start[i], rd.end[i], k, false});
@@ -199,6 +228,7 @@ Plan build_plan(const std::vector<Op>& ops) {
       }
       it->ops.push_back(k);
       it->runs.append(op.runs());
+      if (op.opaque) it->opaque_elems += op.form->numel;
     }
     for (Group& g : groups) {
       const i64 ss = static_cast<i64>(itemsize(g.src.dtype)), ds = static_cast<i64>(itemsize(g.dst.dtype));
@@ -226,7 +256,7 @@ Plan build_plan(const std::vector<Op>& ops) {
         for (int k : g.ops) g.forms.push_back(ops[k].form);
       g.runs = g.runs.coalesce(g.src_cuts, g.dst_cuts);
       g.rects = recover_2d(g.runs, 2, g.src_cuts, g.dst_cuts);
-      if (!g.runs.empty()) plan.groups.push_back(std::move(g));
+      if (!g.runs.empty() || g.opaque_elems) plan.groups.push_back(std::move(g));
     }
   }
   return plan;

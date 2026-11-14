@@ -82,6 +82,10 @@ struct StmtDesc {
   unsigned shape[6];
   unsigned magic[6], shift[6];  // division by shape[k] as multiply + shift (see kernels.cu)
   long long ss[6], ds[6];
+  // device index tables (Base::stab / dtab): dimension, step and bound per side; -1: none
+  int stab_dim, dtab_dim;
+  long long stab_step, dtab_step, sbound, dbound;
+  unsigned long long err;  // device word set when an index is out of its bound
 };
 
 // Magic number and shift such that n / d == (umulhi(n, magic) + n) >> shift
@@ -95,6 +99,7 @@ void int_divider(unsigned d, unsigned* magic, unsigned* shift) {
 
 struct Base {
   long long src, dst;
+  unsigned long long stab, dtab;  // this statement's device index tables (0: none)
 };
 
 struct FusedBatch {
@@ -103,6 +108,10 @@ struct FusedBatch {
   i64 link_size = 1;  // itemsize of the side that lives in staging (cross-device only)
   std::vector<Base> bases;
   std::shared_ptr<void> table;  // the bases, resident on the device (set on first run)
+  // Device index tables: their pointers change per call, so the bases go to
+  // the device each call; members[i]: position in the group of bases[i].
+  bool device_tables = false;
+  std::vector<int> members;
 };
 
 // Structured statements grouped by structure; for cross-device groups the
@@ -215,6 +224,7 @@ class CudaExecutor final : public Executor {
       }
       if (s.staging_used) d_->cuEventSynchronize(s.staging_done);
       dev_free(s, s.staging);
+      dev_free(s, s.err);
       if (s.ev_free) d_->cuEventDestroy(s.ev_free);
       for (CUevent e : {s.ev_in, s.ev_out, s.staging_done})
         if (e) d_->cuEventDestroy(e);
@@ -228,6 +238,12 @@ class CudaExecutor final : public Executor {
   std::vector<Strategy> candidates(const Group& g) override {
     const int di = device_of(g);
     Dev& s = state(di);
+    if (g.opaque()) {  // device indices: only the statement kernel can run it
+      if (!s.kernels || !fused_plan(g).ok)
+        fail(Errc::unsupported, "copies with device indices need the statement kernel: " +
+                                    (s.kernels ? std::string("this layout is not supported") : s.kernel_error));
+      return {Strategy::fused};
+    }
     const bool src_cuda = g.src.device.kind == DeviceKind::cuda, dst_cuda = g.dst.device.kind == DeviceKind::cuda;
     const bool same_dev = src_cuda && dst_cuda && g.src.device.index == g.dst.device.index;
     const size_t rects = g.rects.size();
@@ -284,15 +300,17 @@ class CudaExecutor final : public Executor {
     const bool on_device = g.src.device.kind == DeviceKind::cuda && g.dst.device.kind == DeviceKind::cuda &&
                            g.src.device.index == g.dst.device.index;
     switch (strat) {
-      case Strategy::runs: return g.pure() && src_ok && dst_ok;  // plain DMA calls
-      case Strategy::passthrough: return g.pure() && src_ok && dst_ok;
+      case Strategy::runs: return !g.opaque() && g.pure() && src_ok && dst_ok;  // plain DMA calls
+      case Strategy::passthrough: return !g.opaque() && g.pure() && src_ok && dst_ok;
       case Strategy::kernel: return on_device && g.exec_cache[static_cast<int>(Strategy::kernel)] != nullptr;
       case Strategy::fused: {
         const auto& slot = g.exec_cache[static_cast<int>(Strategy::fused)];
         if (!on_device || !slot) return false;
         const auto& P = *static_cast<const FusedPlan*>(slot.get());
-        return P.ok && !P.cross &&
-               std::all_of(P.batches.begin(), P.batches.end(), [](const FusedBatch& b) { return b.table != nullptr; });
+        // Device tables upload their bases each call (the upload ring waits on the host): not yet.
+        return P.ok && !P.cross && std::all_of(P.batches.begin(), P.batches.end(), [](const FusedBatch& b) {
+                 return b.table != nullptr && !b.device_tables;
+               });
       }
       default: return false;  // staging, bounce buffers, batch descriptors: allocate or wait on the host
     }
@@ -312,7 +330,7 @@ class CudaExecutor final : public Executor {
       case Strategy::kernel: return kernel(s, g, st);
       case Strategy::staged: return staged(s, g, st);
       case Strategy::bounce: return bounce(s, g.src, g.dst, cached_rows(g, Strategy::bounce), st);
-      case Strategy::fused: return fused(s, g, st);
+      case Strategy::fused: return fused(s, g, ops, st);
       default: fail(Errc::unsupported, "CUDA backend cannot run strategy " + std::string(strategy_name(strat)));
     }
   }
@@ -327,6 +345,19 @@ class CudaExecutor final : public Executor {
       for (uintptr_t st : streams)
         if (st == 0 || first) check(d_->cuStreamSynchronize(reinterpret_cast<CUstream>(st)), "cuStreamSynchronize");
       first = false;
+    }
+    for (Dev& s : devs_) {  // the work is done: report device-index errors it found
+      if (!s.init || !s.err_armed) continue;
+      Push push(*d_, s.ctx);
+      s.err_armed = false;
+      unsigned long long flag = 0;
+      check(d_->cuMemcpyDtoHAsync(&flag, s.err.ptr, 8, s.side), "cuMemcpyDtoHAsync");
+      check(d_->cuStreamSynchronize(s.side), "cuStreamSynchronize");
+      if (flag) {
+        check(d_->cuMemsetD8Async(s.err.ptr, 0, 8, s.side), "cuMemsetD8Async");
+        check(d_->cuStreamSynchronize(s.side), "cuStreamSynchronize");
+        fail(Errc::invalid_argument, "a device index table held an index out of range (those elements were skipped)");
+      }
     }
   }
 
@@ -449,7 +480,18 @@ class CudaExecutor final : public Executor {
     std::vector<uintptr_t> streams;
     bool many_streams = false;
     CUevent ev_free{};
+    DevMem err;               // set by kernels that meet an out-of-range device index
+    bool err_armed = false;   // such kernels ran since the last check
   };
+
+  CUdeviceptr error_word(Dev& s) {
+    if (!s.err.ptr) {
+      s.err = dev_alloc(s, 8, "error word");
+      check(d_->cuMemsetD8Async(s.err.ptr, 0, 8, s.side), "cuMemsetD8Async");
+      check(d_->cuStreamSynchronize(s.side), "cuStreamSynchronize");
+    }
+    return s.err.ptr;
+  }
   static constexpr size_t kMaxStreams = 32;
 
   DevMem dev_alloc(Dev& s, size_t bytes, const char* what) {
@@ -1034,6 +1076,7 @@ class CudaExecutor final : public Executor {
   static int vector_width(const FusedBatch& b, long long dadd) {
     const StmtDesc& d = b.desc;
     if (d.rank == 0 || d.ds[d.rank - 1] != 1 || b.tile_a >= 0) return 1;
+    if (d.stab_dim == d.rank - 1 || d.dtab_dim == d.rank - 1) return 1;  // indices, not consecutive elements
     const int dsz = static_cast<int>(itemsize(static_cast<DType>(d.ddt)));
     for (int v = 16 / dsz; v >= 2; v /= 2) {
       if (d.shape[d.rank - 1] % v != 0) continue;
@@ -1055,19 +1098,24 @@ class CudaExecutor final : public Executor {
     if (da >= 0 && sb >= 0 && da != sb && f.shape[da] >= 32 && f.shape[sb] >= 32) *a = da, *b = sb;  // full tiles only
   }
 
-  void launch_stmt(const DevTable& table, const FusedBatch& batch, const cv::Fn& fn, long long sadd, long long dadd,
-                   Dev& s, CUstream st) {
-    if (table.count == 0) return;
+  // `table`: `count` Base entries in device memory.
+  void launch_stmt(CUdeviceptr table, size_t count_, const FusedBatch& batch, const cv::Fn& fn, long long sadd,
+                   long long dadd, Dev& s, CUstream st) {
+    if (count_ == 0) return;
     const StmtDesc& desc = batch.desc;
     const bool tiled = batch.tile_a >= 0;
     CUfunction f = tiled ? function(s, "ce_stmt_tile") : find_function(s, stmt_kernel(desc));
     if (!f) f = function(s, "ce_stmt");
-    CUdeviceptr t = table.ptr;
+    CUdeviceptr t = table;
     StmtDesc dcopy = desc;
+    if (desc.stab_dim >= 0 || desc.dtab_dim >= 0) {
+      dcopy.err = static_cast<unsigned long long>(error_word(s));
+      s.err_armed = true;
+    }
     cv::Fn fcopy = fn;
     if (tiled) {
       const long long sa = desc.shape[batch.tile_a], sb = desc.shape[batch.tile_b];
-      long long count = static_cast<long long>(table.count) * (static_cast<long long>(desc.numel) / (sa * sb));
+      long long count = static_cast<long long>(count_) * (static_cast<long long>(desc.numel) / (sa * sb));
       int a = batch.tile_a, b = batch.tile_b;
       void* args[] = {&t, &count, &dcopy, &fcopy, &a, &b, &sadd, &dadd};
       const long long tiles = ((sb + 31) / 32) * ((sa + 31) / 32);
@@ -1075,7 +1123,7 @@ class CudaExecutor final : public Executor {
       const unsigned gz = static_cast<unsigned>(std::min<long long>(count, 65535));
       run_kernel(s, f, {gx, 1, gz}, {32, 8, 1}, args, st, "ce_stmt_tile");
     } else {
-      long long count = static_cast<long long>(table.count);
+      long long count = static_cast<long long>(count_);
       void* args[] = {&t, &count, &dcopy, &fcopy, &sadd, &dadd};
       const unsigned threads = 256;
       const unsigned per = (desc.numel + desc.vec - 1) / desc.vec;
@@ -1112,15 +1160,21 @@ class CudaExecutor final : public Executor {
           int_divider(b.desc.shape[k], &b.desc.magic[k], &b.desc.shift[k]);
         }
         b.link_size = static_cast<i64>(itemsize(P.h2d ? f.sdt : f.ddt));
-        transpose_dims(f, &b.tile_a, &b.tile_b);
+        b.desc.stab_dim = f.stab_dim, b.desc.dtab_dim = f.dtab_dim;
+        b.desc.stab_step = f.stab_step, b.desc.dtab_step = f.dtab_step;
+        b.desc.sbound = f.sbound, b.desc.dbound = f.dbound;
+        b.desc.err = 0;
+        b.device_tables = f.device_tables();
+        if (!b.device_tables) transpose_dims(f, &b.tile_a, &b.tile_b);
         b.desc.vec = 1;
         P.batches.push_back(std::move(b));
       }
       batch_of[i] = j;
-      P.batches[j].bases.push_back({f.s_base, f.d_base});
+      P.batches[j].bases.push_back({f.s_base, f.d_base, 0, 0});
+      P.batches[j].members.push_back(static_cast<int>(i));
     }
     if (!P.cross) {
-      for (FusedBatch& b : P.batches) b.desc.vec = vector_width(b, 0);
+      for (FusedBatch& b : P.batches) b.desc.vec = vector_width(b, 0);  // 1 when a table dimension is innermost
       P.ok = true;
       return P;
     }
@@ -1186,12 +1240,13 @@ class CudaExecutor final : public Executor {
 
   // Short runs are where evaluating the statement beats copying runs.
   bool fused_worthwhile(const Group& g) const {
+    if (g.opaque()) return fused_plan(g).ok;  // its only way to run
     if (g.forms.empty() || g.runs.empty()) return false;
     const i64 avg = g.runs.total() / static_cast<i64>(g.runs.size());  // bytes for pure groups, else elements
     return avg < (g.pure() ? 256 : 64) && fused_plan(g).ok;
   }
 
-  int64_t fused(Dev& s, const Group& g, CUstream st) {
+  int64_t fused(Dev& s, const Group& g, const std::vector<Op>& ops, CUstream st) {
     const FusedPlan& P = fused_plan(g);
     if (!P.ok) fail(Errc::unsupported, "fused strategy is not applicable to this group");
     const cv::Fn fn = to_cv(g.fn);
@@ -1206,11 +1261,24 @@ class CudaExecutor final : public Executor {
       if (P.h2d) copy_raws(s, host_side, dev_side, raws, st);
     }
     for (const FusedBatch& b : P.batches) {
-      auto& table = const_cast<FusedBatch&>(b).table;
-      if (!table) table = resident(s, b.bases);
       // Cross-device: the link side's indices are relative to the staging base.
       const long long add = P.cross ? static_cast<long long>(stg) / b.link_size : 0;
-      launch_stmt(*static_cast<DevTable*>(table.get()), b, fn, P.h2d ? add : 0, P.h2d ? 0 : add, s, st);
+      if (b.device_tables) {  // this call's table pointers: the bases go up each call
+        std::vector<Base> bases = b.bases;
+        for (size_t i = 0; i < bases.size(); ++i) {
+          const Op& op = ops[g.ops[b.members[i]]];
+          bases[i].stab = op.stab, bases[i].dtab = op.dtab;
+        }
+        Slot& sl = upload(s, bases.data(), bases.size() * sizeof(Base), st);
+        launch_stmt(sl.dev.ptr, bases.size(), b, fn, P.h2d ? add : 0, P.h2d ? 0 : add, s, st);
+        check(d_->cuEventRecord(sl.done, st), "cuEventRecord");
+        sl.used = true;
+        continue;
+      }
+      auto& table = const_cast<FusedBatch&>(b).table;
+      if (!table) table = resident(s, b.bases);
+      const auto& t = *static_cast<DevTable*>(table.get());
+      launch_stmt(t.ptr, t.count, b, fn, P.h2d ? add : 0, P.h2d ? 0 : add, s, st);
     }
     if (P.cross) {
       if (!P.h2d) copy_raws(s, dev_side, host_side, raws, st);

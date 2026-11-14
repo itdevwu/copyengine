@@ -73,6 +73,9 @@ class Lazy:
         return self.permute(p)
 
     def index_select(self, dim: int, index):
+        t = device_table(index)
+        if t is not None:  # stays on the GPU: the copy kernel reads it
+            return self._with(select_device(self._access, dim, t), ("index_select", dim, t))
         idx = index_array(index)
         return self._with(self._access.index_select(dim, idx), ("index_select", dim, idx))
 
@@ -101,9 +104,28 @@ class Lazy:
         return View(b.obj, b.endpoint, self._access, b.is_cuda, b.device_index)
 
 
-def device_index(idx: np.ndarray, device) -> "torch.Tensor":
+def device_table(index):
+    """A CUDA index tensor as a 1-D contiguous int64 tensor on its GPU (no
+    sync, nothing leaves the device), or None for host indices."""
+    if not (is_tensor(index) and index.is_cuda):
+        return None
+    if index.dim() > 1:
+        raise ValueError("index must be 0-D or 1-D")
+    t = index.detach().reshape(-1)
+    if t.dtype != torch.int64:
+        t = t.to(torch.int64)
+    return t.contiguous()
+
+
+def select_device(access, dim: int, t):
+    return access.index_select_device(dim, t.data_ptr(), t.numel(), t.device.index)
+
+
+def device_index(idx, device) -> "torch.Tensor":
     """`idx` as an int64 tensor on `device`, sent from pinned memory without
     making the host wait (what a torch user would do with host indices)."""
+    if is_tensor(idx):  # a device table: already there
+        return idx.to(device, non_blocking=True)
     t = torch.from_numpy(idx)
     if device.type == "cuda":
         return t.pin_memory().to(device, non_blocking=True)

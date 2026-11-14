@@ -220,9 +220,12 @@ fastest.
   CUDA graph capture this is a fork, and `h.wait()` the join. Copies
   copyengine leaves to torch (for example a float-to-int cast) keep torch's
   own semantics.
-- Index tensors (`ce.lazy(...).index_select`, `ce.gather`, `ce.scatter_`) are
-  read on the host: a CUDA index tensor costs one device synchronization per
-  call. Pass host indices on hot paths.
+- Index tensors (`ce.lazy(...).index_select`, `ce.gather`, `ce.scatter_`) may
+  be host or CUDA tensors. CUDA indices stay on the GPU: the copy kernel reads
+  them, so the host never waits and new indices reuse the same plan. An
+  out-of-range CUDA index skips that element and raises `ValueError` at the
+  next `synchronize()`; duplicate CUDA scatter indices are not detected
+  (undefined, as in torch's `index_copy_`).
 - Each destination element must be written once per copy: duplicate scatter
   indices and a source overlapping its own destination raise `UnsafeCopy` in
   the explicit API (an intercepted `copy_` leaves those to torch).

@@ -195,6 +195,8 @@ NB_MODULE(_core, m) {
         auto t = i64_arg(idx);
         return a.index_select(dim, t.span());
       })
+      .def("index_select_device", &ce::Access::index_select_device, "dim"_a, "ptr"_a, "n"_a, "device"_a,
+           "index_select whose int64 indices stay in device memory at `ptr` (read by the copy kernel)")
       .def("unsqueeze", &ce::Access::unsqueeze)
       .def("expand", &ce::Access::expand)
       .def("reshape", [](const ce::Access& a, const std::vector<i64>& s) { return a.reshape(s); })

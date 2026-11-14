@@ -50,11 +50,18 @@ struct Form {
   std::array<i64, kMaxRank> shape{}, ss{}, ds{};
   i64 s_base = 0, d_base = 0;
   DType sdt = DType::u8, ddt = DType::u8;
+  // At most one dimension per side may read a device index table (its
+  // pointer is per call: Op::stab / Op::dtab); -1: none.
+  int stab_dim = -1, dtab_dim = -1;
+  i64 stab_step = 1, dtab_step = 1, sbound = 0, dbound = 0;
+  bool device_tables() const { return stab_dim >= 0 || dtab_dim >= 0; }
   // Lowest / highest element index touched on each side.
   std::pair<i64, i64> src_extent() const;
   std::pair<i64, i64> dst_extent() const;
   bool same_structure(const Form& o) const {
-    return rank == o.rank && shape == o.shape && ss == o.ss && ds == o.ds && sdt == o.sdt && ddt == o.ddt;
+    return rank == o.rank && shape == o.shape && ss == o.ss && ds == o.ds && sdt == o.sdt && ddt == o.ddt &&
+           stab_dim == o.stab_dim && dtab_dim == o.dtab_dim && stab_step == o.stab_step &&
+           dtab_step == o.dtab_step && sbound == o.sbound && dbound == o.dbound;
   }
 };
 
@@ -79,6 +86,11 @@ struct Op {
   double enqueue_us = 0;           // host time spent submitting it
   bool host_async = false;         // Hints::host_async
   int64_t weight = 1;              // runs this op stands for in online sampling (see Impl::native_now)
+  uintptr_t stab = 0, dtab = 0;    // device index tables of form->stab_dim / dtab_dim, this call's
+  // A statement with device tables has no runs (its indices are not known on
+  // the host): `form` is its only executable description, and its footprint
+  // is its whole source / destination allocation.
+  bool opaque = false;
   std::shared_ptr<const Form> form;  // null when the statement has tables or came in as runs
   Hash128 fp;  // content fingerprint
   // byte-interval read / write sets (absolute addresses), computed lazily
@@ -103,6 +115,8 @@ struct Group {
   std::vector<int> ops;  // indices into the flushed queue (original order)
   Runs runs;             // merged, coalesced
   int64_t op_runs = 0;   // runs of the ops as submitted: what passthrough issues
+  int64_t opaque_elems = 0;  // elements of ops without runs (device tables): only their forms can run them
+  bool opaque() const { return opaque_elems > 0; }
   Rects rects;           // structure recovered from runs
   // Allocation boundaries on each side, in run units: one copy call never
   // crosses them (separate allocations, even adjacent ones, are not one range
@@ -123,7 +137,7 @@ struct Group {
   bool pure() const { return fn.identity() && src.dtype == dst.dtype; }
   // Cached: a plan's groups never change, and runs can be millions long.
   int64_t bytes() const {
-    if (bytes_ < 0) bytes_ = runs.total() * static_cast<int64_t>(itemsize(src.dtype));
+    if (bytes_ < 0) bytes_ = (runs.total() + opaque_elems) * static_cast<int64_t>(itemsize(src.dtype));
     return bytes_;
   }
 

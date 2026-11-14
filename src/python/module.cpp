@@ -257,6 +257,7 @@ NB_MODULE(_core, m) {
       .def_rw("allow_async", &ce::EngineOptions::allow_async)
       .def_rw("sync_always", &ce::EngineOptions::sync_always)
       .def_rw("max_sms", &ce::EngineOptions::max_sms)
+      .def_rw("bandwidth", &ce::EngineOptions::bandwidth)
       .def_rw("disable", &ce::EngineOptions::disable)
       .def_rw("log_plan", &ce::EngineOptions::log_plan)
       .def_rw("host_threads", &ce::EngineOptions::host_threads)
@@ -338,7 +339,8 @@ NB_MODULE(_core, m) {
         nb::gil_scoped_release release;
         e.fence(r, w);
       }, "reads"_a, "writes"_a)
-      .def("begin_scope", nb::overload_cast<bool>(&ce::Engine::begin_scope), "host_async"_a = false)
+      .def("begin_scope", nb::overload_cast<bool, double>(&ce::Engine::begin_scope), "host_async"_a = false,
+           "bandwidth"_a = 0.0)
       .def("end_scope", &ce::Engine::end_scope, nb::call_guard<nb::gil_scoped_release>())
       .def("flush", &ce::Engine::flush, nb::call_guard<nb::gil_scoped_release>())
       .def("synchronize", &ce::Engine::synchronize, nb::call_guard<nb::gil_scoped_release>())

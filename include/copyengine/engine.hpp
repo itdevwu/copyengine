@@ -21,8 +21,9 @@ enum class Strategy : uint8_t {
   bounce,         // CUDA: pageable host side packed through pinned buffers on the CPU
   fused,          // CUDA: structured statements (strides, broadcast) evaluated by one kernel
   native,         // each op through the frontend's own implementation (torch's copy_): the baseline
+  paced,          // CUDA: a bandwidth-limited group in chunks, a GPU pacing kernel before each (QoS)
 };
-inline constexpr int kNumStrategies = 9;
+inline constexpr int kNumStrategies = 10;
 std::string_view strategy_name(Strategy s);
 Strategy parse_strategy(std::string_view name);
 
@@ -48,6 +49,9 @@ struct EngineOptions {
   // start), else by launching at most this many thread blocks. DMA copies use
   // the copy engines, not SMs, and are not limited.
   int max_sms = 0;
+  // Copies touching a GPU run at most this many bytes per second (0: no
+  // limit), paced on the GPU; a scope's own limit (begin_scope) overrides it.
+  double bandwidth = 0;
   bool disable = false;                  // every op natively, else as submitted (CE_DISABLE)
   bool log_plan = false;                 // print plans to stderr (CE_LOG=plan)
   int host_threads = 0;                  // 0: min(hardware threads, 8)
@@ -101,6 +105,10 @@ class Engine {
   // non_blocking: buffers stay alive until the GPU is done (Python's
   // scope(stream=...)). Scopes nest; one async scope makes its inner ones async.
   void begin_scope(bool host_async);
+  // `bandwidth` > 0: copies queued in this scope (and inner scopes without
+  // their own limit) run at most this many bytes per second, per GPU and
+  // direction, as a paced background transfer instead of at full speed.
+  void begin_scope(bool host_async, double bandwidth);
   // Flushes at depth 0. Copies are ordered on the caller's stream; the call
   // waits only when host memory is involved (unless allow_async).
   void end_scope();

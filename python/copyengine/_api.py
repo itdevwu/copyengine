@@ -144,6 +144,16 @@ def _flat_payload(dst, src, fn):
     return dst.dtype == src.dtype or (dst.dtype in _FLOATS and src.dtype != torch.bool)
 
 
+def _bandwidth(b) -> float:
+    """A bandwidth limit in bytes per second (None or 0: none)."""
+    if b is None:
+        return 0.0
+    b = float(b)
+    if not b >= 0 or b == float("inf"):
+        raise ValueError(f"bandwidth must be a finite number of bytes per second >= 0, got {b!r}")
+    return b
+
+
 class Engine:
     """A lazy copy queue.
 
@@ -161,12 +171,14 @@ class Engine:
                  tune_topk: int = 3, ab_pairs: int = 20, ab_max_pairs: int = 50, online_every: int = 64,
                  allow_async: bool = False,
                  host_threads: int = 0, disable: bool = False, prior_only: bool = False, max_sms: int = 0,
-                 _intercept: Optional[str] = None):
+                 bandwidth: Optional[float] = None, _intercept: Optional[str] = None):
         """``explore=False`` uses only a loaded profile (uncovered buckets take the
         baseline). ``max_sms`` bounds the SMs copy kernels may occupy per GPU (see
         ``stats()["cuda"]`` for whether it is enforced by a green context or by
-        capping thread blocks). ``prior_only`` is for tests: always the prior's
-        first strategy, no measurement and no no-regression guarantee."""
+        capping thread blocks). ``bandwidth`` (bytes per second) limits every copy
+        that touches a GPU, as :meth:`scope` does per scope. ``prior_only`` is for
+        tests: always the prior's first strategy, no measurement and no
+        no-regression guarantee."""
         o = _core.EngineOptions()
         o.staging_budget = int(staging_budget_mb) << 20
         o.explore = explore
@@ -180,6 +192,7 @@ class Engine:
         o.host_threads = host_threads
         o.disable = disable
         o.max_sms = max_sms
+        o.bandwidth = _bandwidth(bandwidth)
         self._opts = _core.EngineOptions.from_env(o)  # CE_* environment variables win
         self._e = _core.Engine(self._opts)
         self._handle = self._e.handle
@@ -196,7 +209,7 @@ class Engine:
 
     # ---- scope ----------------------------------------------------------------
 
-    def scope(self, stream=None, _site=None) -> "_Scope":
+    def scope(self, stream=None, *, bandwidth: Optional[float] = None, _site=None) -> "_Scope":
         """Queue copies until exit, then plan and issue them together.
 
         Inside a scope ``Tensor.copy_`` is intercepted too, and every other op is
@@ -207,11 +220,15 @@ class Engine:
         already queued on the current one, and never makes the host wait:
         ``with engine.scope(stream="copy") as h:`` gives a :class:`Pending`, and
         ``h.wait()`` orders the current stream after the copies.
+
+        ``bandwidth=8e9`` runs the scope's copies that touch a GPU at most at
+        about 8 GB/s (per GPU and direction), paced on the GPU: a background
+        transfer that leaves the link to other work. Results do not change.
         """
         if _site is None:
             f = sys._getframe(1)
             _site = (f.f_code, f.f_lineno)
-        return _Scope(self, _site, stream)
+        return _Scope(self, _site, stream, _bandwidth(bandwidth))
 
     def copy_stream(self, device=None):
         """This engine's copy stream for `device` (created on first use)."""
@@ -224,13 +241,15 @@ class Engine:
             st = self._copy_streams[dev.index] = torch.cuda.Stream(dev)
         return st
 
-    def _interception(self, site):
+    def _interception(self, site, limited: bool = False):
         """'shim', 'mode' or None for one scope entry; also whether to time it."""
         if self._force is not None:
             return self._force, False
         if torch is None or self._opts.disable:
             return None, False
         on = "shim" if _shim.lib is not None else "mode"
+        if limited or self._opts.bandwidth > 0:  # a limited scope is never left to torch for speed
+            return on, False
         if self._depth > 1:  # an inner scope: the outermost one decided (this one is already counted in depth)
             return self._scope_kind, False
         st = self._sites.get(site)
@@ -595,10 +614,10 @@ class Pending:
 
 class _Scope:
     __slots__ = ("engine", "site", "kind", "mode", "timed", "t0", "stream", "stream_ctx", "outer_held", "pending",
-                 "runs0", "ev0")
+                 "bandwidth", "runs0", "ev0")
 
-    def __init__(self, engine: Engine, site, stream=None):
-        self.engine, self.site = engine, site
+    def __init__(self, engine: Engine, site, stream=None, bandwidth: float = 0.0):
+        self.engine, self.site, self.bandwidth = engine, site, bandwidth
         self.kind = self.mode = None
         self.timed, self.t0 = False, 0.0
         self.runs0, self.ev0 = 0, None
@@ -618,12 +637,12 @@ class _Scope:
             self.stream_ctx = torch.cuda.stream(st)
             self.stream_ctx.__enter__()
         with e._lock:
-            e._e.begin_scope(host_async=st is not None)
+            e._e.begin_scope(host_async=st is not None, bandwidth=self.bandwidth)
             e._set_depth(e._depth + 1)
             e._async_depth += st is not None
             if st is not None:
                 self.outer_held, e._held = e._held, []
-        self.kind, self.timed = e._interception(self.site)
+        self.kind, self.timed = e._interception(self.site, self.bandwidth > 0)
         if e._depth == 1:
             e._scope_kind = self.kind
         if self.timed:
@@ -753,9 +772,9 @@ def default_engine() -> Engine:
     return e
 
 
-def scope(stream=None):
+def scope(stream=None, *, bandwidth: Optional[float] = None):
     f = sys._getframe(1)
-    return default_engine().scope(stream, _site=(f.f_code, f.f_lineno))
+    return default_engine().scope(stream, bandwidth=bandwidth, _site=(f.f_code, f.f_lineno))
 
 
 def copy_(dst, src, **kw):

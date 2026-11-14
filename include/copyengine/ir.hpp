@@ -88,11 +88,24 @@ Rects recover_2d(const Runs& runs, int min_height = 2, std::span<const i64> src_
 
 using Table = std::shared_ptr<const std::vector<i64>>;
 
-// One dimension's contribution to the offset: stride * i, or stride * table[i].
+// Indices that live in device memory: entry i is the int64 at
+// ptr + i * step * 8 on `device`, valid in [0, bound). Their values are
+// never known on the host: kernels read them.
+struct DeviceTable {
+  uintptr_t ptr = 0;  // 0: not a device table
+  i64 step = 1;
+  i64 bound = 0;
+  int device = 0;
+  bool operator==(const DeviceTable&) const = default;
+};
+
+// One dimension's contribution to the offset: stride * i, stride * table[i]
+// (host values), or stride * dev[i] (a device table).
 struct Term {
   i64 size = 0;
   i64 stride = 0;
-  Table table;  // null: affine
+  Table table;      // null: no host table
+  DeviceTable dev;  // dev.ptr == 0: no device table
 };
 
 // offset(i) = base + sum_d term_d(i_d). Tables are concrete runtime values
@@ -109,7 +122,8 @@ class Access {
   const std::vector<Term>& terms() const { return terms_; }
   std::vector<i64> shape() const;
   size_t rank() const { return terms_.size(); }
-  bool has_table() const;
+  bool has_table() const;         // host-valued table on some dimension
+  bool has_device_table() const;  // device table on some dimension
   i64 numel() const;
 
   // Data-movement operators: pure algebra, no data is touched.
@@ -118,6 +132,9 @@ class Access {
   Access select(int dim, i64 index) const;
   Access flip(int dim) const;
   Access index_select(int dim, std::span<const i64> index) const;
+  // Indices in device memory (n int64 values at `ptr`, contiguous) on `device`.
+  // Only an affine dimension can be selected this way.
+  Access index_select_device(int dim, uintptr_t ptr, i64 n, int device) const;
   Access unsqueeze(int dim) const;
   Access expand(int dim, i64 n) const;           // size-1 dim -> stride 0 (source side only)
   Access reshape(std::span<const i64> shape) const;  // view-compatible only, else needs_materialize

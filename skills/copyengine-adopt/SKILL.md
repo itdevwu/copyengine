@@ -56,7 +56,8 @@ Read [patterns](references/patterns.md) for code. In short:
 | Copies must not take SMs from compute | `ce.Engine(max_sms=N)` |
 
 Use one `ce.Engine()` per thread (the module-level functions already do).
-Keep index lists on the host on hot paths: a CUDA index tensor costs a sync.
+Keep index lists on the host on hot paths: before 0.3 a CUDA index tensor
+costs a sync (from 0.3 it stays on the GPU).
 
 ## Warm up, then serve without exploring
 

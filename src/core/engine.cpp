@@ -426,8 +426,10 @@ struct Engine::Impl {
     if (op.runs().empty() && !op.opaque) return;
     if (async_depth > 0) op.host_async = true;
     if (const double bw = bandwidth_now();
-        bw > 0 && !opt.disable && (op.src.device.kind == DeviceKind::cuda || op.dst.device.kind == DeviceKind::cuda)) {
+        bw > 0 && !opt.disable && !op.opaque &&
+        (op.src.device.kind == DeviceKind::cuda || op.dst.device.kind == DeviceKind::cuda)) {
       // Paced: never the frontend's full-speed copy, and its own plans.
+      // Not copies with device indices: pacing cuts runs, and they have none.
       op.bandwidth = bw;
       op.native.reset();
       op.fp.a ^= std::bit_cast<uint64_t>(bw) * 0x9E3779B97F4A7C15ull;

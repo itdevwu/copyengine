@@ -67,8 +67,10 @@
 
 ## Scope
 
-- Commit code only: no design notes, benchmark results, or machine-specific
-  data (hostnames, paths, GPU models, driver versions).
+- Commit code, and the design document of what the current version builds
+  (`docs/design/v0.X.md`, updated as the design settles). Do not commit
+  plans for later versions, benchmark results, or machine-specific data
+  (hostnames, paths, GPU models, driver versions).
 - copyengine is a library; do not add a CLI.
 
 ## Verification

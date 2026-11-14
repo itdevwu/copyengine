@@ -112,6 +112,7 @@ struct FusedBatch {
   // the device each call; members[i]: position in the group of bases[i].
   bool device_tables = false;
   std::vector<int> members;
+  std::vector<std::shared_ptr<void>> captured;  // bases recorded by CUDA graph captures
 };
 
 // Structured statements grouped by structure; for cross-device groups the
@@ -305,12 +306,16 @@ class CudaExecutor final : public Executor {
       case Strategy::passthrough: return !g.opaque() && g.pure() && src_ok && dst_ok;
       case Strategy::kernel: return on_device && g.exec_cache[static_cast<int>(Strategy::kernel)] != nullptr;
       case Strategy::fused: {
+        if (!on_device || !devs_[di].kernels) return false;
+        if (g.opaque()) fused_plan(g);  // host-only planning: fine under capture
         const auto& slot = g.exec_cache[static_cast<int>(Strategy::fused)];
-        if (!on_device || !slot) return false;
+        if (!slot) return false;
         const auto& P = *static_cast<const FusedPlan*>(slot.get());
-        // Device tables upload their bases each call (the upload ring waits on the host): not yet.
-        return P.ok && !P.cross && std::all_of(P.batches.begin(), P.batches.end(), [](const FusedBatch& b) {
-                 return b.table != nullptr && !b.device_tables;
+        // Resident tables are built on first use (a host wait); device-table
+        // bases are written by kernel nodes of the capture itself.
+        return P.ok && !P.cross && devs_[di].err.ptr != 0  /* made at device setup */ &&
+               std::all_of(P.batches.begin(), P.batches.end(), [](const FusedBatch& b) {
+                 return b.device_tables ? b.captured.size() < kMaxCaptured : b.table != nullptr;
                });
       }
       default: return false;  // staging, bounce buffers, batch descriptors: allocate or wait on the host
@@ -348,7 +353,7 @@ class CudaExecutor final : public Executor {
       first = false;
     }
     for (Dev& s : devs_) {  // the work is done: report device-index errors it found
-      if (!s.init || !s.err_armed) continue;
+      if (!s.init || !(s.err_armed || s.err_graphs)) continue;
       Push push(*d_, s.ctx);
       s.err_armed = false;
       unsigned long long flag = 0;
@@ -483,6 +488,7 @@ class CudaExecutor final : public Executor {
     CUevent ev_free{};
     DevMem err;               // set by kernels that meet an out-of-range device index
     bool err_armed = false;   // such kernels ran since the last check
+    bool err_graphs = false;  // ... or were captured: graph replays may set it at any time
   };
 
   CUdeviceptr error_word(Dev& s) {
@@ -579,6 +585,7 @@ class CudaExecutor final : public Executor {
     for (Slot& sl : s.slots) check(d_->cuEventCreate(&sl.done, CU_EVENT_DISABLE_TIMING), "cuEventCreate");
     admit_kernels(s);
     admit_batch(s);
+    if (s.kernels) error_word(s);  // before any capture can need it
     if (opt_.max_sms > 0 && s.kernels) setup_sm_limit(s);
     return s;
   }
@@ -1023,6 +1030,39 @@ class CudaExecutor final : public Executor {
     }
   };
 
+  static constexpr int kPutWords = 480;  // as in kernels.cu
+  static constexpr size_t kMaxCaptured = 64;  // captured base tables kept per batch
+  struct Put {
+    CUdeviceptr dst;
+    int n;
+    unsigned long long w[kPutWords];
+  };
+
+  // A batch's bases for one CUDA graph capture: device memory written by
+  // ce_put nodes, so replays read the bases recorded at capture time. Kept
+  // while the group lives (the graph may replay any time).
+  CUdeviceptr captured_bases(Dev& s, FusedBatch& b, const std::vector<Base>& bases, CUstream st) {
+    if (b.captured.size() >= kMaxCaptured)
+      fail(Errc::unsupported, "too many CUDA graph captures of one copy with device indices");
+    const size_t words = bases.size() * sizeof(Base) / 8;
+    auto t = std::make_shared<DevTable>();
+    t->owner = this, t->device = s.index, t->alive = alive_, t->count = bases.size();
+    t->mem = dev_alloc(s, words * 8, "captured copy table");
+    t->ptr = t->mem.ptr;
+    CUfunction f = function(s, "ce_put");
+    const auto* w = reinterpret_cast<const unsigned long long*>(bases.data());
+    for (size_t at = 0; at < words; at += kPutWords) {
+      Put p{};
+      p.dst = t->ptr + at * 8;
+      p.n = static_cast<int>(std::min<size_t>(kPutWords, words - at));
+      std::memcpy(p.w, w + at, static_cast<size_t>(p.n) * 8);
+      void* args[] = {&p};
+      check(d_->cuLaunchKernel(f, 1, 1, 1, 128, 1, 1, 0, st, args, nullptr), "cuLaunchKernel ce_put");
+    }
+    b.captured.push_back(t);
+    return t->ptr;
+  }
+
   // Built once, when a group first runs a strategy (planning, not the hot path).
   template <class T>
   std::shared_ptr<DevTable> resident(Dev& s, const std::vector<T>& v) {
@@ -1112,6 +1152,7 @@ class CudaExecutor final : public Executor {
     if (desc.stab_dim >= 0 || desc.dtab_dim >= 0) {
       dcopy.err = static_cast<unsigned long long>(error_word(s));
       s.err_armed = true;
+      if (capturing(reinterpret_cast<uintptr_t>(st))) s.err_graphs = true;
     }
     cv::Fn fcopy = fn;
     if (tiled) {
@@ -1269,6 +1310,11 @@ class CudaExecutor final : public Executor {
         for (size_t i = 0; i < bases.size(); ++i) {
           const Op& op = ops[g.ops[b.members[i]]];
           bases[i].stab = op.stab, bases[i].dtab = op.dtab;
+        }
+        if (capturing(reinterpret_cast<uintptr_t>(st))) {  // the graph owns these bases
+          const CUdeviceptr t = captured_bases(s, const_cast<FusedBatch&>(b), bases, st);
+          launch_stmt(t, bases.size(), b, fn, P.h2d ? add : 0, P.h2d ? 0 : add, s, st);
+          continue;
         }
         Slot& sl = upload(s, bases.data(), bases.size() * sizeof(Base), st);
         launch_stmt(sl.dev.ptr, bases.size(), b, fn, P.h2d ? add : 0, P.h2d ? 0 : add, s, st);

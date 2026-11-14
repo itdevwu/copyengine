@@ -91,6 +91,7 @@ struct Op {
   // the host): `form` is its only executable description, and its footprint
   // is its whole source / destination allocation.
   bool opaque = false;
+  double bandwidth = 0;            // bytes/s limit of its scope (0: none), mixed into fp
   std::shared_ptr<const Form> form;  // null when the statement has tables or came in as runs
   Hash128 fp;  // content fingerprint
   // byte-interval read / write sets (absolute addresses), computed lazily
@@ -127,6 +128,7 @@ struct Group {
   std::vector<std::pair<i64, i64>> src_allocs;
   std::vector<std::shared_ptr<const Form>> forms;  // one per op when every op is structured, else empty
   int wave = 0;
+  double bandwidth = 0;  // its ops' limit: ops with different limits never share a group
   // filled at plan time
   std::vector<Strategy> candidates;
   std::string bucket;

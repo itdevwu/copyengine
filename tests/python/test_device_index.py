@@ -97,3 +97,23 @@ def test_ops_needing_values_refuse():
         x.select(0, 1)
     with pytest.raises(ce.NeedsMaterialize):
         x.index_select(0, torch.tensor([0], device=DEV))
+
+
+@pytest.mark.parametrize("dim", [0, 1, -1])
+def test_explicit_calls_through_the_torch_op(dim):
+    src = torch.randn(12, 10, 6, device=DEV)
+    n = src.shape[dim]
+    idx = torch.randint(0, n, (5,), device=DEV)
+    e = ce.Engine()
+    out = e.gather(src, idx, dim)  # allocated
+    torch.cuda.synchronize()
+    assert torch.equal(out, src.index_select(dim, idx))
+    dst = torch.zeros_like(src)
+    perm = torch.randperm(n, device=DEV)[:5]
+    e.scatter_(dst, perm, out, dim)
+    torch.cuda.synchronize()
+    assert torch.equal(dst, torch.zeros_like(src).index_copy_(dim, perm, out))
+    row = out.select(dim, 0).unsqueeze(dim)  # broadcast source: no torch index_copy_ equivalent
+    e.scatter_(dst, perm, row, dim)
+    torch.cuda.synchronize()
+    assert torch.equal(dst.index_select(dim, perm), row.expand_as(out))

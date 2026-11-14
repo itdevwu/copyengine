@@ -360,6 +360,13 @@ class Engine:
     def gather(self, src, index, dim: int = 0, *, out=None, fn: Optional[Elementwise] = None,
                dtype=None, ctx: str = ""):
         """``out = fn(src.index_select(dim, index))``; allocates ``out`` like ``src`` if omitted."""
+        if (fn is None or fn is _IDENTITY) and not ctx and self._fast_indexed(src, index, out, dtype):
+            if out is None:
+                shape = list(src.shape)
+                shape[dim] = index.numel()
+                out = torch.empty(shape, dtype=src.dtype, device=src.device)
+            if self._indexed(_torch_ops.gather_, out, src, dim, index, (out, src, dim)):
+                return out
         s = view(src)
         idx = device_table(index) if s.is_cuda else None
         if idx is not None:
@@ -384,6 +391,9 @@ class Engine:
 
     def scatter_(self, dst, index, src, dim: int = 0, *, fn: Optional[Elementwise] = None, ctx: str = ""):
         """``dst.index_copy_(dim, index, fn(src))``. Duplicate indices raise UnsafeCopy."""
+        if ((fn is None or fn is _IDENTITY) and not ctx and self._fast_indexed(dst, index, src, None)
+                and self._indexed(_torch_ops.scatter_, dst, src, dim, index, (dst, src, dim))):
+            return dst
         d, s = view(dst, writable=True), view(src)
         idx = device_table(index) if d.is_cuda else None
         if idx is not None:  # duplicates are not detected on the device (undefined, as in torch)
@@ -398,6 +408,30 @@ class Engine:
                               native=native)
             self._after(s.obj, d.obj, idx)
         return dst
+
+    @staticmethod
+    def _fast_indexed(a, index, b, dtype) -> bool:
+        """The C++ op takes it: strided CUDA tensors and a CUDA index tensor."""
+        return (_torch_ops.gather_ is not None and dtype is None and type(a) is _Tensor and type(index) is _Tensor
+                and a.is_cuda and index.is_cuda and a.layout is _STRIDED and a.dtype not in _NOT_STABLE
+                and (b is None or (type(b) is _Tensor and b.layout is _STRIDED and b.dtype not in _NOT_STABLE)))
+
+    def _indexed(self, op, dst, src, dim, index, args) -> bool:
+        """Runs gather_ / scatter_ (args without the index and engine); False: the general path decides."""
+        if index.dtype is not torch.int64 or index.dim() != 1 or index.stride(0) != 1:
+            index = device_table(index)
+        a = list(args)
+        a.insert(3 if op is _torch_ops.gather_ else 1, index)
+        try:
+            op(*a, self._handle)
+        except RuntimeError as e:
+            err = _torch_ops.translate(e)
+            if not isinstance(err, _core.Unsupported):
+                raise err from None
+            return False
+        if self._hold:
+            self._after(src, dst, index)
+        return True
 
     # ---- plans, tuning, stats -------------------------------------------------------
 

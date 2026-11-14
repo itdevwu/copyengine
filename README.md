@@ -256,7 +256,7 @@ fastest.
 |---|---|
 | `CE_DISABLE=1` | turn copyengine's choices off: torch's own copy, or each copy as submitted |
 | `CE_EXPLORE=0` | never measure: use the loaded profile; copy patterns it does not cover run natively (or with copyengine's default where torch has no equivalent) and are listed in the profile for the next warmup |
-| `CE_STAGING_MB` | device staging budget in MB (default 256) |
+| `CE_STAGING_MB` | device staging budget in MB per stream that stages copies (default 256) |
 | `CE_LOG=plan` | print plans to stderr |
 | `CE_SYNC=1` | wait for every copy to finish (debugging) |
 | `CE_MAX_SMS` | at most this many SMs per GPU for copy kernels (see guarantee 4) |

@@ -59,6 +59,37 @@ int copy_strided(Engine& engine, const Endpoint& src, const Endpoint& dst, const
   }
 }
 
+int copy_indexed(Engine& engine, const Endpoint& src, const Endpoint& dst, const int64_t* s_shape,
+                 const int64_t* s_strides, int s_rank, int64_t s_off, const int64_t* d_shape, const int64_t* d_strides,
+                 int d_rank, int64_t d_off, int side, int dim, uintptr_t table, int64_t n, int table_device,
+                 const Elementwise& fn, std::shared_ptr<NativeOp> native, uint32_t flags, uintptr_t stream,
+                 std::string* error) {
+  try {
+    Access da = Access::strided(std::span<const i64>(d_shape, static_cast<size_t>(d_rank)),
+                                std::span<const i64>(d_strides, static_cast<size_t>(d_rank)), d_off);
+    Access sa = Access::strided(std::span<const i64>(s_shape, static_cast<size_t>(s_rank)),
+                                std::span<const i64>(s_strides, static_cast<size_t>(s_rank)), s_off);
+    if (side == 0) {
+      sa = sa.index_select_device(dim, table, n, table_device);
+      if (sa.shape() != da.shape()) fail(Errc::invalid_argument, "gather: output shape does not match");
+    } else {
+      da = da.index_select_device(dim, table, n, table_device);
+      sa = broadcast_to(sa, da.shape());
+    }
+    Hints h;
+    h.native = std::move(native);
+    h.host_async = (flags & FrontendApi::kHostAsync) != 0;
+    engine.copy(src, dst, Stmt(std::move(da), std::move(sa)), fn, h, stream);
+    return 0;
+  } catch (const Error& e) {
+    if (error) *error = e.what();
+    return 1 + static_cast<int>(e.code());
+  } catch (const std::exception& e) {
+    if (error) *error = e.what();
+    return 1 + static_cast<int>(Errc::backend);
+  }
+}
+
 int fence(Engine& engine, const Range* reads, size_t n_reads, const Range* writes, size_t n_writes,
           std::string* error) {
   try {
@@ -93,6 +124,7 @@ const FrontendApi* frontend_api() {
     a.queued = &queued;
     a.decline = &decline;
     a.set_device_allocator = &set_device_allocator;
+    a.copy_indexed = &copy_indexed;
     return a;
   }();
   return &api;

@@ -46,7 +46,11 @@ typedef enum ce_status {
 
 typedef enum ce_dtype {
   CE_F64 = 0, CE_F32 = 1, CE_F16 = 2, CE_BF16 = 3, CE_I64 = 4,
-  CE_I32 = 5, CE_I16 = 6, CE_I8 = 7, CE_U8 = 8, CE_BOOL = 9
+  CE_I32 = 5, CE_I16 = 6, CE_I8 = 7, CE_U8 = 8, CE_BOOL = 9,
+  CE_F8E4M3 = 10,  /* torch float8_e4m3fn: overflow converts to NaN */
+  CE_F8E5M2 = 11,  /* torch float8_e5m2 */
+  CE_F8E8M0 = 12,  /* torch float8_e8m0fnu: exponent only */
+  CE_F4X2 = 13     /* two packed e2m1 values per byte: same-type copies only */
 } ce_dtype;
 
 typedef enum ce_device_kind { CE_DEVICE_HOST = 0, CE_DEVICE_CUDA = 1 } ce_device_kind;

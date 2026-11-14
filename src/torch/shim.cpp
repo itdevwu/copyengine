@@ -50,6 +50,10 @@ bool to_dtype(at::ScalarType t, ce::DType* out) {
     case at::kChar: *out = ce::DType::i8; return true;
     case at::kByte: *out = ce::DType::u8; return true;
     case at::kBool: *out = ce::DType::b8; return true;
+    case at::kFloat8_e4m3fn: *out = ce::DType::f8e4m3; return true;
+    case at::kFloat8_e5m2: *out = ce::DType::f8e5m2; return true;
+    case at::kFloat8_e8m0fnu: *out = ce::DType::f8e8m0; return true;
+    case at::kFloat4_e2m1fn_x2: *out = ce::DType::f4x2; return true;
     default: return false;
   }
 }
@@ -61,7 +65,11 @@ bool usable(const at::Tensor& t) {
 }
 
 // torch's copy_ gives ce's bits for these pairs (tests/python/test_cuda.py).
-bool same_bits(at::ScalarType d, at::ScalarType s) { return d == s || (at::isFloatingType(d) && s != at::kBool); }
+bool is_float(at::ScalarType t) {
+  return t == at::kHalf || t == at::kBFloat16 || t == at::kFloat || t == at::kDouble || t == at::kFloat8_e4m3fn ||
+         t == at::kFloat8_e5m2 || t == at::kFloat8_e8m0fnu;
+}
+bool same_bits(at::ScalarType d, at::ScalarType s) { return d == s || (is_float(d) && s != at::kBool); }
 
 ce::Device ce_device(const at::Tensor& t) {
   return t.is_cuda() ? ce::Device{ce::DeviceKind::cuda, t.get_device()} : ce::Device{ce::DeviceKind::host, 0};

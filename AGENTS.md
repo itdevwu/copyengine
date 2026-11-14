@@ -51,7 +51,8 @@
 - A group touches several allocations; no copy call, 2-D block or staged
   interval may cross an allocation boundary (the driver rejects it).
 - The native baseline is offered only for dtype pairs whose bits match ce's,
-  backed by a test.
+  backed by a test. "Match" means every non-NaN value bit for bit and NaN
+  for NaN: torch's NaN payloads differ between its CPU and CUDA conversions.
 - Hot paths never synchronize; only warmup exploration and validation may.
 - Intercepted `copy_` keeps the caller's `non_blocking` semantics; explicit
   `ce.copy_` returns with host-side copies complete.

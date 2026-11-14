@@ -35,7 +35,7 @@ without a new kernel for every new model or cache layout.
 
 - **Inference**: loading and offloading KV cache blocks between host and GPU,
   paged caches (gather / scatter by block id), quantizing or dequantizing KV on
-  the way (int8 with a scale), swapping LoRA weights in and out.
+  the way (FP8 or int8 with a scale), swapping LoRA weights in and out.
 - **Training**: offloading optimizer state and activations, dataloader H2D,
   checkpoint save / load and resharding (pure reordering).
 - **Model code**: `x.permute(...).contiguous().cuda()`, copying after
@@ -58,7 +58,8 @@ scope: it runs as usual, ordered correctly around the copies.
    torch rewrite of the same thing.
 2. **The same results.** copyengine only takes a copy when it can produce
    exactly torch's result; otherwise torch runs it. Host and GPU conversions
-   are bit-identical.
+   are bit-identical. (NaN stays NaN, but its sign and payload bits are not
+   kept: torch's own differ between its CPU and CUDA conversions.)
 3. **Easy to turn off.** `CE_DISABLE=1` turns copyengine's choices off: every
    copy runs through torch's own `copy_`, or exactly as submitted where torch
    has no equivalent.
@@ -82,6 +83,10 @@ pip install .                      # needs CMake >= 3.26 and a C++20 compiler
                                    # GPU support: CUDA toolkit headers + nvcc at build time
 pip install --no-build-isolation . # same, with torch already installed: also builds the torch integration
 ```
+
+dtypes: float64/32/16, bfloat16, float8 (e4m3fn, e5m2, e8m0fnu), int64/32/16/8,
+uint8 and bool convert into each other; packed FP4 (`float4_e2m1fn_x2`) is
+copied unconverted.
 
 Requirements: Linux x86_64, Python ≥ 3.10. GPU support runs on CUDA 12.x and
 13.x drivers; the driver is loaded at runtime, nothing links against `libcuda`

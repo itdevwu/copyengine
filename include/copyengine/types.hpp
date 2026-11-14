@@ -10,8 +10,15 @@
 
 namespace ce {
 
-enum class DType : uint8_t { f64, f32, f16, bf16, i64, i32, i16, i8, u8, b8 };
-inline constexpr int kNumDTypes = 10;
+// f8e4m3 / f8e5m2 / f8e8m0: torch's float8_e4m3fn / float8_e5m2 /
+// float8_e8m0fnu, with torch's conversions (overflow to NaN, no saturation;
+// clamp first to saturate). f4x2 is two packed fp4 values per byte: moved as
+// bytes, never converted.
+enum class DType : uint8_t { f64, f32, f16, bf16, i64, i32, i16, i8, u8, b8, f8e4m3, f8e5m2, f8e8m0, f4x2 };
+inline constexpr int kNumDTypes = 14;
+inline constexpr int kNumConvertible = 13;  // dtypes before f4x2 convert into each other
+
+inline bool convertible(DType t) { return static_cast<int>(t) < kNumConvertible; }
 
 size_t itemsize(DType t);
 std::string_view dtype_name(DType t);

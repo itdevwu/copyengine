@@ -17,9 +17,11 @@ from ._tensor import torch_parts, raw_stream
 _COPY = torch.ops.aten.copy_.default
 _PASS_THROUGH = {torch.ops.aten.is_pinned.default}
 
-_FLOATS = (torch.float16, torch.bfloat16, torch.float32, torch.float64)
+_FLOATS = (torch.float16, torch.bfloat16, torch.float32, torch.float64,
+           torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e8m0fnu)
 _DTYPES = {torch.float64, torch.float32, torch.float16, torch.bfloat16, torch.int64, torch.int32, torch.int16,
-           torch.int8, torch.uint8, torch.bool}
+           torch.int8, torch.uint8, torch.bool, torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e8m0fnu,
+           torch.float4_e2m1fn_x2}
 
 _schemas: dict = {}  # op -> None (pass through) or indices of written arguments
 

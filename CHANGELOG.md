@@ -4,6 +4,18 @@ copyengine follows [semantic versioning](https://semver.org). From 0.1.0 on,
 the Python API, the C ABI (`CE_ABI_VERSION`) and the tuning profile format
 change incompatibly only in a new minor (0.x) or major release.
 
+## Unreleased
+
+- FP8 dtypes: `float8_e4m3fn`, `float8_e5m2`, `float8_e8m0fnu`, converted to
+  and from every other dtype with torch's exact bits (round to nearest even;
+  e4m3fn overflow becomes NaN as in torch, so clamp first to saturate), on
+  host and GPU, inside scopes and in the explicit API. Quantization and
+  dequantization with a scale run in one pass.
+- `float4_e2m1fn_x2` (packed FP4): copied between tensors of that dtype,
+  any layout; never converted.
+- The no-regression and same-results guarantees now state what holds for
+  NaN: NaN stays NaN, its payload is not kept (torch's differs per device).
+
 ## 0.1.0
 
 First release.

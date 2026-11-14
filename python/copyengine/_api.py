@@ -34,9 +34,12 @@ Elementwise = _core.Elementwise
 _IDENTITY = _core.Elementwise()
 _Tensor = torch.Tensor if torch is not None else None
 _STRIDED = torch.strided if torch is not None else None
+# dtypes torch's stable ABI cannot pass to a custom op yet: these take the Python path.
+_NOT_STABLE = (torch.float8_e8m0fnu, torch.float4_e2m1fn_x2) if torch is not None else ()
 
 if torch is not None:
-    _FLOATS = (torch.float16, torch.bfloat16, torch.float32, torch.float64)
+    _FLOATS = (torch.float16, torch.bfloat16, torch.float32, torch.float64,
+               torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e8m0fnu)
 
 
 def _same_bits(dst, src, fn) -> bool:
@@ -172,7 +175,8 @@ class Engine:
         op = _torch_ops.copy_
         # Strided only: the stable ABI the op targets cannot tell it a tensor's layout.
         if (op is not None and not ctx and type(dst) is _Tensor and type(src) is _Tensor
-                and dst.layout is _STRIDED and src.layout is _STRIDED):
+                and dst.layout is _STRIDED and src.layout is _STRIDED
+                and dst.dtype not in _NOT_STABLE and src.dtype not in _NOT_STABLE):
             # Descriptors, checks and the native baseline in C++; the engine locks itself.
             try:
                 if fn is None or fn is _IDENTITY:

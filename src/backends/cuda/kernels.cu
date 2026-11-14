@@ -230,6 +230,30 @@ CE_STMT(apply_i8_f32, float, int8_t, 2)
 CE_STMT(apply_f16_i8, int8_t, half_t, 2)
 CE_STMT(apply_bf16_i8, int8_t, bf16_t, 2)
 CE_STMT(apply_f32_i8, int8_t, float, 2)
+CE_STMT(cast_f32_f8e4m3, f8e4m3_t, float, 1)
+CE_STMT(cast_f8e4m3_f32, float, f8e4m3_t, 1)
+CE_STMT(apply_f32_f8e4m3, f8e4m3_t, float, 2)
+CE_STMT(apply_f8e4m3_f32, float, f8e4m3_t, 2)
+CE_STMT(cast_f16_f8e4m3, f8e4m3_t, half_t, 1)
+CE_STMT(cast_f8e4m3_f16, half_t, f8e4m3_t, 1)
+CE_STMT(apply_f16_f8e4m3, f8e4m3_t, half_t, 2)
+CE_STMT(apply_f8e4m3_f16, half_t, f8e4m3_t, 2)
+CE_STMT(cast_bf16_f8e4m3, f8e4m3_t, bf16_t, 1)
+CE_STMT(cast_f8e4m3_bf16, bf16_t, f8e4m3_t, 1)
+CE_STMT(apply_bf16_f8e4m3, f8e4m3_t, bf16_t, 2)
+CE_STMT(apply_f8e4m3_bf16, bf16_t, f8e4m3_t, 2)
+CE_STMT(cast_f32_f8e5m2, f8e5m2_t, float, 1)
+CE_STMT(cast_f8e5m2_f32, float, f8e5m2_t, 1)
+CE_STMT(apply_f32_f8e5m2, f8e5m2_t, float, 2)
+CE_STMT(apply_f8e5m2_f32, float, f8e5m2_t, 2)
+CE_STMT(cast_f16_f8e5m2, f8e5m2_t, half_t, 1)
+CE_STMT(cast_f8e5m2_f16, half_t, f8e5m2_t, 1)
+CE_STMT(apply_f16_f8e5m2, f8e5m2_t, half_t, 2)
+CE_STMT(apply_f8e5m2_f16, half_t, f8e5m2_t, 2)
+CE_STMT(cast_bf16_f8e5m2, f8e5m2_t, bf16_t, 1)
+CE_STMT(cast_f8e5m2_bf16, bf16_t, f8e5m2_t, 1)
+CE_STMT(apply_bf16_f8e5m2, f8e5m2_t, bf16_t, 2)
+CE_STMT(apply_f8e5m2_bf16, bf16_t, f8e5m2_t, 2)
 
 // The same statements when the destination's contiguous dimension `a` is not
 // the source's `b` (transposes): 32x32 tiles through shared memory, read
@@ -328,3 +352,38 @@ extern "C" __global__ void ce_stmt_tile(const Base* __restrict__ bases, long lon
 #define CE_ROW(sn, st) CE_TYPES_INNER(CE_KERNEL, sn, st)
 #define CE_ALL(unused, sn, st) CE_ROW(sn, st)
 CE_TYPES(CE_ALL, _)
+// FP8 is compiled only against the types it is commonly converted with; the
+// other pairs run ce_convert_dyn (same bits, no vector accesses).
+CE_KERNEL(f32, float, f8e4m3, f8e4m3_t)
+CE_KERNEL(f8e4m3, f8e4m3_t, f32, float)
+CE_KERNEL(f16, half_t, f8e4m3, f8e4m3_t)
+CE_KERNEL(f8e4m3, f8e4m3_t, f16, half_t)
+CE_KERNEL(bf16, bf16_t, f8e4m3, f8e4m3_t)
+CE_KERNEL(f8e4m3, f8e4m3_t, bf16, bf16_t)
+CE_KERNEL(f32, float, f8e5m2, f8e5m2_t)
+CE_KERNEL(f8e5m2, f8e5m2_t, f32, float)
+CE_KERNEL(f16, half_t, f8e5m2, f8e5m2_t)
+CE_KERNEL(f8e5m2, f8e5m2_t, f16, half_t)
+CE_KERNEL(bf16, bf16_t, f8e5m2, f8e5m2_t)
+CE_KERNEL(f8e5m2, f8e5m2_t, bf16, bf16_t)
+CE_KERNEL(f32, float, f8e8m0, f8e8m0_t)
+CE_KERNEL(f8e8m0, f8e8m0_t, f32, float)
+
+// Any convertible pair, dtypes read at run time (sdt / ddt: the DType codes).
+extern "C" __global__ void ce_convert_dyn(const Chunk* __restrict__ chunks, int n, Fn fn, long long sadd,
+                                          long long dadd, int sdt, int ddt, int identity) {
+  const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+  const int lane = threadIdx.x & 31;
+  if (warp >= n) return;
+  Chunk c = chunks[warp];
+  c.src += sadd, c.dst += dadd;
+  const int ss = dt_size(sdt), ds = dt_size(ddt);
+  const long long total = c.width * c.rows;
+  for (long long e = lane; e < total; e += 32) {
+    const long long r = e / c.width, i = e - r * c.width;
+    const void* sp = reinterpret_cast<const void*>(static_cast<uintptr_t>(c.src + r * c.spitch + i) * ss);
+    void* dp = reinterpret_cast<void*>(static_cast<uintptr_t>(c.dst + r * c.dpitch + i) * ds);
+    if (identity) dyn_cast(sp, sdt, dp, ddt);
+    else dyn_apply(sp, sdt, dp, ddt, fn);
+  }
+}

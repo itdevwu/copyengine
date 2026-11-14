@@ -14,6 +14,7 @@ struct Info {
 constexpr Info kInfo[kNumDTypes] = {
     {"float64", 8}, {"float32", 4}, {"float16", 2}, {"bfloat16", 2}, {"int64", 8},
     {"int32", 4},   {"int16", 2},   {"int8", 1},    {"uint8", 1},    {"bool", 1},
+    {"float8_e4m3fn", 1}, {"float8_e5m2", 1}, {"float8_e8m0fnu", 1}, {"float4_e2m1fn_x2", 1},
 };
 }  // namespace
 

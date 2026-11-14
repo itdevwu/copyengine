@@ -22,6 +22,9 @@ template <> struct ctype<DType::i16> { using type = int16_t; };
 template <> struct ctype<DType::i8> { using type = int8_t; };
 template <> struct ctype<DType::u8> { using type = uint8_t; };
 template <> struct ctype<DType::b8> { using type = cv::bool_t; };
+template <> struct ctype<DType::f8e4m3> { using type = cv::f8e4m3_t; };
+template <> struct ctype<DType::f8e5m2> { using type = cv::f8e5m2_t; };
+template <> struct ctype<DType::f8e8m0> { using type = cv::f8e8m0_t; };
 
 template <class D, class S>
 void loop_cast(const void* src, void* dst, int64_t n, const cv::Fn&) {
@@ -55,7 +58,7 @@ constexpr ConvertFn pick(bool identity) {
 }
 
 struct Table {
-  ConvertFn fn[kNumDTypes][kNumDTypes][2];
+  ConvertFn fn[kNumConvertible][kNumConvertible][2];  // f4x2 never converts
   template <int S, int D>
   void fill_one() {
     fn[S][D][0] = pick<S, D>(false);
@@ -67,9 +70,9 @@ struct Table {
   }
   template <int... Ss>
   void fill(std::integer_sequence<int, Ss...>) {
-    (fill_row<Ss>(std::make_integer_sequence<int, kNumDTypes>{}), ...);
+    (fill_row<Ss>(std::make_integer_sequence<int, kNumConvertible>{}), ...);
   }
-  Table() { fill(std::make_integer_sequence<int, kNumDTypes>{}); }
+  Table() { fill(std::make_integer_sequence<int, kNumConvertible>{}); }
 };
 
 const Table& table() {

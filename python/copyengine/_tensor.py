@@ -24,6 +24,8 @@ if torch is not None:
         torch.float64: "float64", torch.float32: "float32", torch.float16: "float16",
         torch.bfloat16: "bfloat16", torch.int64: "int64", torch.int32: "int32", torch.int16: "int16",
         torch.int8: "int8", torch.uint8: "uint8", torch.bool: "bool",
+        torch.float8_e4m3fn: "float8_e4m3fn", torch.float8_e5m2: "float8_e5m2",
+        torch.float8_e8m0fnu: "float8_e8m0fnu", torch.float4_e2m1fn_x2: "float4_e2m1fn_x2",
     }
 
 

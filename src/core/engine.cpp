@@ -239,6 +239,9 @@ struct Engine::Impl {
     op.dst_hi = static_cast<int64_t>(dst.base) + dst.nbytes;
     // Absolute element indices. Pure copies become bytes so any dtypes merge.
     const bool pure = fn.identity() && src.dtype == dst.dtype;
+    if (!pure && (!convertible(src.dtype) || !convertible(dst.dtype)))
+      fail(Errc::unsupported, std::string(dtype_name(convertible(src.dtype) ? dst.dtype : src.dtype)) +
+                                  " is only copied to the same dtype, unconverted");
     const i64 scale = pure ? ssz : 1;
     const i64 sb = static_cast<i64>(src.base) / (pure ? 1 : ssz), db = static_cast<i64>(dst.base) / (pure ? 1 : dsz);
     for (size_t i = 0; i < runs.size(); ++i) {

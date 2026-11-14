@@ -37,11 +37,18 @@ bool to_dtype(ST t, ce::DType* out) {
     case ST::Char: *out = ce::DType::i8; return true;
     case ST::Byte: *out = ce::DType::u8; return true;
     case ST::Bool: *out = ce::DType::b8; return true;
+    case ST::Float8_e4m3fn: *out = ce::DType::f8e4m3; return true;
+    case ST::Float8_e5m2: *out = ce::DType::f8e5m2; return true;
+    case ST::Float8_e8m0fnu: *out = ce::DType::f8e8m0; return true;
+    case ST::Float4_e2m1fn_x2: *out = ce::DType::f4x2; return true;
     default: return false;
   }
 }
 
-bool is_float(ST t) { return t == ST::Half || t == ST::BFloat16 || t == ST::Float || t == ST::Double; }
+bool is_float(ST t) {
+  return t == ST::Half || t == ST::BFloat16 || t == ST::Float || t == ST::Double || t == ST::Float8_e4m3fn ||
+         t == ST::Float8_e5m2 || t == ST::Float8_e8m0fnu;
+}
 
 // torch's copy_ gives ce's bits for these pairs (tests/python/test_cuda.py).
 bool same_bits(ST d, ST s) { return d == s || (is_float(d) && s != ST::Bool); }

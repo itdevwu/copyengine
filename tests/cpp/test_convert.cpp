@@ -16,7 +16,7 @@ int main() {
   const int n = 4096;
   std::vector<unsigned char> src(n * 8), a(n * 8), b(n * 8);
   const cv::Fn fns[] = {{0.37f, -1.5f, 0, 0, false, false}, {8.0f, 0.25f, -100.0f, 100.0f, true, true}};
-  for (int s = 0; s < kNumDTypes; ++s) {
+  for (int s = 0; s < kNumConvertible; ++s) {
     const DType st = static_cast<DType>(s);
     // random bits, then patch in values that matter for each source type
     for (auto& x : src) x = static_cast<unsigned char>(rng());
@@ -34,7 +34,7 @@ int main() {
         }
       }
     }
-    for (int d = 0; d < kNumDTypes; ++d) {
+    for (int d = 0; d < kNumConvertible; ++d) {
       const DType dt = static_cast<DType>(d);
       const size_t ss = itemsize(st), ds = itemsize(dt);
       if (s != d) {

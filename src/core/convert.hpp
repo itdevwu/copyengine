@@ -21,6 +21,9 @@ namespace ce::cv {
 struct half_t { uint16_t bits; };
 struct bf16_t { uint16_t bits; };
 struct bool_t { uint8_t v; };
+struct f8e4m3_t { uint8_t bits; };
+struct f8e5m2_t { uint8_t bits; };
+struct f8e8m0_t { uint8_t bits; };
 
 CE_HD uint32_t f2u(float f) {
 #if defined(__CUDA_ARCH__)
@@ -76,6 +79,83 @@ CE_HD uint16_t float_to_bf16(float f) {
   return static_cast<uint16_t>((u + 0x7FFFu + ((u >> 16) & 1u)) >> 16);
 }
 
+// FP8 <-> binary32, bit for bit as torch's c10 conversions (same algorithms):
+// round to nearest even; e4m3fn has no infinity, so overflow (|x| >= 464)
+// and infinities become NaN; e5m2 keeps infinities; e8m0fnu is a bare
+// exponent (sign ignored, 0xFF is NaN, 0 means 2^-127).
+
+CE_HD uint32_t clz32(uint32_t x) {
+#if defined(__CUDA_ARCH__)
+  return static_cast<uint32_t>(__clz(static_cast<int>(x)));
+#else
+  return x ? static_cast<uint32_t>(__builtin_clz(x)) : 32u;
+#endif
+}
+
+CE_HD float f8e4m3_to_float(uint8_t x) {
+  const uint32_t w = static_cast<uint32_t>(x) << 24;
+  const uint32_t sign = w & 0x80000000u, nonsign = w & 0x7FFFFFFFu;
+  uint32_t shift = clz32(nonsign);
+  shift = shift > 4 ? shift - 4 : 0;
+  const int32_t inf_nan = (static_cast<int32_t>(nonsign + 0x01000000u) >> 8) & 0x7F800000;
+  const int32_t zero = static_cast<int32_t>(nonsign - 1) >> 31;
+  return u2f(sign | ((((nonsign << shift >> 4) + ((0x78u - shift) << 23)) | static_cast<uint32_t>(inf_nan)) &
+                     ~static_cast<uint32_t>(zero)));
+}
+
+CE_HD uint8_t float_to_f8e4m3(float f) {
+  uint32_t b = f2u(f);
+  const uint32_t sign = b & 0x80000000u;
+  b ^= sign;
+  uint8_t r;
+  if (b >= (1087u << 20)) {  // >= 464, inf, NaN
+    r = 0x7F;
+  } else if (b < (121u << 23)) {  // below 2^-6: subnormal, rounded by an fp32 add
+    const uint32_t denorm = 141u << 23;
+    r = static_cast<uint8_t>(f2u(u2f(b) + u2f(denorm)) - denorm);
+  } else {
+    const uint32_t odd = (b >> 20) & 1u;
+    b += (static_cast<uint32_t>(7 - 127) << 23) + 0x7FFFFu + odd;
+    r = static_cast<uint8_t>(b >> 20);
+  }
+  return static_cast<uint8_t>(r | (sign >> 24));
+}
+
+CE_HD float f8e5m2_to_float(uint8_t x) { return half_to_float(static_cast<uint16_t>(x) << 8); }
+
+CE_HD uint8_t float_to_f8e5m2(float f) {
+  uint32_t b = f2u(f);
+  const uint32_t sign = b & 0x80000000u;
+  b ^= sign;
+  uint8_t r;
+  if (b >= (143u << 23)) {  // >= 65536: inf, or NaN
+    r = b > (255u << 23) ? 0x7F : 0x7C;
+  } else if (b < (113u << 23)) {  // below 2^-14
+    const uint32_t denorm = 134u << 23;
+    r = static_cast<uint8_t>(f2u(u2f(b) + u2f(denorm)) - denorm);
+  } else {
+    const uint32_t odd = (b >> 21) & 1u;
+    b += (static_cast<uint32_t>(15 - 127) << 23) + 0xFFFFFu + odd;
+    r = static_cast<uint8_t>(b >> 21);
+  }
+  return static_cast<uint8_t>(r | (sign >> 24));
+}
+
+CE_HD float f8e8m0_to_float(uint8_t x) {
+  if (x == 0) return u2f(0x00400000u);
+  if (x == 0xFF) return u2f(0x7F800001u);
+  return u2f(static_cast<uint32_t>(x) << 23);
+}
+
+CE_HD uint8_t float_to_f8e8m0(float f) {
+  const uint32_t b = f2u(f);
+  uint32_t e = (b >> 23) & 0xFFu;
+  if (e == 0xFF) return 0xFF;
+  const bool g = b & 0x400000u, rs = b & 0x3FFFFFu & ~0x400000u;  // guard; round + sticky
+  if (g && (rs || e > 0)) ++e;  // nearest even; the implied bit is 1 for normals
+  return static_cast<uint8_t>(e);
+}
+
 // ---- type traits ----------------------------------------------------------------
 
 template <class T> struct is_int { static constexpr bool value = false; };
@@ -95,6 +175,9 @@ template <> struct limits<uint8_t> { static constexpr uint8_t lo = 0, hi = 255; 
 // Widen a float-like value: halves to float, float/double unchanged.
 CE_HD float widen(half_t x) { return half_to_float(x.bits); }
 CE_HD float widen(bf16_t x) { return bf16_to_float(x.bits); }
+CE_HD float widen(f8e4m3_t x) { return f8e4m3_to_float(x.bits); }
+CE_HD float widen(f8e5m2_t x) { return f8e5m2_to_float(x.bits); }
+CE_HD float widen(f8e8m0_t x) { return f8e8m0_to_float(x.bits); }
 CE_HD float widen(float x) { return x; }
 CE_HD double widen(double x) { return x; }
 
@@ -112,6 +195,9 @@ template <> CE_HD double from_float<double>(float v) { return v; }
 template <> CE_HD float from_float<float>(float v) { return v; }
 template <> CE_HD half_t from_float<half_t>(float v) { return {float_to_half(v)}; }
 template <> CE_HD bf16_t from_float<bf16_t>(float v) { return {float_to_bf16(v)}; }
+template <> CE_HD f8e4m3_t from_float<f8e4m3_t>(float v) { return {float_to_f8e4m3(v)}; }
+template <> CE_HD f8e5m2_t from_float<f8e5m2_t>(float v) { return {float_to_f8e5m2(v)}; }
+template <> CE_HD f8e8m0_t from_float<f8e8m0_t>(float v) { return {float_to_f8e8m0(v)}; }
 template <> CE_HD bool_t from_float<bool_t>(float v) { return {static_cast<uint8_t>(v != 0.0f)}; }
 template <> CE_HD int64_t from_float<int64_t>(float v) { return sat<int64_t>(v); }
 template <> CE_HD int32_t from_float<int32_t>(float v) { return sat<int32_t>(v); }
@@ -128,6 +214,9 @@ template <> CE_HD float to_float<bool_t>(bool_t x) { return x.v ? 1.0f : 0.0f; }
 template <class T> struct is_halfish { static constexpr bool value = false; };
 template <> struct is_halfish<half_t> { static constexpr bool value = true; };
 template <> struct is_halfish<bf16_t> { static constexpr bool value = true; };
+template <> struct is_halfish<f8e4m3_t> { static constexpr bool value = true; };
+template <> struct is_halfish<f8e5m2_t> { static constexpr bool value = true; };
+template <> struct is_halfish<f8e8m0_t> { static constexpr bool value = true; };
 
 // Identity-function conversion S -> D (see the rules in copyengine/types.hpp).
 template <class D, class S>
@@ -175,7 +264,7 @@ CE_HD D apply(S s, const Fn& f) {
 // enum order) instead of templates. Every source widens exactly into one of
 // three categories, so going through the category value changes no bits.
 
-enum { kF64 = 0, kF32, kF16, kBF16, kI64, kI32, kI16, kI8, kU8, kB8 };
+enum { kF64 = 0, kF32, kF16, kBF16, kI64, kI32, kI16, kI8, kU8, kB8, kF8E4M3, kF8E5M2, kF8E8M0 };
 
 CE_HD int dt_size(int dt) {
   switch (dt) {
@@ -213,6 +302,9 @@ CE_HD Val load(const void* p, int dt) {
     case kI16: v.i = rd<int16_t>(p); break;
     case kI8: v.i = rd<int8_t>(p); break;
     case kU8: v.i = rd<uint8_t>(p); break;
+    case kF8E4M3: v.f = f8e4m3_to_float(rd<uint8_t>(p)), v.cat = 1; break;
+    case kF8E5M2: v.f = f8e5m2_to_float(rd<uint8_t>(p)), v.cat = 1; break;
+    case kF8E8M0: v.f = f8e8m0_to_float(rd<uint8_t>(p)), v.cat = 1; break;
     default: v.i = rd<uint8_t>(p) ? 1 : 0; break;
   }
   return v;
@@ -237,6 +329,9 @@ CE_HD void store_float(void* p, int dt, float x) {
     case kI16: wr<int16_t>(p, sat<int16_t>(x)); break;
     case kI8: wr<int8_t>(p, sat<int8_t>(x)); break;
     case kU8: wr<uint8_t>(p, sat<uint8_t>(x)); break;
+    case kF8E4M3: wr<uint8_t>(p, float_to_f8e4m3(x)); break;
+    case kF8E5M2: wr<uint8_t>(p, float_to_f8e5m2(x)); break;
+    case kF8E8M0: wr<uint8_t>(p, float_to_f8e8m0(x)); break;
     default: wr<uint8_t>(p, static_cast<uint8_t>(x != 0.0f)); break;
   }
 }
@@ -254,6 +349,9 @@ CE_HD void dyn_cast(const void* s, int sdt, void* d, int ddt) {
     case kI16: wr<int16_t>(d, val_int<int16_t>(v)); break;
     case kI8: wr<int8_t>(d, val_int<int8_t>(v)); break;
     case kU8: wr<uint8_t>(d, val_int<uint8_t>(v)); break;
+    case kF8E4M3: wr<uint8_t>(d, float_to_f8e4m3(val_float(v))); break;
+    case kF8E5M2: wr<uint8_t>(d, float_to_f8e5m2(val_float(v))); break;
+    case kF8E8M0: wr<uint8_t>(d, float_to_f8e8m0(val_float(v))); break;
     default: wr<uint8_t>(d, static_cast<uint8_t>(v.cat == 0 ? v.d != 0 : (v.cat == 1 ? v.f != 0 : v.i != 0))); break;
   }
 }

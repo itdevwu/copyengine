@@ -139,6 +139,10 @@ std::string short_name(DType t) {
     case DType::i8: return "i8";
     case DType::u8: return "u8";
     case DType::b8: return "b8";
+    case DType::f8e4m3: return "f8e4m3";
+    case DType::f8e5m2: return "f8e5m2";
+    case DType::f8e8m0: return "f8e8m0";
+    case DType::f4x2: return "f4x2";
   }
   return "?";
 }
@@ -675,6 +679,21 @@ class CudaExecutor final : public Executor {
     return f;
   }
 
+  // "ce_cast_<s>_<d>" / "ce_apply_<s>_<d>" back to DType codes.
+  static bool parse_kernel(const std::string& name, int* sdt, int* ddt, int* identity) {
+    std::string rest;
+    if (name.rfind("ce_cast_", 0) == 0) *identity = 1, rest = name.substr(8);
+    else if (name.rfind("ce_apply_", 0) == 0) *identity = 0, rest = name.substr(9);
+    else return false;
+    for (int a = 0; a < kNumConvertible; ++a)
+      for (int b = 0; b < kNumConvertible; ++b)
+        if (rest == short_name(static_cast<DType>(a)) + "_" + short_name(static_cast<DType>(b))) {
+          *sdt = a, *ddt = b;
+          return true;
+        }
+    return false;
+  }
+
   // The specialized ce_stmt for this dtype pair and mode, if compiled.
   static std::string stmt_kernel(const StmtDesc& d) {
     const DType sd = static_cast<DType>(d.sdt), dd = static_cast<DType>(d.ddt);
@@ -745,14 +764,19 @@ class CudaExecutor final : public Executor {
   void launch_table(Dev& s, const std::string& name, CUdeviceptr table, size_t chunks, const cv::Fn& fn,
                     long long sadd, long long dadd, CUstream st) {
     if (chunks == 0) return;
-    CUfunction f = function(s, name);
+    CUfunction f = find_function(s, name);
     const bool bytes = name == "ce_bytes";  // no function argument
+    // A pair without a compiled kernel: the run-time dispatched one.
+    int sdt = 0, ddt = 0, identity = 0;
+    const bool dyn = !f && parse_kernel(name, &sdt, &ddt, &identity);
+    if (dyn) f = function(s, "ce_convert_dyn");
+    if (!f) f = function(s, name);  // reports the missing kernel
     for (size_t at = 0; at < chunks;) {
       const size_t n = std::min<size_t>(chunks - at, size_t{1} << 24);
       int count = static_cast<int>(n);
       CUdeviceptr t = table + at * sizeof(Chunk);
       cv::Fn fcopy = fn;
-      void* typed_args[] = {&t, &count, &fcopy, &sadd, &dadd};
+      void* typed_args[] = {&t, &count, &fcopy, &sadd, &dadd, &sdt, &ddt, &identity};  // dyn reads the last three
       void* bytes_args[] = {&t, &count, &sadd, &dadd};
       const unsigned threads = 256, warps = threads / 32;
       const unsigned blocks = static_cast<unsigned>((n + warps - 1) / warps);

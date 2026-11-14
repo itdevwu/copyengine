@@ -670,3 +670,21 @@ def test_cuda_allocator_when_torch_allocator_is_off():
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
                          env={**__import__("os").environ, "CE_TORCH_ALLOCATOR": "0"})
     assert out.stdout.strip() == "cuda", out.stderr
+
+
+def test_sm_limited_engine_with_staging_tears_down():
+    # Freeing staging orders its stream after every stream ce used, so the
+    # SM-limited stream must still exist then (it was destroyed first).
+    import subprocess
+    import sys
+    code = ("import gc, torch, copyengine as ce\n"
+            "e = ce.Engine(max_sms=2, prior_only=True)\n"
+            "src, dst = torch.randn(64, 32).pin_memory(), torch.zeros(32, 64, device='cuda')\n"
+            "e.copy_(dst, src.t())\n"  # through device staging
+            "torch.cuda.synchronize()\n"
+            "assert torch.equal(dst.cpu(), src.t())\n"
+            "info = e.stats()['cuda'][0]\n"
+            "del e; gc.collect(); torch.cuda.synchronize()\n"
+            "print('ok', info['sm_limit'], info['allocator'])\n")
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert out.returncode == 0 and out.stdout.startswith("ok"), (out.returncode, out.stdout, out.stderr[-2000:])

@@ -81,3 +81,7 @@ Read `why` in the decisions:
 - `CE_STAGING_MB` caps device staging (default 256 MB, allocated on demand).
 - `Engine(max_sms=N)` / `CE_MAX_SMS`: `st["cuda"][i]["sm_limit"]` says whether
   the limit is hard (green context, verified) or soft (thread-block cap).
+- `scope(bandwidth=...)` (0.3+): limited groups show strategy `paced` and the
+  decision "bandwidth limit"; `st["cuda"][i]["zero_copy"]` says whether
+  small rows may use kernels over pinned host memory. A limited copy inside
+  a CUDA graph capture must run once before capturing.

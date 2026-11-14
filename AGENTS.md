@@ -73,7 +73,22 @@
 - GPU work runs inside `just docker-shell`.
 - `python bench/bench_torch.py` compares against torch on a GPU.
 
-## Commits
+## Branches, commits and releases
 
-- Emoji conventional commits on `master`, for example `✨ feat: add Runs IR`.
-  Rebase, no merge commits.
+- `master` is the trunk and only receives pull requests; never push to it
+  directly. Do each piece of work on its own branch named
+  `<type>/v<next version>-<topic>`, for example `feat/v0.2.0-torch-allocator`
+  or `fix/v0.1.2-capture`, open a pull request, and rebase it into `master`
+  once CI passes (the repository allows only rebase merges).
+- Emoji conventional commits, for example `✨ feat: add Runs IR`.
+- CI has no GPU. A pull request that touches GPU paths (kernels, CUDA graphs,
+  async scopes, SM limits) states which GPU tests ran locally, on what GPU,
+  and their result.
+- A release is a pull request whose last commit is
+  `🔖 chore: prepare version X.Y.Z`: the version in `CMakeLists.txt`, the
+  CHANGELOG heading, and every tag the README and `skills/` refer to. After it
+  is merged, tag `vX.Y.Z` on `master`; the tag builds and publishes the wheels.
+- Release from `master`. Only when an older minor needs a fix while `master`
+  holds unreleased incompatible changes, branch `release/0.X` from that
+  minor's last tag, release the fix there, and port it to `master` through a
+  pull request.

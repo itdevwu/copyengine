@@ -489,8 +489,8 @@ def _reuse_pinned_after_free(start_copy, later, n=1 << 20):
     """Start a copy from a pinned tensor while the GPU is busy, drop the tensor and
     let the engine move on to other (already planned) work: until the copy has
     run, torch must not hand that pinned memory to anyone else, and the copy
-    must deliver the original data. (WSL's driver captures pinned sources at
-    submit time, so only the pointer check can fail there.)"""
+    must deliver the original data. (Some drivers capture pinned sources at
+    submit time; there only the pointer check can fail.)"""
     later()  # planned once now: planning may synchronize, the timed part must not
     src = torch.arange(n, dtype=torch.float32).pin_memory()
     want, p = src.clone(), src.data_ptr()

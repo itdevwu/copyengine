@@ -57,6 +57,28 @@ jobs:
         # The stable-ABI ops need torch >= 2.10; older torch uses the Python path for explicit copies.
         run: python -c "import torch, copyengine as ce; v = tuple(map(int, torch.__version__.split('+')[0].split('.')[:2])); assert (ce._torch_ops.copy_ is not None) == (v >= (2, 10)), ce._torch_ops.error; assert ce._shim.lib is not None, ce._shim.error"
 
+  # Server ARM (Grace: GH200, GB200; GB10): the core and torch suites on an
+  # aarch64 runner, with the oldest and newest torch.
+  arm:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        torch: ["2.9.1", "2.11.0"]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - uses: taiki-e/install-action@just
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - run: pip install scikit-build-core nanobind pytest numpy
+      - run: pip install "torch==${{ matrix.torch }}" --index-url "$TORCH_CPU_INDEX"
+      - run: just test
+      - name: Same suite, Python interception mode
+        run: CE_SHIM=0 pytest -q
+
   # The stable ABI claim and the compile-on-import path: built with the newest
   # torch, run with the oldest supported one.
   cross-torch:
@@ -79,15 +101,28 @@ jobs:
       - run: pytest -q
 
   # Release wheels and sdist (docker/build-wheels.sh, which also runs locally):
-  # manylinux_2_28, CUDA kernels for every architecture, a prebuilt shim per
-  # supported torch release. On a v* tag the version must match CMakeLists.txt
-  # and the files are attached to the GitHub release.
+  # manylinux_2_28 on x86_64 and aarch64, CUDA kernels for every GPU
+  # architecture, a prebuilt shim per supported torch release. On a v* tag the
+  # version must match CMakeLists.txt and the files are attached to the GitHub
+  # release.
   wheel:
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
-    needs: [core, torch, cross-torch]
-    runs-on: ubuntu-24.04
+    needs: [core, torch, arm, cross-torch]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+            sdist: "1"
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            sdist: "0"
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
-    container: quay.io/pypa/manylinux_2_28_x86_64
+    container: quay.io/pypa/manylinux_2_28_${{ matrix.arch }}
+    env:
+      CE_WHEEL_SDIST: ${{ matrix.sdist }}
     steps:
       - uses: actions/checkout@v6
       - name: Tag matches the version
@@ -98,7 +133,7 @@ jobs:
       - run: docker/build-wheels.sh
       - uses: actions/upload-artifact@v5
         with:
-          name: dist
+          name: dist-${{ matrix.arch }}
           path: dist/*
 
   release:
@@ -110,7 +145,8 @@ jobs:
     steps:
       - uses: actions/download-artifact@v5
         with:
-          name: dist
+          pattern: dist-*
+          merge-multiple: true
           path: dist
       - env:
           GH_TOKEN: ${{ github.token }}
@@ -130,6 +166,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v5
         with:
-          name: dist
+          pattern: dist-*
+          merge-multiple: true
           path: dist
       - uses: pypa/gh-action-pypi-publish@release/v1

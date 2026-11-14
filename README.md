@@ -69,7 +69,10 @@ scope: it runs as usual, ordered correctly around the copies.
 3. **Easy to turn off.** `CE_DISABLE=1` turns copyengine's choices off: every
    copy runs through torch's own `copy_`, or exactly as submitted where torch
    has no equivalent.
-4. **Bounded resources.** Device staging memory has a budget (`CE_STAGING_MB`),
+4. **Bounded resources.** With torch installed, copyengine's own device memory
+   (staging, copy tables) comes from torch's caching allocator, so it shows in
+   `torch.cuda.memory_allocated()` and obeys torch's limits. Device staging
+   has a budget (`CE_STAGING_MB`),
    and `Engine(max_sms=N)` (or `CE_MAX_SMS`) keeps copy kernels on at most N
    SMs per GPU, leaving the rest to your compute. Where the driver supports
    green contexts the limit is hard (checked on start); otherwise copyengine
@@ -235,6 +238,7 @@ fastest.
 | `CE_SYNC=1` | wait for every copy to finish (debugging) |
 | `CE_MAX_SMS` | at most this many SMs per GPU for copy kernels (see guarantee 4) |
 | `CE_SHIM=0` | skip the compiled `copy_` interception; scopes intercept in Python |
+| `CE_TORCH_ALLOCATOR=0` | take copyengine's device memory from `cuMemAlloc` instead of torch's allocator |
 | `CE_CACHE_DIR` | where interception builds compiled on import are cached (default `~/.cache/copyengine`) |
 
 Licensed under Apache-2.0.

@@ -38,6 +38,13 @@ change incompatibly only in a new minor (0.x) or major release.
 - A/B fixes: a run that set a strategy up (resident tables) is no longer a
   sample, and submit cost counts on both sides; both had biased decisions
   toward torch's copy.
+- copyengine's own device memory (staging, resident copy tables, upload
+  buffers) comes from torch's caching allocator when torch 2.10+ is
+  installed: it counts in torch's memory statistics, limits and snapshots, and
+  freeing it never synchronizes the device. Before memory goes back to torch,
+  the stream it belongs to is ordered after every stream copyengine used.
+  `CE_TORCH_ALLOCATOR=0` restores `cuMemAlloc`. Engines also no longer leak
+  their copy tables when destroyed.
 - The no-regression and same-results guarantees now state what holds for
   NaN: NaN stays NaN, its payload is not kept (torch's differs per device).
 ## 0.1.1

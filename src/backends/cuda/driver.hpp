@@ -30,6 +30,7 @@ namespace ce::cuda {
   X(cuStreamCreate)             \
   X(cuStreamDestroy)            \
   X(cuStreamSynchronize)        \
+  X(cuCtxSynchronize)           \
   X(cuEventCreate)              \
   X(cuEventDestroy)             \
   X(cuEventRecord)              \

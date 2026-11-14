@@ -6,7 +6,9 @@ is older, the Python layer issues copies itself; results are the same.
 
 from __future__ import annotations
 
+import atexit
 import ctypes
+import os
 from pathlib import Path
 
 from . import _core
@@ -38,9 +40,12 @@ def _load() -> None:
         return
     try:
         torch.ops.load_library(str(path))
-        if ctypes.CDLL(str(path)).copyengine_torch_bind(ctypes.c_size_t(_core._frontend_api())) != 0:
+        lib = ctypes.CDLL(str(path))
+        use_torch_memory = os.environ.get("CE_TORCH_ALLOCATOR", "1") not in ("0", "off", "false")
+        if lib.copyengine_torch_bind(ctypes.c_size_t(_core._frontend_api()), ctypes.c_int(use_torch_memory)) != 0:
             error = "torch extension and copyengine._core come from different builds"
             return
+        atexit.register(lib.copyengine_torch_shutdown)
     except (OSError, RuntimeError) as e:  # e.g. torch older than the stable ABI it needs
         error = f"cannot load the torch extension: {e}"
         return

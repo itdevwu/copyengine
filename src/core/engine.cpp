@@ -754,6 +754,15 @@ Engine::~Engine() {
     impl_->synchronize();
   } catch (...) {
   }
+  // Plans own device tables freed through the executor: drop them while it
+  // still exists (members would otherwise outlive it and leak the memory).
+  Impl& m = *impl_;
+  m.memo = {};
+  m.last_ran = {};
+  m.last_ops.reset();
+  m.stmt_cache.clear();
+  m.plans.clear();
+  m.graveyard.clear();
 }
 
 void Engine::copy(const Endpoint& src, const Endpoint& dst, const Runs& runs, const Elementwise& fn,

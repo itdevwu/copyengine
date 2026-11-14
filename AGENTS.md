@@ -57,6 +57,11 @@
   backed by a test. "Match" means every non-NaN value bit for bit and NaN
   for NaN: torch's NaN payloads differ between its CPU and CUDA conversions.
 - Hot paths never synchronize; only warmup exploration and validation may.
+- copyengine's own long-lived device memory goes through `DevMem`
+  (`dev_alloc` / `dev_free` in the CUDA executor), which uses the framework's
+  allocator when one is registered. Before such memory goes back, its
+  allocation stream is ordered after every stream copyengine used on that
+  device; a test checks the ordering, not just the data.
 - Intercepted `copy_` keeps the caller's `non_blocking` semantics; explicit
   `ce.copy_` returns with host-side copies complete.
 

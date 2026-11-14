@@ -13,7 +13,7 @@ from typing import Any, Optional, Sequence
 
 import numpy as np
 
-from . import _core, _torch_ops, _shim  # the shim lets copyengine:: ops through: load them first
+from . import _core, _plan, _torch_ops, _shim  # the shim lets copyengine:: ops through: load them first
 from ._tensor import (
     device_table,
     select_device,
@@ -459,6 +459,19 @@ class Engine:
 
     # ---- plans, tuning, stats -------------------------------------------------------
 
+    def plan(self, step) -> "_plan.StepPlan":
+        """A step of copies, planned once and replayed: ``p = eng.plan(step); p(*args)``.
+
+        The first calls for an argument layout run ``step(*args)`` intercepted
+        until the engine has settled; then its copies are frozen, and later
+        calls replay them without running ``step`` or planning, reading the
+        current CUDA int64 index tensors. Every other tensor the copies touch
+        must be an argument and the same buffer (a new buffer or shape traces
+        again). Only the copies replay: other work in ``step`` runs while it is
+        traced. A replay is kept only where it beats running ``step`` plainly.
+        """
+        return _plan.StepPlan(self, step)
+
     def freeze(self) -> "FrozenPlan":
         """Replayable copy of the last flush (no planning, no checks on replay)."""
         with self._lock:
@@ -765,7 +778,10 @@ if torch is not None and _shim.lib is None and "CE_SHIM=0" not in _shim.error:
 
 
 def default_engine() -> Engine:
-    """This thread's engine (created on first use)."""
+    """This thread's engine (created on first use); while a step plan traces, its engine."""
+    e = _plan.tracing_engine()
+    if e is not None:
+        return e
     e = getattr(_default, "engine", None)
     if e is None:
         e = _default.engine = Engine()
@@ -795,6 +811,11 @@ def gather(src, index, dim: int = 0, **kw):
 
 def scatter_(dst, index, src, dim: int = 0, **kw):
     return default_engine().scatter_(dst, index, src, dim, **kw)
+
+
+def plan(step):
+    """``default_engine().plan(step)``."""
+    return default_engine().plan(step)
 
 
 def barrier():

@@ -222,6 +222,7 @@ struct Engine::Impl {
   int64_t total_flushes = 0, total_ops = 0, total_calls = 0, total_bytes = 0, plan_hits = 0;
   int64_t tuning_runs = 0;  // see Engine::tuning_runs
   double total_plan_us = 0;  // planning on plan-cache misses
+  bool recording = false;   // see Engine::set_recording
   std::shared_ptr<std::vector<Op>> last_ops;
   Ran last_ran;
 
@@ -384,7 +385,7 @@ struct Engine::Impl {
   // One op in online_every still goes through the queue and the tuner, which
   // keeps re-checking the decision (it stands for the runs that skipped it).
   bool native_now(Op& op) {
-    if (!op.native || opt.prior_only) return false;
+    if (!op.native || opt.prior_only || recording) return false;
     if (opt.disable) return true;
     if (merges_with_tail(op)) return false;
     auto it = keys.find(op.key);
@@ -1113,25 +1114,68 @@ class FrozenImpl final : public Frozen {
  public:
   FrozenImpl(Engine::Impl* eng, std::shared_ptr<std::vector<Op>> ops, Ran ran)
       : eng_(eng), ops_(std::move(ops)), ran_(std::move(ran)) {}
-  void run(uintptr_t stream) override {
+  void run(uintptr_t stream) override { run(stream, {}); }
+  void run(uintptr_t stream, std::span<const Rebind> rebinds) override {
     Locked lk(*eng_);
+    const std::vector<Op>* ops = ops_.get();
+    if (!rebinds.empty()) {
+      if (work_.empty()) work_ = *ops_;
+      auto remap = [&](uintptr_t p) {
+        for (const Rebind& r : rebinds)
+          if (p >= r.lo && p < r.hi) return r.to + (p - r.lo);
+        return p;
+      };
+      for (size_t k = 0; k < work_.size(); ++k)
+        if ((*ops_)[k].opaque) work_[k].stab = remap((*ops_)[k].stab), work_[k].dtab = remap((*ops_)[k].dtab);
+      ops = &work_;
+    }
     const Engine::Impl::Capture cap(*eng_, stream);
     const auto& groups = ran_.plan->groups;
     for (size_t i = 0; i < groups.size(); ++i) {
-      const Strategy s = eng_->capturing ? eng_->capture_choice(groups[i], *ops_, ran_.strategies[i]) : ran_.strategies[i];
-      eng_->run_group(groups[i], s, *ops_, stream, false, nullptr);
+      const Strategy s = eng_->capturing ? eng_->capture_choice(groups[i], *ops, ran_.strategies[i]) : ran_.strategies[i];
+      eng_->run_group(groups[i], s, *ops, stream, false, nullptr);
     }
     eng_->finish(stream);
+  }
+  std::vector<uintptr_t> tables() const override {
+    std::vector<uintptr_t> t;
+    for (const Op& op : *ops_) {
+      if (op.stab) t.push_back(op.stab);
+      if (op.dtab) t.push_back(op.dtab);
+    }
+    return t;
+  }
+  std::vector<std::array<int64_t, 4>> allocations() const override {
+    std::vector<std::array<int64_t, 4>> a;
+    auto add = [&](const Side& s, int64_t lo, int64_t hi) {
+      std::array<int64_t, 4> x{static_cast<int64_t>(s.device.kind), s.device.index, lo, hi};
+      if (std::find(a.begin(), a.end(), x) == a.end()) a.push_back(x);
+    };
+    for (const Op& op : *ops_) add(op.src, op.src_lo, op.src_hi), add(op.dst, op.dst_lo, op.dst_hi);
+    return a;
   }
 
  private:
   Engine::Impl* eng_;
   std::shared_ptr<std::vector<Op>> ops_;
+  std::vector<Op> work_;  // ops_ with this call's table pointers
   Ran ran_;
 };
 }  // namespace
 
-std::shared_ptr<Frozen> Engine::freeze() const {
+std::shared_ptr<Frozen> Engine::freeze() const { return freeze(false); }
+
+void Engine::set_recording(bool on) {
+  Locked lk(*impl_);
+  impl_->recording = on;
+}
+
+int64_t Engine::flushes() const {
+  Locked lk(*impl_);
+  return impl_->total_flushes;
+}
+
+std::shared_ptr<Frozen> Engine::freeze(bool rebindable) const {
   Locked lk(*impl_);
   if (!impl_->last_ops) fail(Errc::invalid_argument, "freeze: nothing has been flushed yet");
   // What each group should run from now on, not what the last flush happened
@@ -1148,6 +1192,10 @@ std::shared_ptr<Frozen> Engine::freeze() const {
     const Choice c = m.choice_for(g, ops);
     if (auto l = m.tuner.locked_strategy(g.bucket); l && runnable(*l)) ran.strategies[i] = *l;
     else if (runnable(c.reference())) ran.strategies[i] = c.reference();
+    if (rebindable && g.opaque() && ran.strategies[i] == Strategy::native) {
+      if (c.cands.empty()) fail(Errc::unsupported, "freeze: a copy with device indices has no strategy but torch's");
+      ran.strategies[i] = c.cands.front();
+    }
   }
   return std::make_shared<FrozenImpl>(impl_.get(), impl_->last_ops, std::move(ran));
 }

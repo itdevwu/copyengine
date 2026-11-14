@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <array>
 #include <span>
 #include <string>
 #include <vector>
@@ -142,6 +143,14 @@ class Engine {
   // Freezes the last flush: replay without planning or checks. The caller
   // guarantees the same buffers, layouts and tables stay valid.
   std::shared_ptr<Frozen> freeze() const;
+  // The same, replayable with other device index tables (Frozen::run's
+  // rebinds): groups reading device tables never take the frontend's native
+  // copy, whose payload holds the traced index tensors.
+  std::shared_ptr<Frozen> freeze(bool rebindable) const;
+  int64_t flushes() const;
+  // While on, every copy goes through the queue (none runs as torch's copy at
+  // interception time): a frontend tracing a region for freeze() sets it.
+  void set_recording(bool on);  // flushes so far (a region that flushed more than once was not one plan)
 
   struct Impl;
 
@@ -149,10 +158,22 @@ class Engine {
   std::unique_ptr<Impl> impl_;
 };
 
+// Device index tables a replay reads elsewhere: a table pointer in [lo, hi)
+// at freeze time reads from `to + (pointer - lo)` instead.
+struct Rebind {
+  uintptr_t lo = 0, hi = 0, to = 0;
+};
+
 class Frozen {
  public:
   virtual ~Frozen() = default;
   virtual void run(uintptr_t stream = 0) = 0;
+  virtual void run(uintptr_t stream, std::span<const Rebind> rebinds) = 0;
+  // The device table pointers the frozen copies read (for frontends that map
+  // them to their arguments).
+  virtual std::vector<uintptr_t> tables() const = 0;
+  // Every allocation the frozen copies touch: {device kind, device index, lo, hi} (bytes).
+  virtual std::vector<std::array<int64_t, 4>> allocations() const = 0;
 };
 
 }  // namespace ce

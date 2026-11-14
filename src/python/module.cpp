@@ -8,6 +8,7 @@
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/vector.h>
+#include <nanobind/stl/array.h>
 
 #include "copyengine/copyengine.h"
 #include "copyengine/copyengine.hpp"
@@ -265,7 +266,19 @@ NB_MODULE(_core, m) {
       .def_static("from_env", [](ce::EngineOptions base) { return ce::EngineOptions::from_env(base); }, "base"_a);
 
   nb::class_<ce::Frozen>(m, "Frozen")
-      .def("run", &ce::Frozen::run, "stream"_a = 0, nb::call_guard<nb::gil_scoped_release>());
+      .def("run", nb::overload_cast<uintptr_t>(&ce::Frozen::run), "stream"_a = 0,
+           nb::call_guard<nb::gil_scoped_release>())
+      .def("run_rebound",
+           [](ce::Frozen& f, uintptr_t stream, const std::vector<std::array<uintptr_t, 3>>& rebinds) {
+             std::vector<ce::Rebind> r;
+             r.reserve(rebinds.size());
+             for (const auto& x : rebinds) r.push_back({x[0], x[1], x[2]});
+             nb::gil_scoped_release release;
+             f.run(stream, r);
+           },
+           "stream"_a, "rebinds"_a)
+      .def_prop_ro("tables", &ce::Frozen::tables)
+      .def_prop_ro("allocations", &ce::Frozen::allocations);
 
   auto make_hints = [](nb::handle valid_start, nb::handle valid_len, const std::string& ctx) {
     ce::Hints h;
@@ -353,7 +366,9 @@ NB_MODULE(_core, m) {
       .def_prop_ro("tuning_runs", &ce::Engine::tuning_runs)
       .def("dump_profile", &ce::Engine::dump_profile)
       .def("load_profile", &ce::Engine::load_profile)
-      .def("freeze", &ce::Engine::freeze);
+      .def("freeze", [](const ce::Engine& e, bool rebindable) { return e.freeze(rebindable); }, "rebindable"_a = false)
+      .def_prop_ro("flushes", &ce::Engine::flushes)
+      .def("set_recording", &ce::Engine::set_recording);
 
   m.def("hardware_fingerprint", &ce::hardware_fingerprint);
   m.def("host_is_pinned", &ce::host_is_pinned, "ptr"_a);

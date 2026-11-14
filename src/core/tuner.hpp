@@ -80,6 +80,9 @@ class Tuner {
   // a while report how many runs they skipped, so online sampling keeps pace).
   Pick pick(const std::string& bucket, const Choice& c, int64_t runs = 1);
   void report(const std::string& bucket, Strategy s, Sample sample);
+  // A measured run that does not count (it paid one-time setup): the next
+  // run of `s` is measured instead.
+  void discard(const std::string& bucket, Strategy s);
   bool locked(const std::string& bucket) const;
   // Why `ran` ran for `bucket` (after pick): the evidence behind a locked
   // choice, or which phase of exploration a sample belongs to.

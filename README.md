@@ -161,6 +161,19 @@ reason. In Nsight Systems every group is an NVTX range named
 
 To compare against torch on your GPU: `python bench/bench_torch.py`.
 
+## With an AI coding agent
+
+Two [Agent Skills](skills/) teach coding agents (Claude Code, Codex, Cursor,
+...) to adopt and debug copyengine: `copyengine-adopt` finds copy hotspots,
+picks the integration, warms it up and proves same results and the measured
+gain; `copyengine-diagnose` explains slow, declined or failing copies from
+copyengine's own stats.
+
+```bash
+npx skills@1 add https://github.com/itdevwu/copyengine/tree/v0.2.0/skills/copyengine-adopt --global
+npx skills@1 add https://github.com/itdevwu/copyengine/tree/v0.2.0/skills/copyengine-diagnose --global
+```
+
 ## How it works
 
 Copies issued inside a scope are queued instead of run. When the scope ends,

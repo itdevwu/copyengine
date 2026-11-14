@@ -26,6 +26,9 @@ change incompatibly only in a new minor (0.x) or major release.
   and why; `stats()["declined"]` counts intercepted copies left to torch, by
   reason (the same in the C++ shim and the Python interception); each group
   is an NVTX range `copyengine:<strategy>`.
+- `Engine.warmup(fn)` runs until every copy pattern `fn` hits has locked its
+  decision (it ran 4 times regardless) and returns the number of runs.
+- Agent Skills `copyengine-adopt` and `copyengine-diagnose` (`skills/`).
 - The no-regression and same-results guarantees now state what holds for
   NaN: NaN stays NaN, its payload is not kept (torch's differs per device).
 ## 0.1.1

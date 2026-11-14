@@ -717,3 +717,20 @@ def test_last_flush_explains_its_decisions():
     d = e.stats()["last"]["decisions"][0]
     assert d["why"].startswith(("locked", "online re-check")) and d["ops"] == 1 and d["bytes"] == src.nbytes, d
     assert ce.Engine(prior_only=True).copy_(dst, src) is dst
+
+
+def test_warmup_runs_until_every_pattern_is_locked():
+    src = np.arange(1 << 16, dtype=np.float32)
+    dst = np.zeros_like(src)
+    a = np.arange(4096, dtype=np.float32).reshape(64, 64)
+    b = np.zeros((64, 64), np.float32)
+    e = ce.Engine()
+
+    def step(eng):
+        eng.copy_(dst, src)
+        eng.copy_(b, a.T)
+
+    n = e.warmup(step)
+    assert n > 4
+    assert all(v["locked"] for v in json.loads(e.dump_profile())["buckets"].values())
+    assert e.warmup(step, iters=3) == 3

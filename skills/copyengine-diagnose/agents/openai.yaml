@@ -1,0 +1,4 @@
+interface:
+  display_name: "copyengine: diagnose"
+  short_description: "Explain why copyengine chose, declined or failed, from its own stats"
+  default_prompt: "Use $copyengine-diagnose to find out why copyengine is not making these copies faster."

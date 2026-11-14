@@ -314,11 +314,25 @@ class Engine:
         with open(path, "w") as f:
             f.write(self.dump_profile())
 
-    def warmup(self, fn, iters: int = 4) -> None:
-        """Run ``fn(engine)`` a few times so every bucket it hits gets tuned."""
-        for _ in range(iters):
+    def warmup(self, fn, iters: Optional[int] = None, max_iters: int = 500) -> int:
+        """Run ``fn(engine)`` until every copy pattern it hits has locked its
+        decision (or `iters` times exactly), and return how many runs it took.
+
+        Run it with representative inputs before serving; then
+        ``save_profile`` lets later processes skip it.
+        """
+        n = 0
+        while True:
             fn(self)
             self.barrier()
+            n += 1
+            if iters is not None:
+                if n >= iters:
+                    return n
+                continue
+            buckets = json.loads(self.dump_profile())["buckets"].values()
+            if all(b["locked"] for b in buckets) or n >= max_iters:
+                return n
 
     @property
     def options(self) -> _core.EngineOptions:

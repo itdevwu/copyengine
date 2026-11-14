@@ -30,6 +30,9 @@
   identical semantics: behavior may differ only in speed, never in results,
   and `tests/python/test_scope.py` runs under both.
 - The version lives only in `project(... VERSION ...)` in `CMakeLists.txt`.
+- `skills/` holds the Agent Skills users install by release tag. Each states
+  the copyengine minor series it supports; update them with any API or
+  behavior change they describe, and keep every snippet in them runnable.
 
 ## Invariants
 

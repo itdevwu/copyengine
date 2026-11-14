@@ -1,0 +1,4 @@
+interface:
+  display_name: "copyengine: faster tensor copies"
+  short_description: "Find copy hotspots in PyTorch code and hand them to copyengine, proving same results and measured gains"
+  default_prompt: "Use $copyengine-adopt to find the copy hotspots in this code and speed them up with copyengine."

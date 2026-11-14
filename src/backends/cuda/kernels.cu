@@ -144,6 +144,8 @@ struct Base {
   const long long* dtab;
 };
 
+constexpr int kPutWords = 480;  // ce_put's parameters stay under the 4 KB limit
+
 __device__ __forceinline__ void element(const void* sp, void* dp, const StmtDesc& D, const Fn& fn) {
   if (D.mode == 0) {
     switch (dt_size(D.sdt)) {
@@ -226,6 +228,19 @@ __device__ __forceinline__ void stmt_body(const Base* __restrict__ bases, long l
       default: wr<uint16_t>(dp, *reinterpret_cast<const uint16_t*>(buf)); break;
     }
   }
+}
+
+// Writes words carried in the kernel's parameters to device memory: inside a
+// CUDA graph capture the values become part of the kernel node, so no host
+// buffer has to outlive the capture (pinned allocation is illegal there).
+struct Put {
+  unsigned long long* dst;
+  int n;
+  unsigned long long w[kPutWords];
+};
+
+extern "C" __global__ void ce_put(Put p) {
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < p.n; i += gridDim.x * blockDim.x) p.dst[i] = p.w[i];
 }
 
 extern "C" __global__ void ce_stmt(const Base* __restrict__ bases, long long count, StmtDesc D, Fn fn, long long sadd,

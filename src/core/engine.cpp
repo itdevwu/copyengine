@@ -359,7 +359,7 @@ struct Engine::Impl {
     if (!want) want = tuner.locked_strategy(g.bucket);
     if (want && *want != Strategy::native && ex.capture_safe(*want, g)) return *want;
     if (std::all_of(g.ops.begin(), g.ops.end(), [&](int k) { return ops[k].native != nullptr; })) return Strategy::native;
-    for (Strategy s : {Strategy::runs, Strategy::passthrough})
+    for (Strategy s : {Strategy::runs, Strategy::passthrough, Strategy::fused})
       if (ex.capture_safe(s, g)) return s;
     fail(Errc::unsupported,
          "copyengine cannot record this copy in a CUDA graph: torch has no equivalent and its strategy needs "

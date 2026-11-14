@@ -160,3 +160,25 @@ def test_sm_limited_kernels_inside_a_graph():
     g = capture(lambda: e.copy_(out, src()))
     idx = torch.tensor(ids, device=DEV)
     replayed(g, cache, out, lambda: cache[idx].flip(1).permute(0, 2, 1))
+
+
+def test_device_indices_replay_with_new_values():
+    # A static index buffer, rewritten between replays: the graph reads the new ids.
+    cache = torch.randn(64, 4, 32, device=DEV)
+    ids = torch.randperm(64, device=DEV)[:16]
+    out = torch.zeros(16, 32, 4, device=DEV)
+    e = ce.Engine()
+    src = lambda: ce.lazy(cache).index_select(0, ids).slice(1, None, None, -1).permute(0, 2, 1)  # no torch view
+    e.copy_(out, src())
+    torch.cuda.synchronize()
+    g = capture(lambda: e.copy_(out, src()))
+    for _ in range(3):
+        ids.copy_(torch.randperm(64, device=DEV)[:16])
+        out.zero_()
+        g.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out, cache[ids].flip(1).permute(0, 2, 1))
+    ids[3] = 999  # out of range: skipped, reported at the next synchronize
+    g.replay()
+    with pytest.raises(ValueError, match="out of range"):
+        e.synchronize()

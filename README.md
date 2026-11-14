@@ -173,6 +173,9 @@ fastest.
   open on it; a copy or scope from another thread during one raises an error.
 - Buffers of copies that are not waited for (intercepted `non_blocking`
   copies, `allow_async`) are kept alive until the GPU is done with them.
+- CUDA Graphs: copies inside `torch.cuda.graph` (scopes, `ce.copy_`,
+  `FrozenPlan.run()`) are recorded and replay correctly. Copies torch has no
+  equivalent for must run once before capturing.
 - Each destination element must be written once per copy: duplicate scatter
   indices and a source overlapping its own destination raise `UnsafeCopy` in
   the explicit API (an intercepted `copy_` leaves those to torch).

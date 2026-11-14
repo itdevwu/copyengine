@@ -160,6 +160,8 @@ class Engine:
 
     def _retire(self, objs) -> None:
         """allow_async, outside a scope: keep `objs` until the work issued so far completes."""
+        if torch is not None and torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            return  # recorded into a CUDA graph: its owner keeps the tensors alive
         inflight = self._inflight
         while inflight and self._e.done(inflight[0][0]):
             inflight.popleft()

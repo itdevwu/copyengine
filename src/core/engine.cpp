@@ -143,7 +143,7 @@ struct Engine::Impl {
   std::deque<Kept> kept;
 
   void keep(const std::vector<Op>& ops, uintptr_t strm) {
-    if (!cuda) return;
+    if (!cuda || capturing) return;
     Kept k;
     std::vector<int> devs;
     for (const Op& op : ops) {
@@ -329,7 +329,28 @@ struct Engine::Impl {
   }
 
   // `host_wait`: the caller expects the host side complete when it returns.
+  // CUDA Graph capture of `strm` (torch.cuda.graph): work is recorded into
+  // the graph, never run now, so nothing may be timed, waited for or kept
+  // alive by the engine (the graph's owner keeps the tensors).
+  bool capturing = false;
+  bool is_capturing(uintptr_t strm) { return cuda && cuda->capturing(strm); }
+
+  // What runs a group during capture: the locked or given strategy if it only
+  // enqueues stream work, else torch's own copy (capturable), else plain DMA.
+  Strategy capture_choice(const Group& g, const std::vector<Op>& ops, std::optional<Strategy> want) {
+    Executor& ex = exec_for(g.src, g.dst);
+    if (!want) want = tuner.locked_strategy(g.bucket);
+    if (want && *want != Strategy::native && ex.capture_safe(*want, g)) return *want;
+    if (std::all_of(g.ops.begin(), g.ops.end(), [&](int k) { return ops[k].native != nullptr; })) return Strategy::native;
+    for (Strategy s : {Strategy::runs, Strategy::passthrough})
+      if (ex.capture_safe(s, g)) return s;
+    fail(Errc::unsupported,
+         "copyengine cannot record this copy in a CUDA graph: torch has no equivalent and its strategy needs "
+         "resources that are set up on first use; run it once before capturing");
+  }
+
   void note_pending(const Side& s, const Side& d, uintptr_t strm, bool host_wait) {
+    if (capturing) return;  // the graph's work, not the engine's
     if (s.device.kind == DeviceKind::host && d.device.kind == DeviceKind::host) return;
     if (std::find(cuda_streams.begin(), cuda_streams.end(), strm) == cuda_streams.end()) cuda_streams.push_back(strm);
     const int dev = s.device.kind == DeviceKind::cuda ? s.device.index : d.device.index;
@@ -344,17 +365,21 @@ struct Engine::Impl {
                                                       op.dst_hi)))
       flush();
     const bool host_only = op.src.device.kind == DeviceKind::host && op.dst.device.kind == DeviceKind::host;
-    if (host_only && host_pending) synchronize();  // host work may touch what CUDA work still uses
+    if (host_only && host_pending && !capturing) synchronize();  // host work may touch what CUDA work still uses
     op.native->run(strm);
     note_pending(op.src, op.dst, strm, !op.host_async);
     bury(std::move(op.native));
     ++native_ops;
-    if (depth == 0) finish();
+    if (depth == 0) finish(strm);
   }
 
   void push(Op op, uintptr_t strm) {
     if (op.runs().empty()) return;
-    if (!kept.empty()) reap();
+    // Only work that touches the device now asks about capture: a copy queued
+    // in a scope costs nothing extra.
+    std::optional<Capture> cap;
+    if (depth == 0 || op.native || !kept.empty()) cap.emplace(*this, strm);
+    if (!kept.empty() && !capturing) reap();
     if (native_now(op)) {
       run_native_now(op, strm);
       return;
@@ -366,7 +391,7 @@ struct Engine::Impl {
     queue.push_back(std::move(op));
     if (depth == 0) {
       flush();
-      finish();
+      finish(strm);
     }
   }
 
@@ -505,7 +530,7 @@ struct Engine::Impl {
   int64_t run_group(const Group& g, Strategy s, const std::vector<Op>& ops, uintptr_t strm, bool measure,
                     FlushStats* st) {
     Executor& ex = exec_for(g.src, g.dst);
-    if (&ex == &host && host_pending) synchronize();  // host work may touch what CUDA work still uses
+    if (&ex == &host && host_pending && !capturing) synchronize();  // host work may touch what CUDA work still uses
     const int64_t a = measure ? ex.mark(strm, device_of(g)) : -1;
     const auto t0 = Clock::now();
     int64_t calls = 0;
@@ -577,8 +602,11 @@ struct Engine::Impl {
 
   void flush() {
     if (queue.empty()) return;
-    if (flush_memo()) return;
-    poll_samples();
+    const Capture cap(*this, stream);
+    if (!capturing) {
+      if (flush_memo()) return;
+      poll_samples();
+    }
     std::vector<Op> ops;
     ops.swap(queue);
     q_reads.clear();
@@ -588,17 +616,24 @@ struct Engine::Impl {
     const Hash128 key = h.done();
     auto it = plans.find(key);
     const bool hit = it != plans.end();
-    if (!hit) {
+    std::shared_ptr<const Plan> pp;
+    if (hit) {
+      pp = it->second;
+    } else {
       auto p = std::make_shared<Plan>(build_plan(ops));
       for (Group& g : p->groups) {
-        g.candidates = tuner.shortlist(exec_for(g.src, g.dst).candidates(g));
+        // Candidates may initialize the device (allocations): not while capturing,
+        // and a plan built then is not kept.
+        if (!capturing) g.candidates = tuner.shortlist(exec_for(g.src, g.dst).candidates(g));
         g.bucket = bucket_key(g, static_cast<int>(g.ops.size()));
       }
       if (opt.log_plan) log(*p, ops.size());
-      if (static_cast<int>(plans.size()) >= opt.plan_cache) plans.clear();
-      it = plans.emplace(key, std::move(p)).first;
+      if (!capturing) {
+        if (static_cast<int>(plans.size()) >= opt.plan_cache) plans.clear();
+        plans.emplace(key, p);
+      }
+      pp = std::move(p);
     }
-    const std::shared_ptr<const Plan> pp = it->second;
     const Plan& plan = *pp;
     FlushStats st;
     st.ops = static_cast<int>(ops.size());
@@ -613,12 +648,15 @@ struct Engine::Impl {
       Tuner::Pick p{c.baseline, false};
       int64_t runs = 1;
       for (int k : g.ops) runs = std::max(runs, ops[k].weight);
-      if (!opt.disable) p = tuner.pick(g.bucket, c, runs);
-      if (ops.size() == 1 && plan.groups.size() == 1 && !p.measure && (opt.disable || tuner.locked(g.bucket)))
+      if (capturing) p = {capture_choice(g, ops, opt.disable ? std::optional<Strategy>(c.baseline) : std::nullopt), false};
+      else if (!opt.disable) p = tuner.pick(g.bucket, c, runs);
+      if (!capturing && ops.size() == 1 && plan.groups.size() == 1 && !p.measure &&
+          (opt.disable || tuner.locked(g.bucket)))
         memo = {true, ops.front().fp, pp, p.strategy, 0};
       run_group(g, p.strategy, ops, stream, p.measure, &st);
       ran.strategies.push_back(p.strategy);
       for (int k : g.ops) {
+        if (capturing) break;
         KeyStat& ks = keys[ops[k].key];
         ++ks.seen;
         ks.merged += g.ops.size() > 1;
@@ -658,9 +696,21 @@ struct Engine::Impl {
 
   // End of a top-level copy or scope. Device-only work stays queued on the
   // caller's stream, which orders it like torch's own copies.
-  void finish() {
-    if (opt.sync_always || (host_pending && !opt.allow_async)) synchronize();
+  // `strm`: the stream of the work that just ended.
+  void finish(uintptr_t strm) {
+    if (capturing) return;  // recorded, not run: nothing to wait for
+    if (!(opt.sync_always || (host_pending && !opt.allow_async))) return;
+    if (is_capturing(strm)) return;  // earlier work stays pending: no waiting during a capture
+    synchronize();
   }
+
+  // Sets `capturing` for one flush or replay on `strm`.
+  struct Capture {
+    Impl& m;
+    bool was;
+    Capture(Impl& impl, uintptr_t strm) : m(impl), was(impl.capturing) { m.capturing = m.is_capturing(strm); }
+    ~Capture() { m.capturing = was; }
+  };
 };
 
 namespace {
@@ -748,7 +798,7 @@ void Engine::end_scope() {
   if (impl_->depth == 0) fail(Errc::invalid_argument, "end_scope without begin_scope");
   if (--impl_->depth == 0) {
     impl_->flush();
-    impl_->finish();
+    impl_->finish(impl_->stream);
   }
 }
 
@@ -843,10 +893,13 @@ class FrozenImpl final : public Frozen {
       : eng_(eng), ops_(std::move(ops)), ran_(std::move(ran)) {}
   void run(uintptr_t stream) override {
     Locked lk(*eng_);
+    const Engine::Impl::Capture cap(*eng_, stream);
     const auto& groups = ran_.plan->groups;
-    for (size_t i = 0; i < groups.size(); ++i)
-      eng_->run_group(groups[i], ran_.strategies[i], *ops_, stream, false, nullptr);
-    eng_->finish();
+    for (size_t i = 0; i < groups.size(); ++i) {
+      const Strategy s = eng_->capturing ? eng_->capture_choice(groups[i], *ops_, ran_.strategies[i]) : ran_.strategies[i];
+      eng_->run_group(groups[i], s, *ops_, stream, false, nullptr);
+    }
+    eng_->finish(stream);
   }
 
  private:

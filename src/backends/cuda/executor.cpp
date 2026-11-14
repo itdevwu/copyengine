@@ -245,6 +245,35 @@ class CudaExecutor final : public Executor {
     return with_fused({Strategy::staged});
   }
 
+  bool capturing(uintptr_t stream) override {
+    if (stream == 0) return false;  // the legacy stream cannot be captured
+    CUstreamCaptureStatus st = CU_STREAM_CAPTURE_STATUS_NONE;
+    check(d_->cuStreamIsCapturing(reinterpret_cast<CUstream>(stream), &st), "cuStreamIsCapturing");
+    return st != CU_STREAM_CAPTURE_STATUS_NONE;
+  }
+
+  bool capture_safe(Strategy strat, const Group& g) override {
+    const int di = device_of(g);
+    if (di < 0 || di >= static_cast<int>(devs_.size()) || !devs_[di].init) return false;  // first use sets up the device
+    const bool src_ok = g.src.device.kind == DeviceKind::cuda || g.src.pinned;
+    const bool dst_ok = g.dst.device.kind == DeviceKind::cuda || g.dst.pinned;
+    const bool on_device = g.src.device.kind == DeviceKind::cuda && g.dst.device.kind == DeviceKind::cuda &&
+                           g.src.device.index == g.dst.device.index;
+    switch (strat) {
+      case Strategy::runs: return g.pure() && src_ok && dst_ok;  // plain DMA calls
+      case Strategy::passthrough: return g.pure() && src_ok && dst_ok;
+      case Strategy::kernel: return on_device && g.exec_cache[static_cast<int>(Strategy::kernel)] != nullptr;
+      case Strategy::fused: {
+        const auto& slot = g.exec_cache[static_cast<int>(Strategy::fused)];
+        if (!on_device || !slot) return false;
+        const auto& P = *static_cast<const FusedPlan*>(slot.get());
+        return P.ok && !P.cross &&
+               std::all_of(P.batches.begin(), P.batches.end(), [](const FusedBatch& b) { return b.table != nullptr; });
+      }
+      default: return false;  // staging, bounce buffers, batch descriptors: allocate or wait on the host
+    }
+  }
+
   int64_t run(Strategy strat, const Group& g, const std::vector<Op>& ops, uintptr_t stream) override {
     const int di = device_of(g);
     Dev& s = state(di);

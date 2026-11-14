@@ -31,6 +31,12 @@ class Executor {
   virtual void release(int64_t /*m*/) {}
   // Whether the work before mark `m` has completed (does not release it).
   virtual bool ready(int64_t /*m*/) { return true; }
+  // CUDA Graph capture. While `stream` is being captured, work may only be
+  // enqueued on it: no allocation, synchronization or event query.
+  virtual bool capturing(uintptr_t /*stream*/) { return false; }
+  // Whether running `s` for `g` now only enqueues stream work (its tables
+  // already resident, no staging, pinned or device memory only).
+  virtual bool capture_safe(Strategy /*s*/, const Group& /*g*/) { return true; }
   // Admission results etc. for stats().
   virtual Json info() { return Json(true); }
 };

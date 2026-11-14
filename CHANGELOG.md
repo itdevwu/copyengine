@@ -19,6 +19,16 @@ change incompatibly only in a new minor (0.x) or major release.
   thread blocks. `stats()["cuda"]` reports which. DMA copies are unaffected.
 - The no-regression and same-results guarantees now state what holds for
   NaN: NaN stays NaN, its payload is not kept (torch's differs per device).
+## 0.1.1
+
+- CUDA Graphs: copies issued while a stream is being captured
+  (`torch.cuda.graph`) are recorded and replay correctly, in scopes, through
+  the explicit API and from `FrozenPlan.run()`. During a capture copyengine
+  does not explore, wait, time or allocate: it uses the decided strategy when
+  that only enqueues stream work, else torch's own copy. A copy torch has no
+  equivalent for (a `ce.lazy` gather, `ce.segments`) must run once before
+  capture; otherwise copyengine raises `Unsupported` instead of breaking the
+  capture.
 
 ## 0.1.0
 

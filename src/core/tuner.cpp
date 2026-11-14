@@ -286,6 +286,13 @@ void Tuner::online(Entry& e, Strategy s, Sample sample) {
   }
 }
 
+void Tuner::discard(const std::string& bucket, Strategy s) {
+  auto it = table_.find(bucket);
+  if (it == table_.end()) return;
+  int& p = it->second.pending[static_cast<int>(s)];
+  if (p > 0) --p;
+}
+
 void Tuner::report(const std::string& bucket, Strategy s, Sample sample) {
   auto it = table_.find(bucket);
   if (it == table_.end()) return;

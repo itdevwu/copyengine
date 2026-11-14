@@ -538,6 +538,9 @@ struct Engine::Impl {
     Executor& ex = exec_for(g.src, g.dst);
     if (&ex == &host && host_pending && !capturing) synchronize();  // host work may touch what CUDA work still uses
     const int64_t a = measure ? ex.mark(strm, device_of(g)) : -1;
+    // Setup on a strategy's first run for this group (tables made resident,
+    // descriptors built) is paid once, not per run: such a run is no sample.
+    const bool had_cache = g.exec_cache[static_cast<int>(s)] != nullptr;
     const auto t0 = Clock::now();
     int64_t calls = 0;
     if (s == Strategy::native) {
@@ -546,10 +549,15 @@ struct Engine::Impl {
     } else {
       calls = ex.run(s, g, ops, strm);
     }
-    if (measure) {
+    if (measure && !had_cache && g.exec_cache[static_cast<int>(s)] != nullptr) {
+      ex.release(a);
+      tuner.discard(g.bucket, s);
+    } else if (measure) {
+      // Submitting the ops into the engine is paid whatever runs them: torch's
+      // copy is only chosen after interception (or the explicit call) went
+      // through it. Counting it on one side only biased the A/B toward native.
       double submit = 0;
-      if (s != Strategy::native)  // ce also paid for submitting the ops; native would not have
-        for (int k : g.ops) submit += ops[k].enqueue_us;
+      for (int k : g.ops) submit += ops[k].enqueue_us;
       const int64_t b = ex.mark(strm, device_of(g));
       samples.push_back({g.bucket, s, us_since(t0) + submit, submit, a, b, &ex});
     }

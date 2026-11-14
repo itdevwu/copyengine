@@ -9,11 +9,15 @@ change incompatibly only in a new minor (0.x) or major release.
 - copyengine's pinned host buffers (bounce and upload buffers) come from
   torch's pinned allocator when torch provides it, so they count in its host
   memory statistics; `stats()["cuda"][i]["host_allocator"]` reports it.
-
 - CUDA index tensors stay on the GPU in `ce.gather`, `ce.scatter_` and
   `ce.lazy(...).index_select`: the statement kernel reads them (no device
   synchronization), and new indices reuse the same plan. Out-of-range indices
   are skipped and raise `ValueError` at the next `synchronize()`.
+- Bandwidth limits: `ce.scope(bandwidth=bytes_per_s)` and
+  `Engine(bandwidth=...)` run copies that touch a GPU as a paced background
+  transfer (a GPU pacing kernel between chunks, per GPU and direction; no
+  host waits, recorded into CUDA graphs). Small rows use zero-copy kernels
+  over pinned host memory with streaming accesses. Results do not change.
 
 ## 0.2.2
 

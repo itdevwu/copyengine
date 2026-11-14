@@ -83,7 +83,10 @@ scope: it runs as usual, ordered correctly around the copies.
    SMs per GPU, leaving the rest to your compute. Where the driver supports
    green contexts the limit is hard (checked on start); otherwise copyengine
    launches at most N thread blocks. DMA copies use the copy engines and no
-   SMs; memory bandwidth is still shared.
+   SMs; memory bandwidth is still shared, unless you limit it:
+   `ce.scope(bandwidth=8e9)` (or `Engine(bandwidth=...)`) paces the copies on
+   the GPU to about 8 GB/s per direction, leaving the rest of the link to
+   other work.
 
 The first runs of each new copy pattern are a warmup: copyengine measures its
 options, then locks the fastest. Save the result with `eng.save_profile(path)`

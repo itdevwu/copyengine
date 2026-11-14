@@ -630,6 +630,42 @@ def test_own_memory_counts_in_torch_statistics():
     torch.testing.assert_close(dst.cpu(), src.t(), rtol=0, atol=0)
 
 
+_PINNED_CHECK = """
+import torch, copyengine as ce
+def host_bytes():
+    s = torch._C._cuda_hostMemoryStats() if hasattr(torch._C, "_cuda_hostMemoryStats") else {}
+    return s.get("allocated_bytes", {}).get("allocated", 0)
+e = ce.Engine(tune_trials=1, tune_topk=4)
+e.copy_(torch.zeros(4, device="cuda"), torch.ones(4, device="cuda"))
+info = e.stats()["cuda"][0]
+src, dst = torch.randn(512, 256), torch.zeros(512, 256, device="cuda")
+perm = torch.randperm(512).tolist()
+before, seen = host_bytes(), set()
+for _ in range(8):  # explores bounce (pinned bounce buffers)
+    dst.zero_()
+    with e.scope():
+        for i, j in enumerate(perm):
+            e.copy_(dst[j], src[i])
+    torch.cuda.synchronize()
+    seen.update(e.stats()["last"]["strategies"])
+    assert torch.equal(dst[perm].cpu(), src)
+print(info["host_allocator"], "bounce" in seen, host_bytes() - before >= 1 << 20)
+"""
+
+
+def test_own_pinned_memory_counts_in_torch_statistics():
+    # A fresh process: the backend's buffers outlive engines, so earlier tests may own them.
+    import subprocess
+    import sys
+    _skip_unless_torch_allocator()
+    out = subprocess.run([sys.executable, "-c", _PINNED_CHECK], capture_output=True, text=True)
+    words = out.stdout.split()
+    assert len(words) == 3, out.stderr
+    if words[0] != "torch":
+        pytest.skip("this torch has no pinned allocation entry point")
+    assert words[1:] == ["True", "True"]
+
+
 def test_freed_memory_is_not_reused_before_pending_copies():
     # Staging allocated on stream A is still read by a copy queued on stream B
     # (behind a long kernel) when growth frees it; torch then hands that block

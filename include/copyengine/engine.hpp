@@ -117,6 +117,10 @@ class Engine {
   void decline(std::string_view reason);
   int depth() const;
   size_t queued() const;
+  // Group runs so far that were tuning measurements (exploration or A/B), not
+  // decided strategies: a frontend compares it before and after a region to
+  // tell whether the region ran settled.
+  int64_t tuning_runs() const;
 
   // Tuning table, keyed by hardware fingerprint inside the JSON.
   std::string dump_profile() const;

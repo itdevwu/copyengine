@@ -185,7 +185,8 @@ class Engine:
         self._copy_streams: dict = {}  # device index -> torch.cuda.Stream (scope(stream="copy"))
         self._async_depth = 0          # open scope(stream=...)s
         self._set_depth(0)        # scope depth as seen from Python: whether queued copies need references held
-        self._sites: dict = {}    # call site -> _Site (Python-mode on/off decision)
+        self._sites: dict = {}    # outermost scope call site -> _Site (intercept or not)
+        self._scope_kind = None   # the outermost open scope's interception (inner scopes share it)
 
     # ---- scope ----------------------------------------------------------------
 
@@ -223,12 +224,16 @@ class Engine:
             return self._force, False
         if torch is None or self._opts.disable:
             return None, False
-        if _shim.lib is not None:
-            return "shim", False
+        on = "shim" if _shim.lib is not None else "mode"
+        if self._depth > 1:  # an inner scope: the outermost one decided (this one is already counted in depth)
+            return self._scope_kind, False
         st = self._sites.get(site)
         if st is None:
-            st = self._sites[site] = _Site()
-        return st.choose()
+            st = self._sites[site] = _Site(on)
+        kind, timed = st.choose()
+        if timed and torch is not None and torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            return (kind if st.decided is not None else on), False  # nothing runs during a capture: no samples
+        return kind, timed
 
     def barrier(self) -> None:
         """Issue everything queued and wait for it."""
@@ -393,7 +398,11 @@ class Engine:
             return FrozenPlan(self, self._e.freeze(), list(self._held))
 
     def stats(self) -> dict:
-        return json.loads(self._e.stats_json())
+        out = json.loads(self._e.stats_json())
+        # Per outermost scope call site: whether it intercepts (None: still deciding).
+        out["scopes"] = [{"site": f"{code.co_filename}:{line}", "intercept": st.decided}
+                         for (code, line), st in self._sites.items()]
+        return out
 
     def dump_profile(self) -> str:
         return self._e.dump_profile()
@@ -431,23 +440,59 @@ class Engine:
 
 
 class _Site:
-    """Python-mode interception costs ~9 us per op, paid at scope entry. One
-    call site alternates entries with and without it; the mode stays only if
-    it wins clearly (the same rule as the engine's A/B), else the site runs
-    torch natively from then on."""
+    """Whether one outermost scope call site intercepts copies.
+
+    Interception costs something even when ce wins every copy it plans: each op
+    in the scope is dispatched through it, and copies left to torch are queued
+    and replayed. The baseline is the scope not intercepting at all. A site
+    first runs intercepted until the engine is settled there (``SETTLE``
+    entries in a row without tuning runs), then alternates entries with and
+    without interception, each timed end to end (host time, and GPU time from
+    the scope's entry to its last work, read later without waiting).
+    Interception stays only if it wins clearly (the engine's A/B rule); ties
+    keep torch. Entries that ran tuning measurements are not samples.
+    """
 
     PAIRS = 10
+    SETTLE = 3
+    MAX_WARM = 256  # an engine that never settles: compare anyway
 
-    def __init__(self):
+    def __init__(self, on_kind: str = "mode"):
+        self.on_kind = on_kind
         self.on: list[float] = []
         self.off: list[float] = []
         self.decided: Optional[bool] = None
+        self.settled = 0
+        self.warm = 0
+        self.waiting: list = []  # (used, host seconds, start event, end event) not yet complete
 
     def choose(self):
+        """(kind, timed) for the next entry: kind is the interception or None."""
         if self.decided is not None:
-            return ("mode" if self.decided else None), False
-        use = len(self.on) <= len(self.off)
-        return ("mode" if use else None), True
+            return (self.on_kind if self.decided else None), False
+        self._poll()
+        if self.settled < self.SETTLE and self.warm < self.MAX_WARM:
+            return self.on_kind, "warm"
+        if self.decided is not None:
+            return (self.on_kind if self.decided else None), False
+        use = len(self.on) + sum(w[0] for w in self.waiting) <= len(self.off) + sum(not w[0] for w in self.waiting)
+        return (self.on_kind if use else None), True
+
+    def warmed(self, quiet: bool) -> None:
+        """A warm-up entry ended; `quiet`: it ran no tuning measurements."""
+        self.warm += 1
+        self.settled = self.settled + 1 if quiet else 0
+
+    def sample(self, used: bool, seconds: float, start=None, end=None) -> None:
+        if start is None:
+            self.report(used, seconds)
+        else:
+            self.waiting.append((used, seconds, start, end))
+
+    def _poll(self) -> None:
+        while self.waiting and self.waiting[0][3].query():
+            used, host, start, end = self.waiting.pop(0)
+            self.report(used, max(host, start.elapsed_time(end) / 1e3))
 
     def report(self, used: bool, seconds: float) -> None:
         (self.on if used else self.off).append(seconds)
@@ -457,6 +502,7 @@ class _Site:
         on, off = self.on[:n], self.off[:n]
         wins = sum(a < b for a, b in zip(on, off))
         self.decided = statistics.median(on) <= 0.95 * statistics.median(off) and wins >= _sign_test(n)
+        self.waiting.clear()
 
 
 def _sign_test(n: int) -> int:
@@ -500,12 +546,14 @@ class Pending:
 
 
 class _Scope:
-    __slots__ = ("engine", "site", "kind", "mode", "timed", "t0", "stream", "stream_ctx", "outer_held", "pending")
+    __slots__ = ("engine", "site", "kind", "mode", "timed", "t0", "stream", "stream_ctx", "outer_held", "pending",
+                 "runs0", "ev0")
 
     def __init__(self, engine: Engine, site, stream=None):
         self.engine, self.site = engine, site
         self.kind = self.mode = None
         self.timed, self.t0 = False, 0.0
+        self.runs0, self.ev0 = 0, None
         self.stream, self.stream_ctx, self.outer_held, self.pending = stream, None, None, None
 
     def __enter__(self):
@@ -528,7 +576,13 @@ class _Scope:
             if st is not None:
                 self.outer_held, e._held = e._held, []
         self.kind, self.timed = e._interception(self.site)
+        if e._depth == 1:
+            e._scope_kind = self.kind
         if self.timed:
+            self.runs0 = e._e.tuning_runs
+            if self.timed is True and torch is not None and torch.cuda.is_available() and torch.cuda.is_initialized():
+                self.ev0 = torch.cuda.Event(enable_timing=True)
+                self.ev0.record()
             self.t0 = time.perf_counter()
         if self.kind == "shim":
             if _shim.lib is None:
@@ -570,7 +624,18 @@ class _Scope:
                     self.stream_ctx.__exit__(*exc)
                     self.stream_ctx = None
         if self.timed:
-            e._sites[self.site].report(self.kind == "mode", time.perf_counter() - self.t0)
+            host = time.perf_counter() - self.t0
+            site = e._sites[self.site]
+            quiet = e._e.tuning_runs == self.runs0
+            if self.timed == "warm":
+                site.warmed(quiet)
+            elif quiet:  # an entry that ran tuning measurements is not a sample
+                end = None
+                if self.ev0 is not None:
+                    end = torch.cuda.Event(enable_timing=True)
+                    end.record(self.stream if self.stream is not None else torch.cuda.current_stream())
+                site.sample(self.kind is not None, host, self.ev0, end)
+            self.ev0 = None
 
 
 class _PendingSlot:

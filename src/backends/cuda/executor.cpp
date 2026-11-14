@@ -224,6 +224,7 @@ class CudaExecutor final : public Executor {
       if (s.staging_used) d_->cuEventSynchronize(s.staging_done);
       dev_free(s, s.staging);
       dev_free(s, s.err);
+      dev_free(s, s.pace);
       if (s.sm_stream) {
         d_->cuStreamSynchronize(s.sm_stream);
         d_->cuStreamDestroy(s.sm_stream);
@@ -327,6 +328,15 @@ class CudaExecutor final : public Executor {
                  return b.device_tables ? b.captured.size() < kMaxCaptured : b.table != nullptr;
                });
       }
+      case Strategy::paced: {
+        const auto& slot = g.exec_cache[static_cast<int>(Strategy::paced)];
+        if (!slot || !devs_[di].pace.ptr) return false;
+        const auto& P = *static_cast<const PacedPlan*>(slot.get());
+        return std::all_of(P.chunks.begin(), P.chunks.end(), [](const PacedChunk& c) {
+          if (c.inner == Strategy::runs || c.inner == Strategy::batch) return true;  // batch records as runs
+          return c.inner == Strategy::kernel && c.g.exec_cache[static_cast<int>(Strategy::kernel)] != nullptr;
+        });
+      }
       default: return false;  // staging, bounce buffers, batch descriptors: allocate or wait on the host
     }
   }
@@ -346,6 +356,7 @@ class CudaExecutor final : public Executor {
       case Strategy::staged: return staged(s, g, st);
       case Strategy::bounce: return bounce(s, g.src, g.dst, cached_rows(g, Strategy::bounce), st);
       case Strategy::fused: return fused(s, g, ops, st);
+      case Strategy::paced: return paced(s, g, st);
       default: fail(Errc::unsupported, "CUDA backend cannot run strategy " + std::string(strategy_name(strat)));
     }
   }
@@ -435,6 +446,8 @@ class CudaExecutor final : public Executor {
                     .set("kernels", s.kernels ? Json(true) : Json(s.kernel_error))
                     .set("batch", s.batch ? Json(true) : Json(s.batch_error))
                     .set("sm_limit", s.sm_limit)
+                    .set("zero_copy", s.zero_copy < 0 ? Json("unchecked")
+                                                      : (s.zero_copy ? Json(true) : Json(s.zero_copy_error)))
                     .set("allocator", device_allocator() ? device_allocator()->name : "cuda")
                     .set("host_allocator",
                          device_allocator() && device_allocator()->host_alloc ? device_allocator()->name : "cuda"));
@@ -502,6 +515,12 @@ class CudaExecutor final : public Executor {
     DevMem err;               // set by kernels that meet an out-of-range device index
     bool err_armed = false;   // such kernels ran since the last check
     bool err_graphs = false;  // ... or were captured: graph replays may set it at any time
+    // Bandwidth limit: the pacing words (the next start time per direction,
+    // on the device), and whether kernels may read and write pinned host
+    // memory directly (zero-copy), checked by a test copy.
+    DevMem pace;
+    int zero_copy = -1;  // -1: not checked yet
+    std::string zero_copy_error;
   };
 
   CUdeviceptr error_word(Dev& s) {
@@ -1164,7 +1183,7 @@ class CudaExecutor final : public Executor {
                     long long sadd, long long dadd, CUstream st) {
     if (chunks == 0) return;
     CUfunction f = find_function(s, name);
-    const bool bytes = name == "ce_bytes";  // no function argument
+    const bool bytes = name == "ce_bytes" || name == "ce_bytes_cs";  // no function argument
     // A pair without a compiled kernel: the run-time dispatched one.
     int sdt = 0, ddt = 0, identity = 0;
     const bool dyn = !f && parse_kernel(name, &sdt, &ddt, &identity);
@@ -1427,6 +1446,15 @@ class CudaExecutor final : public Executor {
 
   // `resident`: the group belongs to a cached plan, so its table can live on
   // the device; a one-off group (passthrough of one op) uploads it per call.
+  // The kernel strategy with a given chunk kernel (zero-copy: streaming accesses).
+  int64_t kernel_named(Dev& s, const Group& g, const std::string& name, CUstream st) {
+    auto& slot = g.exec_cache[static_cast<int>(Strategy::kernel)];
+    if (!slot) slot = resident(s, chunks_of(g));
+    const auto& t = *static_cast<DevTable*>(slot.get());
+    launch_table(s, name, t.ptr, t.count, to_cv(g.fn), 0, 0, st);
+    return 1;
+  }
+
   int64_t kernel(Dev& s, const Group& g, CUstream st, bool resident_table = true) {
     if (!resident_table) {
       launch(s, kernel_name(g), chunks_of(g), to_cv(g.fn), st);
@@ -1600,6 +1628,169 @@ class CudaExecutor final : public Executor {
       }
       staging_release(s, st);
       calls += 2;
+    }
+    return calls;
+  }
+
+  // ---- bandwidth limit: paced chunks ------------------------------------------------------
+  //
+  // A limited group is cut into chunks of about kPaceUs at the limit; before
+  // each chunk a one-thread kernel waits on the GPU until the chunk's slot
+  // (ce_pace). The stream carries the whole schedule: no host thread, no host
+  // waits, and a CUDA graph records it like any other launch. Each chunk runs
+  // the cheapest way that suits its layout: DMA (runs / batch) where rows are
+  // large, else a kernel on the device or zero-copy over pinned host memory,
+  // else staging / bounce buffers (pageable memory).
+
+  static constexpr double kPaceUs = 250;  // chunk duration at the limit
+  static constexpr int64_t kPaceMin = 64 << 10, kPaceMax = 16 << 20;
+
+  struct PacedChunk {
+    Group g;  // this chunk's runs, with the parent's sides and cuts (and its own tables)
+    Strategy inner = Strategy::runs;
+    bool zero_copy = false;     // kernel over pinned host memory
+    unsigned long long ns = 0;  // the chunk's time at the limit
+  };
+  struct PacedPlan {
+    int dir = 0;  // pacing word: 0 H2D, 1 D2H, 2 on / between GPUs
+    bool has_batch = false;
+    std::vector<PacedChunk> chunks;
+  };
+
+  // Zero-copy admission: a kernel copies through pinned host memory both
+  // ways, and the bytes must come back exact.
+  bool zero_copy_ok(Dev& s) {
+    if (s.zero_copy >= 0) return s.zero_copy == 1;
+    s.zero_copy = 0;
+    if (!s.kernels) {
+      s.zero_copy_error = "no kernels: " + s.kernel_error;
+      return false;
+    }
+    const size_t n = 1 << 16;
+    void* host = nullptr;
+    CUdeviceptr dev = 0;
+    try {
+      check(d_->cuMemHostAlloc(&host, 2 * n, 0), "cuMemHostAlloc");
+      check(d_->cuMemAlloc(&dev, n), "cuMemAlloc");
+      auto* h = static_cast<unsigned char*>(host);
+      for (size_t i = 0; i < n; ++i) h[i] = static_cast<unsigned char>(i * 131 + 7), h[n + i] = 0;
+      const long long hp = static_cast<long long>(reinterpret_cast<uintptr_t>(host));
+      const long long dp = static_cast<long long>(dev), ln = static_cast<long long>(n);
+      launch(s, "ce_bytes_cs", {Chunk{hp, dp, ln, 1, 0, 0}}, {}, s.side);       // host -> device
+      launch(s, "ce_bytes_cs", {Chunk{dp, hp + ln, ln, 1, 0, 0}}, {}, s.side);  // device -> host
+      check(d_->cuStreamSynchronize(s.side), "cuStreamSynchronize");
+      s.zero_copy = std::memcmp(h, h + n, n) == 0 ? 1 : 0;
+      if (!s.zero_copy) s.zero_copy_error = "test copy through pinned host memory came back wrong";
+    } catch (const Error& e) {
+      s.zero_copy_error = e.what();
+      s.zero_copy = 0;
+    }
+    if (dev) d_->cuMemFree(dev);
+    if (host) d_->cuMemFreeHost(host);
+    return s.zero_copy == 1;
+  }
+
+  // Every host allocation the runs touch is pinned and mapped at the same
+  // address on the device (unified addressing): kernels may use the pointers.
+  bool host_mapped(const Runs& r, const std::vector<i64>& cuts, bool src_side, size_t isz) {
+    std::vector<size_t> seen;
+    for (size_t i = 0; i < r.size(); ++i) {
+      const i64 at = src_side ? r.src[i] : r.dst[i];
+      const size_t k = static_cast<size_t>(std::upper_bound(cuts.begin(), cuts.end(), at) - cuts.begin());
+      if (std::find(seen.begin(), seen.end(), k) != seen.end()) continue;
+      seen.push_back(k);
+      const uintptr_t addr = static_cast<uintptr_t>(at) * isz;
+      CUdeviceptr dp = 0;
+      if (d_->cuPointerGetAttribute(&dp, CU_POINTER_ATTRIBUTE_DEVICE_POINTER, addr) != CUDA_SUCCESS ||
+          dp != static_cast<CUdeviceptr>(addr))
+        return false;
+    }
+    return true;
+  }
+
+  PacedPlan build_paced(Dev& s, const Group& g) {
+    if (!s.kernels) fail(Errc::unsupported, "a bandwidth limit needs the kernel module (pacing): " + s.kernel_error);
+    if (!(g.bandwidth > 0)) fail(Errc::backend, "paced: the group has no bandwidth limit");
+    const bool sc = g.src.device.kind == DeviceKind::cuda, dc = g.dst.device.kind == DeviceKind::cuda;
+    const bool same_dev = sc && dc && g.src.device.index == g.dst.device.index;
+    if (!g.pure() && sc && dc && !same_dev)
+      fail(Errc::unsupported, "converting copies between two GPUs are not supported yet");
+    if (!s.pace.ptr) {
+      s.pace = dev_alloc(s, 3 * sizeof(unsigned long long), "pacing words");
+      check(d_->cuMemsetD8Async(s.pace.ptr, 0, 3 * sizeof(unsigned long long), s.side), "cuMemsetD8Async");
+      check(d_->cuStreamSynchronize(s.side), "cuStreamSynchronize");
+    }
+    PacedPlan P;
+    P.dir = sc && dc ? 2 : (dc ? 0 : 1);
+    // The bytes that count: the host side's across the link, the destination's on the device.
+    const Side& link = sc && dc ? g.dst : (dc ? g.src : g.dst);
+    const i64 lsz = static_cast<i64>(itemsize(link.dtype));
+    const double bw = g.bandwidth;
+    const int64_t chunk = std::clamp<int64_t>(static_cast<int64_t>(bw * kPaceUs * 1e-6), kPaceMin, kPaceMax);
+    const bool host_ok = (sc || g.src.pinned) && (dc || g.dst.pinned);
+    for (Runs& piece : g.runs.chunks(std::max<i64>(1, chunk / lsz))) {
+      PacedChunk c;
+      Group& sub = c.g;
+      sub.src = g.src, sub.dst = g.dst, sub.fn = g.fn, sub.ctx = g.ctx, sub.wave = g.wave;
+      sub.src_cuts = g.src_cuts, sub.dst_cuts = g.dst_cuts, sub.src_allocs = g.src_allocs;
+      sub.op_runs = static_cast<int64_t>(piece.size());
+      sub.rects = recover_2d(piece, 2, sub.src_cuts, sub.dst_cuts);
+      sub.runs = std::move(piece);
+      c.ns = static_cast<unsigned long long>(static_cast<double>(sub.runs.total() * lsz) / bw * 1e9);
+      int64_t rows = 0;
+      for (i64 h : sub.rects.height) rows += h;
+      const bool fragmented = rows > 2 && sub.bytes() / rows < kSmallRect;
+      auto zero_copy = [&] {
+        if (sc == dc || !host_ok || !zero_copy_ok(s)) return false;
+        const bool host_src = !sc;
+        return host_mapped(sub.runs, host_src ? sub.src_cuts : sub.dst_cuts, host_src,
+                           itemsize(host_src ? sub.src.dtype : sub.dst.dtype));
+      };
+      if (g.pure()) {
+        if (!host_ok) c.inner = Strategy::bounce;
+        else if (fragmented && same_dev) c.inner = Strategy::kernel;
+        else if (fragmented && zero_copy()) c.inner = Strategy::kernel, c.zero_copy = true;
+        else if (sub.rects.size() > 2 && s.batch) c.inner = Strategy::batch;
+        else c.inner = Strategy::runs;
+      } else if (same_dev) {
+        c.inner = Strategy::kernel;
+      } else if (zero_copy()) {
+        c.inner = Strategy::kernel, c.zero_copy = true;
+      } else {
+        c.inner = Strategy::staged;
+      }
+      P.has_batch |= c.inner == Strategy::batch;
+      P.chunks.push_back(std::move(c));
+    }
+    return P;
+  }
+
+  int64_t paced(Dev& s, const Group& g, CUstream st) {
+    auto& slot = g.exec_cache[static_cast<int>(Strategy::paced)];
+    if (!slot) slot = std::make_shared<PacedPlan>(build_paced(s, g));
+    const auto& P = *static_cast<const PacedPlan*>(slot.get());
+    CUfunction pace = function(s, "ce_pace");
+    CUdeviceptr word = s.pace.ptr + static_cast<CUdeviceptr>(P.dir) * sizeof(unsigned long long);
+    // Batch descriptors are not recorded into graphs: those chunks go as plain DMA calls.
+    const bool rec = P.has_batch && capturing(reinterpret_cast<uintptr_t>(st));
+    int64_t calls = 0;
+    for (const PacedChunk& c : P.chunks) {
+      unsigned long long ns = c.ns;
+      void* args[] = {&word, &ns};
+      check(d_->cuLaunchKernel(pace, 1, 1, 1, 32, 1, 1, 0, st, args, nullptr), "cuLaunchKernel ce_pace");
+      ++calls;
+      const Group& sub = c.g;
+      switch (rec && c.inner == Strategy::batch ? Strategy::runs : c.inner) {
+        case Strategy::runs: calls += runs(sub, st); break;
+        case Strategy::batch: calls += batch(s, sub.src, sub.dst, cached_rows(sub, Strategy::batch), st); break;
+        case Strategy::kernel:
+          calls += c.zero_copy ? kernel_named(s, sub, sub.pure() ? "ce_bytes_cs" : kernel_name(sub), st)
+                               : kernel(s, sub, st);
+          break;
+        case Strategy::staged: calls += staged(s, sub, st); break;
+        case Strategy::bounce: calls += bounce(s, sub.src, sub.dst, cached_rows(sub, Strategy::bounce), st); break;
+        default: fail(Errc::backend, "paced: unexpected chunk strategy");
+      }
     }
     return calls;
   }

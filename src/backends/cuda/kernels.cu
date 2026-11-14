@@ -90,30 +90,68 @@ __device__ __forceinline__ void typed(const Chunk* __restrict__ chunks, int n, F
   CE_FOR_CHUNKS(chunks, n, sadd, dadd) typed_one<D, S, kIdentity>(c, lane, fn);
 }
 
-template <class V>
+// kStream: streaming (evict-first) loads and stores, ld.global.cs / st.global.cs,
+// for background copies that should not evict the compute's data from L2.
+template <class V, bool kStream = false>
 __device__ __forceinline__ void move(uintptr_t s, uintptr_t d, long long nbytes, int lane) {
   const V* __restrict__ sv = reinterpret_cast<const V*>(s);
   V* __restrict__ dv = reinterpret_cast<V*>(d);
   const long long n = nbytes / static_cast<long long>(sizeof(V));
-  for (long long i = lane; i < n; i += 32) dv[i] = sv[i];
+  for (long long i = lane; i < n; i += 32) {
+    if constexpr (kStream) __stcs(dv + i, __ldcs(sv + i));
+    else dv[i] = sv[i];
+  }
 }
 
 }  // namespace
 
 // Pure byte copies: widest vector the chunk's alignment allows.
+template <bool kStream>
 __device__ __forceinline__ void bytes_one(Chunk c, int lane) {
   const uintptr_t a = static_cast<uintptr_t>(c.src | c.dst | c.width | c.spitch | c.dpitch);
   for (long long r = 0; r < c.rows; ++r) {
     const uintptr_t s = static_cast<uintptr_t>(c.src + r * c.spitch), d = static_cast<uintptr_t>(c.dst + r * c.dpitch);
-    if ((a & 15) == 0) move<uint4>(s, d, c.width, lane);
-    else if ((a & 7) == 0) move<uint2>(s, d, c.width, lane);
-    else if ((a & 3) == 0) move<uint32_t>(s, d, c.width, lane);
-    else move<uint8_t>(s, d, c.width, lane);
+    if ((a & 15) == 0) move<uint4, kStream>(s, d, c.width, lane);
+    else if ((a & 7) == 0) move<uint2, kStream>(s, d, c.width, lane);
+    else if ((a & 3) == 0) move<unsigned int, kStream>(s, d, c.width, lane);
+    else move<unsigned char, kStream>(s, d, c.width, lane);
   }
 }
 
 extern "C" __global__ void ce_bytes(const Chunk* __restrict__ chunks, int n, long long sadd, long long dadd) {
-  CE_FOR_CHUNKS(chunks, n, sadd, dadd) bytes_one(c, lane);
+  CE_FOR_CHUNKS(chunks, n, sadd, dadd) bytes_one<false>(c, lane);
+}
+
+// The same with streaming accesses: zero-copy over pinned host memory in
+// bandwidth-limited (paced) copies.
+extern "C" __global__ void ce_bytes_cs(const Chunk* __restrict__ chunks, int n, long long sadd, long long dadd) {
+  CE_FOR_CHUNKS(chunks, n, sadd, dadd) bytes_one<true>(c, lane);
+}
+
+// Bandwidth pacing: one thread, launched before each chunk of a paced copy on
+// its stream. `*next` (per GPU and direction) is the earliest time, on the
+// GPU's global timer, at which the next chunk may start; this chunk reserves
+// [start, start + ns) and the stream waits until start. The reservation is a
+// CAS loop, so concurrent paced streams share the budget. Needs sm_70
+// (__nanosleep); older GPUs only reserve (no wait).
+extern "C" __global__ void ce_pace(unsigned long long* next, unsigned long long ns) {
+  if (threadIdx.x != 0 || blockIdx.x != 0) return;
+  unsigned long long now;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
+  unsigned long long old = *reinterpret_cast<volatile unsigned long long*>(next), start;
+  for (;;) {
+    start = old > now ? old : now;
+    const unsigned long long seen = atomicCAS(next, old, start + ns);
+    if (seen == old) break;
+    old = seen;
+  }
+#if __CUDA_ARCH__ >= 700
+  while (now < start) {
+    const unsigned long long left = start - now;
+    __nanosleep(static_cast<unsigned>(left < 500000ull ? left : 500000ull));
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
+  }
+#endif
 }
 
 // Structured statements: dst[D(i)] = f(src[S(i)]) over a shared domain, for a

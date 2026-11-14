@@ -106,6 +106,7 @@ struct Engine::Impl {
   mutable std::recursive_mutex mu;
   int depth = 0;
   std::vector<bool> scope_async;  // per open scope: begin_scope(host_async)
+  std::vector<double> scope_bw;   // per open scope: its bandwidth limit (0: inherited)
   int async_depth = 0;            // open scopes with host_async
   std::vector<Op> queue;
   uintptr_t stream = 0;
@@ -374,6 +375,12 @@ struct Engine::Impl {
   // enqueues stream work, else torch's own copy (capturable), else plain DMA.
   Strategy capture_choice(const Group& g, const std::vector<Op>& ops, std::optional<Strategy> want) {
     Executor& ex = exec_for(g.src, g.dst);
+    if (g.bandwidth > 0) {  // the limit holds in graphs too: paced or nothing
+      if (ex.capture_safe(Strategy::paced, g)) return Strategy::paced;
+      fail(Errc::unsupported,
+           "copyengine cannot record this bandwidth-limited copy in a CUDA graph: run it once before capturing "
+           "(pacing state and tables are set up on first use); pageable host memory cannot be captured");
+    }
     if (!want) want = tuner.locked_strategy(g.bucket);
     if (want && *want != Strategy::native && ex.capture_safe(*want, g)) return *want;
     if (std::all_of(g.ops.begin(), g.ops.end(), [&](int k) { return ops[k].native != nullptr; })) return Strategy::native;
@@ -408,9 +415,24 @@ struct Engine::Impl {
     if (depth == 0) finish(strm);
   }
 
+  // The limit for copies queued now: the innermost scope's, else the engine's.
+  double bandwidth_now() const {
+    for (auto it = scope_bw.rbegin(); it != scope_bw.rend(); ++it)
+      if (*it > 0) return *it;
+    return opt.bandwidth;
+  }
+
   void push(Op op, uintptr_t strm) {
     if (op.runs().empty() && !op.opaque) return;
     if (async_depth > 0) op.host_async = true;
+    if (const double bw = bandwidth_now();
+        bw > 0 && !opt.disable && (op.src.device.kind == DeviceKind::cuda || op.dst.device.kind == DeviceKind::cuda)) {
+      // Paced: never the frontend's full-speed copy, and its own plans.
+      op.bandwidth = bw;
+      op.native.reset();
+      op.fp.a ^= std::bit_cast<uint64_t>(bw) * 0x9E3779B97F4A7C15ull;
+      op.fp.b += 0x5EED;
+    }
     // Only work that touches the device now asks about capture: a copy queued
     // in a scope costs nothing extra.
     std::optional<Capture> cap;
@@ -716,7 +738,8 @@ struct Engine::Impl {
       for (Group& g : p->groups) {
         // Candidates may initialize the device (allocations): not while capturing,
         // and a plan built then is not kept.
-        if (!capturing) g.candidates = tuner.shortlist(exec_for(g.src, g.dst).candidates(g));
+        if (g.bandwidth > 0) g.candidates = {Strategy::paced};
+        else if (!capturing) g.candidates = tuner.shortlist(exec_for(g.src, g.dst).candidates(g));
         g.bucket = bucket_key(g, static_cast<int>(g.ops.size()));
       }
       if (opt.log_plan) log(*p, ops.size());
@@ -740,10 +763,13 @@ struct Engine::Impl {
       Tuner::Pick p{c.baseline, false};
       int64_t runs = 1;
       for (int k : g.ops) runs = std::max(runs, ops[k].weight);
+      // A bandwidth-limited group is not raced against full-speed copies: the
+      // executor paces it (its objective is the limit, not the fastest time).
       if (capturing) p = {capture_choice(g, ops, opt.disable ? std::optional<Strategy>(c.baseline) : std::nullopt), false};
+      else if (g.bandwidth > 0) p = {Strategy::paced, false};
       else if (!opt.disable) p = tuner.pick(g.bucket, c, runs);
       if (!capturing && ops.size() == 1 && plan.groups.size() == 1 && !p.measure &&
-          (opt.disable || tuner.locked(g.bucket)))
+          (opt.disable || g.bandwidth > 0 || tuner.locked(g.bucket)))
         memo = {true, ops.front().fp, pp, p.strategy, 0};
       run_group(g, p.strategy, ops, stream, p.measure, &st);
       ran.strategies.push_back(p.strategy);
@@ -873,11 +899,15 @@ void Engine::decline(std::string_view reason) {
 
 void Engine::begin_scope() { begin_scope(false); }
 
-void Engine::begin_scope(bool host_async) {
+void Engine::begin_scope(bool host_async) { begin_scope(host_async, 0); }
+
+void Engine::begin_scope(bool host_async, double bandwidth) {
+  if (!(bandwidth >= 0)) fail(Errc::invalid_argument, "bandwidth must be >= 0 bytes per second");
   Locked lk(*impl_);
   impl_->check_thread();
   if (impl_->depth++ == 0) impl_->owner = std::this_thread::get_id();
   impl_->scope_async.push_back(host_async);
+  impl_->scope_bw.push_back(bandwidth);
   impl_->async_depth += host_async;
 }
 
@@ -911,6 +941,7 @@ void Engine::end_scope() {
   if (impl_->depth == 0) fail(Errc::invalid_argument, "end_scope without begin_scope");
   impl_->async_depth -= impl_->scope_async.back();
   impl_->scope_async.pop_back();
+  impl_->scope_bw.pop_back();
   if (--impl_->depth == 0) {
     impl_->flush();
     impl_->finish(impl_->stream);
@@ -967,6 +998,7 @@ std::string Engine::stats_json() const {
       std::string why;
       if (m.last_capture) why = "CUDA graph capture: a strategy that only enqueues stream work";
       else if (m.opt.disable) why = "CE_DISABLE";
+      else if (g.bandwidth > 0) why = "bandwidth limit: paced on the GPU, not raced against full speed";
       else why = m.tuner.explain(g.bucket, m.choice_for(g, *m.last_ops), s);
       decisions.push(Json::object()
                          .set("strategy", std::string(strategy_name(s)))

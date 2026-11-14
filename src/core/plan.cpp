@@ -219,12 +219,13 @@ Plan build_plan(const std::vector<Op>& ops) {
       if (level[k] != lv) continue;
       const Op& op = ops[k];
       auto it = std::find_if(groups.begin(), groups.end(), [&](const Group& g) {
-        return g.src == op.src && g.dst == op.dst && g.fn == op.fn && g.ctx == op.ctx;
+        return g.src == op.src && g.dst == op.dst && g.fn == op.fn && g.ctx == op.ctx && g.bandwidth == op.bandwidth;
       });
       if (it == groups.end()) {
         groups.push_back({});
         it = groups.end() - 1;
         it->src = op.src, it->dst = op.dst, it->fn = op.fn, it->ctx = op.ctx, it->wave = lv;
+        it->bandwidth = op.bandwidth;
       }
       it->ops.push_back(k);
       it->runs.append(op.runs());
@@ -272,7 +273,7 @@ std::string bucket_key(const Group& g, int nops) {
   std::string fn = g.fn.identity() ? "id" : (std::string("aff") + (g.fn.round ? "r" : "") + (g.fn.clamp ? "c" : ""));
   return side(g.src) + ">" + side(g.dst) + "|" + fn + "|b" + std::to_string(lg(g.bytes())) + "|n" +
          std::to_string(lg(static_cast<int64_t>(g.rects.size()))) + "|o" + std::to_string(lg(nops)) +
-         (g.rects.has_2d() ? "|2d" : "") + (g.ctx.empty() ? "" : "|" + g.ctx);
+         (g.rects.has_2d() ? "|2d" : "") + (g.ctx.empty() ? "" : "|" + g.ctx) + (g.bandwidth > 0 ? "|paced" : "");
 }
 
 }  // namespace ce

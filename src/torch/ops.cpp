@@ -152,10 +152,50 @@ void torch_free(void* handle) {
   if (!g_shutdown) aoti_torch_delete_tensor_object(static_cast<AtenTensorHandle>(handle));
 }
 
+// Pinned host memory from torch's caching host allocator (what pin_memory()
+// uses), so it counts there. Resolved at run time: the entry point is newer
+// than the oldest torch this library supports.
+using PinnedFn = AOTITorchError (*)(int64_t, const int64_t*, const int64_t*, int32_t, int32_t, int32_t,
+                                    AtenTensorHandle*);
+PinnedFn pinned_fn() {
+  static const PinnedFn fn = [] {
+    for (const char* lib : {"libtorch_cpu.so", "libtorch.so"}) {
+      void* h = dlopen(lib, RTLD_NOW | RTLD_NOLOAD);
+      if (void* f = h ? dlsym(h, "aoti_torch_empty_strided_pinned") : nullptr) return reinterpret_cast<PinnedFn>(f);
+    }
+    return static_cast<PinnedFn>(nullptr);
+  }();
+  return fn;
+}
+
+void* torch_host_alloc(size_t bytes, void** handle) {
+  try {
+    const int64_t size = static_cast<int64_t>(bytes), stride = 1;
+    AtenTensorHandle t = nullptr;
+    if (pinned_fn()(1, &size, &stride, aoti_torch_dtype_uint8(), aoti_torch_device_type_cpu(), 0, &t) !=
+            AOTI_TORCH_SUCCESS ||
+        !t)
+      return nullptr;
+    void* p = nullptr;
+    if (aoti_torch_get_data_ptr(t, &p) != AOTI_TORCH_SUCCESS || !p) {
+      aoti_torch_delete_tensor_object(t);
+      return nullptr;
+    }
+    *handle = t;
+    return p;
+  } catch (...) {
+    return nullptr;
+  }
+}
+
 const ce::DeviceAllocator kTorchAllocator = [] {
   ce::DeviceAllocator a;
   a.alloc = &torch_alloc;
   a.free = &torch_free;
+  if (pinned_fn()) {
+    a.host_alloc = &torch_host_alloc;
+    a.host_free = &torch_free;  // also just drops the tensor
+  }
   a.name = "torch";
   return a;
 }();

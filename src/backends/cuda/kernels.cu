@@ -217,15 +217,26 @@ __device__ __forceinline__ void stmt_body(const Base* __restrict__ bases, long l
            reinterpret_cast<void*>(static_cast<uintptr_t>(dof) * dsz));
       continue;
     }
+    void* dp0 = reinterpret_cast<void*>(static_cast<uintptr_t>(dof) * dsz);
+    const uintptr_t sp0 = static_cast<uintptr_t>(so) * ssz;
+    if (D.mode == 0 && sstep == 1 && ssz == dsz && (sp0 & static_cast<uintptr_t>(D.vec * dsz - 1)) == 0) {
+      const void* sp = reinterpret_cast<const void*>(sp0);  // raw copy, aligned on both sides: one load
+      switch (D.vec * dsz) {  // aligned: plain typed accesses (memcpy-based rd / wr may go bytewise)
+        case 16: *static_cast<uint4*>(dp0) = *static_cast<const uint4*>(sp); break;
+        case 8: *static_cast<uint2*>(dp0) = *static_cast<const uint2*>(sp); break;
+        case 4: *static_cast<uint32_t*>(dp0) = *static_cast<const uint32_t*>(sp); break;
+        default: *static_cast<uint16_t*>(dp0) = *static_cast<const uint16_t*>(sp); break;
+      }
+      continue;
+    }
     alignas(16) unsigned char buf[16];
     for (int k = 0; k < D.vec; ++k)
       conv(reinterpret_cast<const void*>(static_cast<uintptr_t>(so + k * sstep) * ssz), buf + k * dsz);
-    void* dp = reinterpret_cast<void*>(static_cast<uintptr_t>(dof) * dsz);
-    switch (D.vec * dsz) {
-      case 16: wr<uint4>(dp, *reinterpret_cast<const uint4*>(buf)); break;
-      case 8: wr<uint2>(dp, *reinterpret_cast<const uint2*>(buf)); break;
-      case 4: wr<uint32_t>(dp, *reinterpret_cast<const uint32_t*>(buf)); break;
-      default: wr<uint16_t>(dp, *reinterpret_cast<const uint16_t*>(buf)); break;
+    switch (D.vec * dsz) {  // the host checked the destination's alignment
+      case 16: *static_cast<uint4*>(dp0) = *reinterpret_cast<const uint4*>(buf); break;
+      case 8: *static_cast<uint2*>(dp0) = *reinterpret_cast<const uint2*>(buf); break;
+      case 4: *static_cast<uint32_t*>(dp0) = *reinterpret_cast<const uint32_t*>(buf); break;
+      default: *static_cast<uint16_t*>(dp0) = *reinterpret_cast<const uint16_t*>(buf); break;
     }
   }
 }

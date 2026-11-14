@@ -31,7 +31,7 @@ const DeviceAllocator* device_allocator();
 // extensions need not link the core. Both sides come from the same build;
 // errors cross as codes because exception types do not cross shared objects.
 struct FrontendApi {
-  static constexpr uint32_t kVersion = 3;
+  static constexpr uint32_t kVersion = 4;
   enum Flags : uint32_t {
     kHostAsync = 1,  // see Hints::host_async
   };
@@ -52,6 +52,15 @@ struct FrontendApi {
   // Engine::decline.
   void (*decline)(Engine& engine, const char* reason) = nullptr;
   void (*set_device_allocator)(const DeviceAllocator* a) = nullptr;
+  // copy_strided with one side indexed along `dim` by `n` int64 indices in
+  // device memory at `table` on GPU `table_device` (Access::index_select_device):
+  // `side` 0 indexes the source (gather; the source shape is before indexing),
+  // 1 the destination (scatter; the source broadcasts to the indexed shape).
+  int (*copy_indexed)(Engine& engine, const Endpoint& src, const Endpoint& dst, const int64_t* s_shape,
+                      const int64_t* s_strides, int s_rank, int64_t s_off, const int64_t* d_shape,
+                      const int64_t* d_strides, int d_rank, int64_t d_off, int side, int dim, uintptr_t table,
+                      int64_t n, int table_device, const Elementwise& fn, std::shared_ptr<NativeOp> native,
+                      uint32_t flags, uintptr_t stream, std::string* error) = nullptr;
 };
 
 const FrontendApi* frontend_api();

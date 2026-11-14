@@ -117,3 +117,13 @@ def test_explicit_calls_through_the_torch_op(dim):
     e.scatter_(dst, perm, row, dim)
     torch.cuda.synchronize()
     assert torch.equal(dst.index_select(dim, perm), row.expand_as(out))
+
+
+def test_empty_device_index_is_a_no_op():
+    src = torch.randn(8, 4, device=DEV)
+    i0 = torch.empty(0, dtype=torch.long, device=DEV)
+    e = ce.Engine()
+    assert e.gather(src, i0, 0).shape == (0, 4)
+    e.scatter_(src.clone(), i0, torch.empty(0, 4, device=DEV), 0)
+    e.copy_(torch.empty(0, 4, device=DEV), ce.lazy(src).index_select(0, i0))
+    e.synchronize()

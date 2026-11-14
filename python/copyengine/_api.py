@@ -107,7 +107,11 @@ def _native_lazy(dst, src) -> None:
 
 
 def _native_gather(out, src, dim, idx) -> None:
-    out.copy_(src.index_select(dim, device_index(idx, src.device)), non_blocking=True)
+    i = device_index(idx, src.device)
+    if out.dtype == src.dtype and out.is_contiguous():  # what a torch user writes: no temporary
+        torch.index_select(src, dim, i, out=out)
+    else:
+        out.copy_(src.index_select(dim, i), non_blocking=True)
 
 
 def _native_scatter(dst, src, dim, idx) -> None:

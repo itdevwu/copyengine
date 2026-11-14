@@ -102,6 +102,13 @@ struct Base {
   unsigned long long stab, dtab;  // this statement's device index tables (0: none)
 };
 
+struct BaseEntry {
+  std::shared_ptr<void> table;    // DevTable holding the bases
+  std::vector<unsigned long long> ptrs;  // the table pointers they were written with
+  CUstream stream{};
+  uint64_t used = 0;
+};
+
 struct FusedBatch {
   StmtDesc desc{};
   int tile_a = -1, tile_b = -1;  // destination / source contiguous dims when they differ (tiled kernel)
@@ -113,6 +120,8 @@ struct FusedBatch {
   bool device_tables = false;
   std::vector<int> members;
   std::vector<std::shared_ptr<void>> captured;  // bases recorded by CUDA graph captures
+  std::vector<BaseEntry> recent;                // eager: bases of recent pointer sets (see current_bases)
+  uint64_t clock = 0;
 };
 
 // Structured statements grouped by structure; for cross-device groups the
@@ -1049,18 +1058,64 @@ class CudaExecutor final : public Executor {
     t->owner = this, t->device = s.index, t->alive = alive_, t->count = bases.size();
     t->mem = dev_alloc(s, words * 8, "captured copy table");
     t->ptr = t->mem.ptr;
+    put(s, t->ptr, bases, st);
+    b.captured.push_back(t);
+    return t->ptr;
+  }
+
+  // Writes `bases` to device memory at `dst` in stream order, from kernel
+  // parameters: no host buffer, no host wait.
+  void put(Dev& s, CUdeviceptr dst, const std::vector<Base>& bases, CUstream st) {
+    const size_t words = bases.size() * sizeof(Base) / 8;
     CUfunction f = function(s, "ce_put");
     const auto* w = reinterpret_cast<const unsigned long long*>(bases.data());
     for (size_t at = 0; at < words; at += kPutWords) {
       Put p{};
-      p.dst = t->ptr + at * 8;
+      p.dst = dst + at * 8;
       p.n = static_cast<int>(std::min<size_t>(kPutWords, words - at));
       std::memcpy(p.w, w + at, static_cast<size_t>(p.n) * 8);
       void* args[] = {&p};
       check(d_->cuLaunchKernel(f, 1, 1, 1, 128, 1, 1, 0, st, args, nullptr), "cuLaunchKernel ce_put");
     }
-    b.captured.push_back(t);
-    return t->ptr;
+  }
+
+  // Eager calls: the bases of the last few pointer sets stay on the device, so
+  // a call with the same index tensors (a static index buffer) launches only
+  // the copy kernel. An entry is read and rewritten on one stream only, which
+  // orders a rewrite after the kernels that read it.
+  static constexpr size_t kBaseEntries = 4;
+  CUdeviceptr current_bases(Dev& s, FusedBatch& b, const std::vector<Base>& bases, CUstream st) {
+    const auto sameptrs = [&](const BaseEntry& e) {
+      for (size_t i = 0; i < bases.size(); ++i)
+        if (e.ptrs[2 * i] != bases[i].stab || e.ptrs[2 * i + 1] != bases[i].dtab) return false;
+      return true;
+    };
+    BaseEntry* hit = nullptr;
+    for (BaseEntry& e : b.recent)
+      if (e.stream == st && sameptrs(e)) hit = &e;
+    if (!hit) {
+      for (BaseEntry& e : b.recent)
+        if (e.stream == st && (!hit || e.used < hit->used)) hit = &e;  // rewrite in stream order
+      if (!hit && b.recent.size() < kBaseEntries) hit = &b.recent.emplace_back();
+      if (!hit) {  // all on other streams: a fresh table; the old one is freed in order
+        hit = &*std::min_element(b.recent.begin(), b.recent.end(),
+                                 [](const BaseEntry& x, const BaseEntry& y) { return x.used < y.used; });
+        *hit = BaseEntry{};
+      }
+      if (!hit->table) {
+        auto t = std::make_shared<DevTable>();
+        t->owner = this, t->device = s.index, t->alive = alive_, t->count = bases.size();
+        t->mem = dev_alloc(s, bases.size() * sizeof(Base), "copy table");
+        t->ptr = t->mem.ptr;
+        hit->table = t;
+      }
+      hit->stream = st;
+      hit->ptrs.resize(2 * bases.size());
+      for (size_t i = 0; i < bases.size(); ++i) hit->ptrs[2 * i] = bases[i].stab, hit->ptrs[2 * i + 1] = bases[i].dtab;
+      put(s, static_cast<DevTable*>(hit->table.get())->ptr, bases, st);
+    }
+    hit->used = ++b.clock;
+    return static_cast<DevTable*>(hit->table.get())->ptr;
   }
 
   // Built once, when a group first runs a strategy (planning, not the hot path).
@@ -1316,10 +1371,8 @@ class CudaExecutor final : public Executor {
           launch_stmt(t, bases.size(), b, fn, P.h2d ? add : 0, P.h2d ? 0 : add, s, st);
           continue;
         }
-        Slot& sl = upload(s, bases.data(), bases.size() * sizeof(Base), st);
-        launch_stmt(sl.dev.ptr, bases.size(), b, fn, P.h2d ? add : 0, P.h2d ? 0 : add, s, st);
-        check(d_->cuEventRecord(sl.done, st), "cuEventRecord");
-        sl.used = true;
+        launch_stmt(current_bases(s, const_cast<FusedBatch&>(b), bases, st), bases.size(), b, fn,
+                    P.h2d ? add : 0, P.h2d ? 0 : add, s, st);
         continue;
       }
       auto& table = const_cast<FusedBatch&>(b).table;

@@ -281,6 +281,23 @@ struct Engine::Impl {
   // Structured form of a table-free statement, or null if it has none.
   // `stab` / `dtab`: where to put the device table pointers, if the statement
   // has them (at most one dimension per side), else they make it formless.
+  // Merges adjacent dimensions that are one on both sides (k is outer to
+  // k + 1): the same elements in the same order, with less index arithmetic
+  // per element and wider vectors. Table dimensions stay.
+  static void coalesce(Form& f) {
+    for (int k = f.rank - 2; k >= 0; --k) {
+      const int j = k + 1;
+      if (k == f.stab_dim || j == f.stab_dim || k == f.dtab_dim || j == f.dtab_dim) continue;
+      if (f.ss[k] != f.ss[j] * f.shape[j] || f.ds[k] != f.ds[j] * f.shape[j]) continue;
+      f.shape[j] *= f.shape[k];
+      for (int m = k; m + 1 < f.rank; ++m) f.shape[m] = f.shape[m + 1], f.ss[m] = f.ss[m + 1], f.ds[m] = f.ds[m + 1];
+      --f.rank;
+      f.shape[f.rank] = 0, f.ss[f.rank] = 0, f.ds[f.rank] = 0;
+      if (f.stab_dim > k) --f.stab_dim;
+      if (f.dtab_dim > k) --f.dtab_dim;
+    }
+  }
+
   static std::shared_ptr<const Form> make_form(const Endpoint& src, const Endpoint& dst, const Stmt& stmt,
                                                uintptr_t* stab = nullptr, uintptr_t* dtab = nullptr) {
     if (stmt.src.has_table() || stmt.dst.has_table()) return nullptr;
@@ -306,6 +323,7 @@ struct Engine::Impl {
       ++f.rank;
     }
     if (f.numel <= 0 || f.numel >= (int64_t{1} << 31)) return nullptr;
+    coalesce(f);
     return std::make_shared<const Form>(f);
   }
 

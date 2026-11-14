@@ -15,6 +15,8 @@ import numpy as np
 
 from . import _core, _torch_ops, _shim  # the shim lets copyengine:: ops through: load them first
 from ._tensor import (
+    device_table,
+    select_device,
     Lazy,
     View,
     lazy,
@@ -317,7 +319,7 @@ class Engine:
                 native = (self._native, dst, src) if _same_bits(dst, src, fn) else None
             self._e.copy_stmt(s.endpoint, d.endpoint, stmt, fn or _IDENTITY, ctx=ctx, stream=current_stream(d, s),
                               native=native)
-            self._after(s.obj, d.obj)
+            self._after(s.obj, d.obj, src, dst)  # a lazy side holds its device index tables
         return dst
 
     def segments(self, src, dst, src_off, dst_off, length, *, fn: Optional[Elementwise] = None,
@@ -360,8 +362,12 @@ class Engine:
                dtype=None, ctx: str = ""):
         """``out = fn(src.index_select(dim, index))``; allocates ``out`` like ``src`` if omitted."""
         s = view(src)
-        idx = index_array(index)
-        sacc = s.access.index_select(dim, idx)
+        idx = device_table(index) if s.is_cuda else None
+        if idx is not None:
+            sacc = select_device(s.access, dim, idx)
+        else:
+            idx = index_array(index)
+            sacc = s.access.index_select(dim, idx)
         if out is None:
             shape = list(sacc.shape)
             if is_tensor(src):
@@ -374,20 +380,24 @@ class Engine:
         with self._lock:
             self._e.copy_stmt(s.endpoint, d.endpoint, stmt, fn or _IDENTITY, ctx=ctx, stream=current_stream(d, s),
                               native=native)
-            self._after(s.obj, d.obj)
+            self._after(s.obj, d.obj, idx)
         return out
 
     def scatter_(self, dst, index, src, dim: int = 0, *, fn: Optional[Elementwise] = None, ctx: str = ""):
         """``dst.index_copy_(dim, index, fn(src))``. Duplicate indices raise UnsafeCopy."""
         d, s = view(dst, writable=True), view(src)
-        idx = index_array(index)
-        dacc = d.access.index_select(dim, idx)
+        idx = device_table(index) if d.is_cuda else None
+        if idx is not None:  # duplicates are not detected on the device (undefined, as in torch)
+            dacc = select_device(d.access, dim, idx)
+        else:
+            idx = index_array(index)
+            dacc = d.access.index_select(dim, idx)
         stmt = _core.Stmt(dacc, broadcast_to(s.access, list(dacc.shape)))
         native = (_native_scatter, dst, src, dim, idx) if _flat_payload(dst, src, fn) else None
         with self._lock:
             self._e.copy_stmt(s.endpoint, d.endpoint, stmt, fn or _IDENTITY, ctx=ctx, stream=current_stream(d, s),
                               native=native)
-            self._after(s.obj, d.obj)
+            self._after(s.obj, d.obj, idx)
         return dst
 
     # ---- plans, tuning, stats -------------------------------------------------------

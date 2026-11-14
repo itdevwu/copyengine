@@ -279,7 +279,10 @@ struct Engine::Impl {
   }
 
   // Structured form of a table-free statement, or null if it has none.
-  static std::shared_ptr<const Form> make_form(const Endpoint& src, const Endpoint& dst, const Stmt& stmt) {
+  // `stab` / `dtab`: where to put the device table pointers, if the statement
+  // has them (at most one dimension per side), else they make it formless.
+  static std::shared_ptr<const Form> make_form(const Endpoint& src, const Endpoint& dst, const Stmt& stmt,
+                                               uintptr_t* stab = nullptr, uintptr_t* dtab = nullptr) {
     if (stmt.src.has_table() || stmt.dst.has_table()) return nullptr;
     Form f;
     f.sdt = src.dtype, f.ddt = dst.dtype;
@@ -287,8 +290,17 @@ struct Engine::Impl {
     f.d_base = static_cast<i64>(dst.base / itemsize(dst.dtype)) + stmt.dst.base();
     const auto &st = stmt.src.terms(), &dt = stmt.dst.terms();
     for (size_t k = 0; k < st.size(); ++k) {
-      if (st[k].size == 1) continue;  // contributes nothing but its (already folded) base
+      const bool sdev = st[k].dev.ptr != 0, ddev = dt[k].dev.ptr != 0;
+      if (st[k].size == 1 && !sdev && !ddev) continue;  // contributes nothing but its (already folded) base
       if (f.rank == Form::kMaxRank) return nullptr;
+      if (sdev) {
+        if (f.stab_dim >= 0 || !stab) return nullptr;
+        f.stab_dim = f.rank, f.stab_step = st[k].dev.step, f.sbound = st[k].dev.bound, *stab = st[k].dev.ptr;
+      }
+      if (ddev) {
+        if (f.dtab_dim >= 0 || !dtab) return nullptr;
+        f.dtab_dim = f.rank, f.dtab_step = dt[k].dev.step, f.dbound = dt[k].dev.bound, *dtab = dt[k].dev.ptr;
+      }
       f.shape[f.rank] = st[k].size, f.ss[f.rank] = st[k].stride, f.ds[f.rank] = dt[k].stride;
       f.numel *= st[k].size;
       ++f.rank;
@@ -300,7 +312,7 @@ struct Engine::Impl {
   // Adjacent to the queue's last op on both allocations: merging it is a
   // dominance-safe transform, so it always queues.
   bool merges_with_tail(const Op& op) const {
-    if (queue.empty()) return false;
+    if (queue.empty() || op.opaque || queue.back().opaque) return false;
     const Op& t = queue.back();
     if (!(t.src == op.src && t.dst == op.dst && t.fn == op.fn && t.ctx == op.ctx && t.src_lo == op.src_lo &&
           t.dst_lo == op.dst_lo))
@@ -380,7 +392,7 @@ struct Engine::Impl {
   }
 
   void push(Op op, uintptr_t strm) {
-    if (op.runs().empty()) return;
+    if (op.runs().empty() && !op.opaque) return;
     if (async_depth > 0) op.host_async = true;
     // Only work that touches the device now asks about capture: a copy queued
     // in a scope costs nothing extra.
@@ -448,8 +460,56 @@ struct Engine::Impl {
     h.add(static_cast<uint64_t>(e.nbytes));
   }
 
+  // A statement whose indices live on the device: no runs, its form is how it
+  // runs (a statement kernel reads the indices). Its footprint is its whole
+  // source / destination allocation; index values are checked by the kernel.
+  void enqueue_device_stmt(const Endpoint& src, const Endpoint& dst, const Stmt& stmt, const Elementwise& fn,
+                           const Hints& hints, uintptr_t strm, Clock::time_point t0) {
+    if (hints.has_valid) fail(Errc::unsupported, "valid_src with device indices");
+    if (src.device.kind != DeviceKind::cuda || !(src.device == dst.device))
+      fail(Errc::unsupported, "device indices need both tensors on the GPU that holds the indices");
+    for (const Access* a : {&stmt.src, &stmt.dst})
+      for (const Term& t : a->terms())
+        if (t.dev.ptr && t.dev.device != src.device.index)
+          fail(Errc::unsupported, "device indices on another GPU than the tensors");
+    Op op;
+    std::shared_ptr<const Form> form = make_form(src, dst, stmt, &op.stab, &op.dtab);
+    if (!form)
+      fail(Errc::needs_materialize, "a copy with device indices needs at most 6 dimensions and one index table per side");
+    const auto [slo, shi] = form->src_extent();
+    const auto [dlo, dhi] = form->dst_extent();
+    const i64 ss = static_cast<i64>(itemsize(src.dtype)), ds = static_cast<i64>(itemsize(dst.dtype));
+    const i64 s0 = static_cast<i64>(src.base) / ss, d0 = static_cast<i64>(dst.base) / ds;
+    if (slo < s0 || shi >= s0 + src.nbytes / ss) fail(Errc::invalid_argument, "source access out of bounds");
+    if (dlo < d0 || dhi >= d0 + dst.nbytes / ds) fail(Errc::invalid_argument, "destination access out of bounds");
+    exec_for({src.device, src.dtype, false}, {dst.device, dst.dtype, false});
+    op.src = {src.device, src.dtype, false};
+    op.dst = {dst.device, dst.dtype, false};
+    op.fn = fn;
+    op.ctx = hints.ctx;
+    op.src_lo = static_cast<int64_t>(src.base), op.src_hi = static_cast<int64_t>(src.base) + src.nbytes;
+    op.dst_lo = static_cast<int64_t>(dst.base), op.dst_hi = static_cast<int64_t>(dst.base) + dst.nbytes;
+    op.body = std::make_shared<OpBody>();
+    op.form = std::move(form);
+    op.opaque = true;
+    op.fp = fingerprint(op);
+    Hasher kh;
+    kh.add(fingerprint_sides(op));
+    kh.add(uint64_t{0x0DE7});
+    kh.add(static_cast<uint64_t>(lg2(op.form->numel * ss)));
+    op.key = kh.done();
+    op.native = hints.native;
+    op.host_async = hints.host_async;
+    op.enqueue_us = us_since(t0);
+    push(std::move(op), strm);
+  }
+
   void enqueue_stmt(const Endpoint& src, const Endpoint& dst, const Stmt& stmt, const Elementwise& fn,
                     const Hints& hints, uintptr_t strm, Clock::time_point t0) {
+    if (stmt.src.has_device_table() || stmt.dst.has_device_table()) {
+      enqueue_device_stmt(src, dst, stmt, fn, hints, strm, t0);
+      return;
+    }
     Hasher h;
     add_endpoint(h, src);
     add_endpoint(h, dst);
@@ -502,7 +562,7 @@ struct Engine::Impl {
   // be slower than its rows, so only 1-D merges qualify there.
   static bool dominance_safe(const Group& g) {
     const bool host_only = g.src.device.kind == DeviceKind::host && g.dst.device.kind == DeviceKind::host;
-    return g.pure() && (host_only || !g.rects.has_2d()) && g.rects.size() * 2 <= g.ops.size();
+    return !g.opaque() && g.pure() && (host_only || !g.rects.has_2d()) && g.rects.size() * 2 <= g.ops.size();
   }
 
   // Passthrough issues every submitted run separately: beyond this many calls
@@ -519,7 +579,7 @@ struct Engine::Impl {
       // No native copy: nothing the caller would otherwise run. The prior's
       // first choice is the reference, passthrough a candidate if it is cheap.
       c.lead = c.cands.front();
-      if (g.op_runs <= kPassthroughCalls) c.cands.push_back(Strategy::passthrough);
+      if (g.op_runs <= kPassthroughCalls && !g.opaque()) c.cands.push_back(Strategy::passthrough);
     }
     return c;
   }

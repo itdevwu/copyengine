@@ -48,8 +48,9 @@ Read `why` in the decisions:
   Fix the shim (below) for loops of many small copies.
 - Host overhead dominates tiny copies (a few us each): batch them in one scope,
   or `freeze()` a fixed set and `plan.run()` it.
-- An index given as a CUDA tensor costs a device sync per call: pass host
-  indices.
+- An index given as a CUDA tensor costs a device sync per call before 0.3;
+  from 0.3 it stays on the GPU (a `ValueError` at `synchronize()` means one
+  was out of range).
 
 ## Errors
 

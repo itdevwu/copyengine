@@ -6,6 +6,10 @@ change incompatibly only in a new minor (0.x) or major release.
 
 ## Unreleased
 
+- copyengine's pinned host buffers (bounce and upload buffers) come from
+  torch's pinned allocator when torch provides it, so they count in its host
+  memory statistics; `stats()["cuda"][i]["host_allocator"]` reports it.
+
 - CUDA index tensors stay on the GPU in `ce.gather`, `ce.scatter_` and
   `ce.lazy(...).index_select`: the statement kernel reads them (no device
   synchronization), and new indices reuse the same plan. Out-of-range indices

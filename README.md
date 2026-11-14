@@ -157,13 +157,23 @@ with ce.scope(stream="copy") as h:      # or stream=<a torch.cuda.Stream>
 ...                                     # compute keeps running on the current stream
 h.wait()                                # the current stream waits for the copies (GPU side)
 
-# 6. Replay a planned copy without planning again.
-eng = ce.Engine()
-with eng.scope():
-    ...
-plan = eng.freeze()
-plan.run()
+# 6. A step that runs every iteration with new indices: plan it once.
+def load_blocks(caches, pool, block_ids):      # caches: one tensor per layer
+    for l, cache in enumerate(caches):
+        ce.gather(cache, block_ids, 0, out=pool[l])
+
+step = ce.plan(load_blocks)
+step(caches, pool, block_ids)                  # block_ids: a CUDA int64 tensor, new each step
 ```
+
+`ce.plan(step)` (or `eng.plan`) traces `step` per argument layout until the
+engine has settled, then replays its copies without running `step` or
+planning: CUDA int64 index tensors are read anew on every call, and every
+other tensor the copies touch must be an argument and the same buffer (a new
+buffer or shape traces again). Only the copies replay, so a step should only
+copy. A replay is kept only where it beats running `step` plainly.
+`eng.freeze()` / `plan.run()` replays the last flush exactly (same buffers,
+same indices).
 
 More: `ce.gather` / `ce.scatter_` for index-based copies, `ce.barrier()` to
 wait for queued work, `ce.probe()` to see which copy mechanisms this machine

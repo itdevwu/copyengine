@@ -6,6 +6,12 @@ change incompatibly only in a new minor (0.x) or major release.
 
 ## Unreleased
 
+- Step plans: `ce.plan(step)` / `eng.plan(step)` trace a step of copies per
+  argument layout and replay it without running its Python or planning; CUDA
+  int64 index tensors are read anew each call, other buffers are guarded by
+  identity. A replay is kept only where it beats running the step plainly.
+- Copies with device indices depend on each other only through their
+  reachable extents, so gathers into disjoint slices run in one launch.
 - The plan, statement and safety caches evict the least recently used entry
   instead of clearing when full. `stats()` reports planning time on cache
   misses (`plan_us`, total and last flush).

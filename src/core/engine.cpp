@@ -542,8 +542,8 @@ struct Engine::Impl {
   }
 
   // A statement whose indices live on the device: no runs, its form is how it
-  // runs (a statement kernel reads the indices). Its footprint is its whole
-  // source / destination allocation; index values are checked by the kernel.
+  // runs (a statement kernel reads the indices). Its footprint is its form's
+  // extent, a table dimension spanning its bound; the kernel checks the values.
   void enqueue_device_stmt(const Endpoint& src, const Endpoint& dst, const Stmt& stmt, const Elementwise& fn,
                            const Hints& hints, uintptr_t strm, Clock::time_point t0) {
     if (hints.has_valid) fail(Errc::unsupported, "valid_src with device indices");

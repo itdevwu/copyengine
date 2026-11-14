@@ -114,9 +114,11 @@ const Runs& Op::runs() const {
 
 const Intervals& Op::read() const {
   const Runs& r = runs();
-  if (opaque && !body->rd) {  // the whole allocation: the indices are not known on the host
+  if (opaque && !body->rd) {  // the indices are not known on the host: every element an index may reach
+    const auto [lo, hi] = form->src_extent();
+    const i64 sz = static_cast<i64>(itemsize(src.dtype));
     auto iv = std::make_unique<Intervals>();
-    iv->start.push_back(src_lo), iv->end.push_back(src_hi);
+    iv->start.push_back(lo * sz), iv->end.push_back((hi + 1) * sz);
     body->rd = std::move(iv);
   }
   if (!body->rd) body->rd = std::make_unique<Intervals>(interval_union(r.src, r.len, itemsize(src.dtype)));
@@ -125,9 +127,11 @@ const Intervals& Op::read() const {
 
 const Intervals& Op::write() const {
   const Runs& r = runs();
-  if (opaque && !body->wr) {
+  if (opaque && !body->wr) {  // exact when the destination has no table; else its whole bound
+    const auto [lo, hi] = form->dst_extent();
+    const i64 sz = static_cast<i64>(itemsize(dst.dtype));
     auto iv = std::make_unique<Intervals>();
-    iv->start.push_back(dst_lo), iv->end.push_back(dst_hi);
+    iv->start.push_back(lo * sz), iv->end.push_back((hi + 1) * sz);
     body->wr = std::move(iv);
   }
   if (!body->wr) body->wr = std::make_unique<Intervals>(interval_union(r.dst, r.len, itemsize(dst.dtype)));

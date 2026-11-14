@@ -201,6 +201,9 @@ class CudaExecutor final : public Executor {
         dev_free(s, sl.dev);
         if (sl.done) d_->cuEventDestroy(sl.done);
       }
+      // Device memory first: freeing orders it after every stream, so they must still exist.
+      if (s.staging_used) d_->cuEventSynchronize(s.staging_done);
+      dev_free(s, s.staging);
       if (s.sm_stream) {
         d_->cuStreamSynchronize(s.sm_stream);
         d_->cuStreamDestroy(s.sm_stream);
@@ -213,8 +216,6 @@ class CudaExecutor final : public Executor {
         if (b.host) d_->cuMemFreeHost(b.host);
         if (b.done) d_->cuEventDestroy(b.done);
       }
-      if (s.staging_used) d_->cuEventSynchronize(s.staging_done);
-      dev_free(s, s.staging);
       if (s.ev_free) d_->cuEventDestroy(s.ev_free);
       for (CUevent e : {s.ev_in, s.ev_out, s.staging_done})
         if (e) d_->cuEventDestroy(e);

@@ -6,6 +6,8 @@
 #     quay.io/pypa/manylinux_2_28_x86_64 docker/build-wheels.sh
 #
 # CE_WHEEL_SDIST=0 skips the sdist (one architecture provides it).
+# CE_WHEEL_VERSION_SUFFIX=.dev1 builds a pre-release (0.3.0.dev1) of the
+# project() version: wheel metadata and copyengine.__version__ both carry it.
 # Python 3.12+ gets one abi3 wheel; older versions one wheel each. Every wheel
 # carries the CUDA kernels for all architectures, the stable-ABI torch ops, and
 # a prebuilt interception shim per supported torch release (other releases
@@ -37,6 +39,15 @@ else
 fi
 
 step() { echo "== $*"; }
+
+SUFFIX=${CE_WHEEL_VERSION_SUFFIX:-}
+if [ -n "$SUFFIX" ]; then
+  [[ "$SUFFIX" =~ ^\.dev[0-9]+$|^rc[0-9]+$ ]] || { echo "bad version suffix $SUFFIX"; exit 1; }
+  # In the snapshot only: the metadata version and the compiled version string.
+  sed -i "/^regex = 'project.*copyengine VERSION/a result = \"{value}$SUFFIX\"" "$SRC/pyproject.toml"
+  grep -q "^result = " "$SRC/pyproject.toml" || { echo "could not set the version suffix"; exit 1; }
+  export SKBUILD_CMAKE_DEFINE="CE_VERSION_SUFFIX=$SUFFIX${SKBUILD_CMAKE_DEFINE:+;$SKBUILD_CMAKE_DEFINE}"
+fi
 
 step "CUDA $CUDA toolkit (nvcc, headers)"
 dnf -y -q install dnf-plugins-core

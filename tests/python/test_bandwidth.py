@@ -163,3 +163,13 @@ def test_invalid_limits():
         ce.Engine().scope(bandwidth=-1).__enter__()
     with pytest.raises(ValueError):
         ce.Engine(bandwidth=float("nan"))
+
+
+def test_device_index_copies_in_a_limited_scope_still_copy():
+    src = torch.randn(64, 256, device="cuda")
+    idx = torch.randperm(64, device="cuda")[:16]
+    e = ce.Engine()
+    with e.scope(bandwidth=1e9):
+        out = e.gather(src, idx, 0)
+    torch.cuda.synchronize()
+    assert torch.equal(out, src[idx])

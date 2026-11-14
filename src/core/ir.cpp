@@ -288,6 +288,10 @@ bool Access::has_table() const {
   return std::any_of(terms_.begin(), terms_.end(), [](const Term& t) { return t.table != nullptr; });
 }
 
+bool Access::has_device_table() const {
+  return std::any_of(terms_.begin(), terms_.end(), [](const Term& t) { return t.dev.ptr != 0; });
+}
+
 i64 Access::numel() const {
   i64 n = 1;
   for (auto& t : terms_) n *= t.size;
@@ -334,7 +338,12 @@ Access Access::slice(int dim, std::optional<i64> start, std::optional<i64> stop,
 
   std::vector<Term> terms = terms_;
   i64 base = base_;
-  if (!t.table) {
+  if (t.dev.ptr) {  // a window of the device table: move its start, scale its step
+    DeviceTable d = t.dev;
+    if (count > 0) d.ptr += static_cast<uintptr_t>(b * d.step * 8);
+    d.step *= step;
+    terms[dim] = {count, t.stride, nullptr, d};
+  } else if (!t.table) {
     if (count > 0) base += b * t.stride;
     terms[dim] = {count, t.stride * step, nullptr};
   } else {
@@ -350,6 +359,7 @@ Access Access::select(int dim, i64 index) const {
   const Term& t = terms_[dim];
   if (index < -t.size || index >= t.size) fail(Errc::invalid_argument, "select: index out of range");
   if (index < 0) index += t.size;
+  if (t.dev.ptr) fail(Errc::needs_materialize, "select on a device index dimension needs its value");
   const i64 base = base_ + t.stride * (t.table ? (*t.table)[index] : index);
   std::vector<Term> terms = terms_;
   terms.erase(terms.begin() + dim);
@@ -361,7 +371,12 @@ Access Access::flip(int dim) const {
   const Term& t = terms_[dim];
   std::vector<Term> terms = terms_;
   i64 base = base_;
-  if (!t.table) {
+  if (t.dev.ptr) {
+    DeviceTable d = t.dev;
+    if (t.size > 0) d.ptr += static_cast<uintptr_t>((t.size - 1) * d.step * 8);
+    d.step = -d.step;
+    terms[dim] = {t.size, t.stride, nullptr, d};
+  } else if (!t.table) {
     if (t.size > 0) base += (t.size - 1) * t.stride;
     terms[dim] = {t.size, -t.stride, nullptr};
   } else {
@@ -374,6 +389,7 @@ Access Access::flip(int dim) const {
 Access Access::index_select(int dim, std::span<const i64> index) const {
   dim = norm_dim(dim, rank());
   const Term& t = terms_[dim];
+  if (t.dev.ptr) fail(Errc::needs_materialize, "index_select of a device index dimension needs its values");
   auto v = std::make_shared<std::vector<i64>>();
   v->reserve(index.size());
   for (i64 i : index) {
@@ -383,6 +399,17 @@ Access Access::index_select(int dim, std::span<const i64> index) const {
   }
   std::vector<Term> terms = terms_;
   terms[dim] = {static_cast<i64>(index.size()), t.stride, std::move(v)};
+  return Access(base_, std::move(terms));
+}
+
+Access Access::index_select_device(int dim, uintptr_t ptr, i64 n, int device) const {
+  dim = norm_dim(dim, rank());
+  const Term& t = terms_[dim];
+  require(ptr != 0 && n >= 0, "index_select: bad device index table");
+  if (t.table || t.dev.ptr) fail(Errc::needs_materialize, "device indices into an already indexed dimension");
+  if (t.stride == 0 && t.size > 1) fail(Errc::needs_materialize, "device indices into a broadcast dimension");
+  std::vector<Term> terms = terms_;
+  terms[dim] = {n, t.stride, nullptr, DeviceTable{ptr, 1, t.size, device}};
   return Access(base_, std::move(terms));
 }
 
@@ -398,6 +425,7 @@ Access Access::expand(int dim, i64 n) const {
   const Term& t = terms_[dim];
   require(t.size == 1, "expand: dim must have size 1");
   require(n >= 0, "expand: negative size");
+  if (t.dev.ptr) fail(Errc::needs_materialize, "expand of a device index dimension needs its value");
   const i64 base = base_ + t.stride * (t.table ? (*t.table)[0] : 0);
   std::vector<Term> terms = terms_;
   terms[dim] = {n, 0, nullptr};
@@ -443,7 +471,7 @@ Access Access::reshape(std::span<const i64> nshape) const {
     n *= s;
   }
   require(n == numel(), "reshape: element count differs");
-  if (has_table()) fail(Errc::needs_materialize, "reshape across a table dimension");
+  if (has_table() || has_device_table()) fail(Errc::needs_materialize, "reshape across a table dimension");
   std::vector<i64> st;
   for (auto& t : terms_) st.push_back(t.stride);
   auto ns = view_strides(shape(), st, nshape);
@@ -453,6 +481,7 @@ Access Access::reshape(std::span<const i64> nshape) const {
 
 namespace {
 std::vector<i64> term_values(const Term& t) {
+  if (t.dev.ptr) fail(Errc::needs_materialize, "device index values are not known on the host");
   std::vector<i64> v(t.size);
   for (i64 i = 0; i < t.size; ++i) v[i] = t.stride * (t.table ? (*t.table)[i] : i);
   return v;
@@ -483,7 +512,10 @@ std::pair<i64, i64> Access::extent() const {
   for (auto& t : terms_) {
     if (t.size == 0) continue;
     i64 mn = INT64_MAX, mx = INT64_MIN;
-    if (t.table) {
+    if (t.dev.ptr) {  // any entry within its bound
+      mn = std::min<i64>(0, (t.dev.bound - 1) * t.stride);
+      mx = std::max<i64>(0, (t.dev.bound - 1) * t.stride);
+    } else if (t.table) {
       for (i64 v : *t.table) mn = std::min(mn, v * t.stride), mx = std::max(mx, v * t.stride);
     } else {
       mn = std::min<i64>(0, (t.size - 1) * t.stride);

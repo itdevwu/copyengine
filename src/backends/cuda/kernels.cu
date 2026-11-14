@@ -130,10 +130,18 @@ struct StmtDesc {
   unsigned shape[6];
   unsigned magic[6], shift[6];  // n / shape[k] == (umulhi(n, magic) + n) >> shift, for n < 2^31
   long long ss[6], ds[6];
+  // Device index tables: on dimension stab_dim (dtab_dim) the index is read
+  // from Base::stab (dtab), step int64s apart, and must lie in [0, bound);
+  // an index outside it skips the element and sets *err. -1: no table.
+  int stab_dim, dtab_dim;
+  long long stab_step, dtab_step, sbound, dbound;
+  unsigned long long* err;
 };
 
 struct Base {
   long long src, dst;
+  const long long* stab;
+  const long long* dtab;
 };
 
 __device__ __forceinline__ void element(const void* sp, void* dp, const StmtDesc& D, const Fn& fn) {
@@ -180,12 +188,27 @@ __device__ __forceinline__ void stmt_body(const Base* __restrict__ bases, long l
   for (unsigned e = (blockIdx.x * blockDim.x + threadIdx.x) * static_cast<unsigned>(D.vec); e < D.numel; e += stride)
   for (long long op = blockIdx.y; op < count; op += gridDim.y) {
     unsigned r = e;
-    long long so = bases[op].src + sadd, dof = bases[op].dst + dadd;
+    const Base B = bases[op];
+    long long so = B.src + sadd, dof = B.dst + dadd;
+    bool skip = false;
     for (int k = D.rank - 1; k >= 0; --k) {
       const unsigned q = (__umulhi(r, D.magic[k]) + r) >> D.shift[k], i = r - q * D.shape[k];
       r = q;
-      so += static_cast<long long>(i) * D.ss[k];
-      dof += static_cast<long long>(i) * D.ds[k];
+      long long is = i, id = i;
+      if (k == D.stab_dim) {
+        is = B.stab[static_cast<long long>(i) * D.stab_step];
+        skip |= is < 0 || is >= D.sbound;
+      }
+      if (k == D.dtab_dim) {
+        id = B.dtab[static_cast<long long>(i) * D.dtab_step];
+        skip |= id < 0 || id >= D.dbound;
+      }
+      so += is * D.ss[k];
+      dof += id * D.ds[k];
+    }
+    if (skip) {
+      atomicOr(D.err, 1ull);
+      continue;
     }
     if (D.vec == 1) {
       conv(reinterpret_cast<const void*>(static_cast<uintptr_t>(so) * ssz),

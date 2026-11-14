@@ -216,7 +216,7 @@ class CudaExecutor final : public Executor {
       d_->cuCtxPushCurrent(s.ctx);
       for (Slot& sl : s.slots) {
         if (sl.used) d_->cuEventSynchronize(sl.done);
-        if (sl.host) d_->cuMemFreeHost(sl.host);
+        pinned_free(sl.host, sl.host_handle);
         dev_free(s, sl.dev);
         if (sl.done) d_->cuEventDestroy(sl.done);
       }
@@ -233,7 +233,7 @@ class CudaExecutor final : public Executor {
       if (s.green) d_->cuGreenCtxDestroy(s.green);
       for (Bounce& b : s.bounce) {
         if (b.used) d_->cuEventSynchronize(b.done);
-        if (b.host) d_->cuMemFreeHost(b.host);
+        pinned_free(b.host, b.host_handle);
         if (b.done) d_->cuEventDestroy(b.done);
       }
       if (s.ev_free) d_->cuEventDestroy(s.ev_free);
@@ -435,7 +435,9 @@ class CudaExecutor final : public Executor {
                     .set("kernels", s.kernels ? Json(true) : Json(s.kernel_error))
                     .set("batch", s.batch ? Json(true) : Json(s.batch_error))
                     .set("sm_limit", s.sm_limit)
-                    .set("allocator", device_allocator() ? device_allocator()->name : "cuda"));
+                    .set("allocator", device_allocator() ? device_allocator()->name : "cuda")
+                    .set("host_allocator",
+                         device_allocator() && device_allocator()->host_alloc ? device_allocator()->name : "cuda"));
     }
     return devs;
   }
@@ -452,6 +454,7 @@ class CudaExecutor final : public Executor {
 
   struct Slot {
     void* host = nullptr;
+    void* host_handle = nullptr;  // from the framework's pinned allocator
     DevMem dev;
     size_t cap = 0;
     CUevent done = nullptr;
@@ -460,6 +463,7 @@ class CudaExecutor final : public Executor {
 
   struct Bounce {
     void* host = nullptr;
+    void* host_handle = nullptr;
     size_t cap = 0;
     CUevent done = nullptr;
     bool used = false;
@@ -548,6 +552,31 @@ class CudaExecutor final : public Executor {
       d_->cuMemFree(m.ptr);
     }
     m = DevMem{};
+  }
+
+  // Pinned host memory for copyengine's own buffers: from the framework's
+  // allocator when it has one. Freed only once the work using it is done.
+  void* pinned_alloc(size_t bytes, void** handle, const char* what) {
+    *handle = nullptr;
+    if (const DeviceAllocator* a = device_allocator(); a && a->host_alloc) {
+      void* p = a->host_alloc(bytes, handle);
+      if (!p) fail(Errc::backend, std::string(what) + ": out of pinned memory (" + a->name + " allocator, " +
+                                      std::to_string(bytes) + " bytes)");
+      return p;
+    }
+    void* p = nullptr;
+    check(d_->cuMemHostAlloc(&p, bytes, 0), what);
+    return p;
+  }
+
+  void pinned_free(void*& p, void*& handle) {
+    if (!p) return;
+    if (handle) {
+      if (const DeviceAllocator* a = device_allocator(); a && a->host_free) a->host_free(handle);
+    } else {
+      d_->cuMemFreeHost(p);
+    }
+    p = nullptr, handle = nullptr;
   }
 
   void note_stream(Dev& s, uintptr_t st) {
@@ -797,9 +826,8 @@ class CudaExecutor final : public Executor {
     for (Bounce& b : s.bounce) {
       if (b.cap >= cap) continue;
       if (b.used) check(d_->cuEventSynchronize(b.done), "cuEventSynchronize");
-      if (b.host) d_->cuMemFreeHost(b.host);
-      b.host = nullptr;
-      check(d_->cuMemHostAlloc(&b.host, cap, 0), "cuMemHostAlloc (bounce)");
+      pinned_free(b.host, b.host_handle);
+      b.host = pinned_alloc(cap, &b.host_handle, "bounce buffer");
       if (!b.done) check(d_->cuEventCreate(&b.done, CU_EVENT_DISABLE_TIMING), "cuEventCreate");
       b.cap = cap, b.used = false;
     }
@@ -907,12 +935,11 @@ class CudaExecutor final : public Executor {
     Slot& sl = s.slots[s.next++ % kSlots];
     if (sl.used) check(d_->cuEventSynchronize(sl.done), "cuEventSynchronize");
     if (sl.cap < need) {
-      if (sl.host) d_->cuMemFreeHost(sl.host);
+      pinned_free(sl.host, sl.host_handle);
       dev_free(s, sl.dev);
-      sl.host = nullptr;
       size_t cap = 64 << 10;
       while (cap < need) cap <<= 1;
-      check(d_->cuMemHostAlloc(&sl.host, cap, 0), "cuMemHostAlloc");
+      sl.host = pinned_alloc(cap, &sl.host_handle, "upload buffer");
       sl.dev = dev_alloc(s, cap, "upload buffer");
       sl.cap = cap;
     }

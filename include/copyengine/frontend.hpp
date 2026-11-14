@@ -13,14 +13,19 @@ namespace ce {
 bool host_is_pinned(uintptr_t p);
 
 // Where copyengine's own device memory (staging, resident tables, upload
-// buffers) comes from, when a framework provides it: then it counts in the
-// framework's statistics and limits. Process-wide; null means cuMemAlloc.
+// buffers) and pinned host memory (bounce and upload buffers) come from, when
+// a framework provides it: then it counts in the framework's statistics and
+// limits. Process-wide; null means cuMemAlloc / cuMemHostAlloc.
 struct DeviceAllocator {
   // `bytes` on `device`; returns the address (0 when out of memory), the
   // owning handle, and the stream the allocator associated it with (memory is
   // reused only by later allocations on that stream).
   uintptr_t (*alloc)(int device, size_t bytes, void** handle, uintptr_t* stream) = nullptr;
   void (*free)(void* handle) = nullptr;
+  // Pinned host memory (null: cuMemHostAlloc). copyengine frees it only after
+  // its own work on it is done, so the framework may reuse it at once.
+  void* (*host_alloc)(size_t bytes, void** handle) = nullptr;
+  void (*host_free)(void* handle) = nullptr;
   const char* name = "";
 };
 void set_device_allocator(const DeviceAllocator* a);

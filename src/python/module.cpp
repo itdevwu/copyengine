@@ -254,6 +254,7 @@ NB_MODULE(_core, m) {
       .def_rw("online_every", &ce::EngineOptions::online_every)
       .def_rw("allow_async", &ce::EngineOptions::allow_async)
       .def_rw("sync_always", &ce::EngineOptions::sync_always)
+      .def_rw("max_sms", &ce::EngineOptions::max_sms)
       .def_rw("disable", &ce::EngineOptions::disable)
       .def_rw("log_plan", &ce::EngineOptions::log_plan)
       .def_rw("host_threads", &ce::EngineOptions::host_threads)

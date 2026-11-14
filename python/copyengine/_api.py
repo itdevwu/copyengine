@@ -79,11 +79,13 @@ class Engine:
     def __init__(self, *, staging_budget_mb: int = 256, explore: bool = True, tune_trials: int = 5,
                  tune_topk: int = 3, ab_pairs: int = 20, ab_max_pairs: int = 50, online_every: int = 64,
                  allow_async: bool = False,
-                 host_threads: int = 0, disable: bool = False, prior_only: bool = False,
+                 host_threads: int = 0, disable: bool = False, prior_only: bool = False, max_sms: int = 0,
                  _intercept: Optional[str] = None):
         """``explore=False`` uses only a loaded profile (uncovered buckets take the
-        baseline). ``prior_only`` is for tests: always the prior's first strategy,
-        no measurement and no no-regression guarantee."""
+        baseline). ``max_sms`` bounds the SMs copy kernels may occupy per GPU (see
+        ``stats()["cuda"]`` for whether it is enforced by a green context or by
+        capping thread blocks). ``prior_only`` is for tests: always the prior's
+        first strategy, no measurement and no no-regression guarantee."""
         o = _core.EngineOptions()
         o.staging_budget = int(staging_budget_mb) << 20
         o.explore = explore
@@ -96,6 +98,7 @@ class Engine:
         o.allow_async = allow_async
         o.host_threads = host_threads
         o.disable = disable
+        o.max_sms = max_sms
         self._opts = _core.EngineOptions.from_env(o)  # CE_* environment variables win
         self._e = _core.Engine(self._opts)
         self._handle = self._e.handle

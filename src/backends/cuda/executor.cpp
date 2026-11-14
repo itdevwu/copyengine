@@ -178,6 +178,13 @@ class CudaExecutor final : public Executor {
         if (sl.dev) d_->cuMemFree(sl.dev);
         if (sl.done) d_->cuEventDestroy(sl.done);
       }
+      if (s.sm_stream) {
+        d_->cuStreamSynchronize(s.sm_stream);
+        d_->cuStreamDestroy(s.sm_stream);
+        d_->cuEventDestroy(s.sm_in);
+        d_->cuEventDestroy(s.sm_out);
+      }
+      if (s.green) d_->cuGreenCtxDestroy(s.green);
       for (Bounce& b : s.bounce) {
         if (b.used) d_->cuEventSynchronize(b.done);
         if (b.host) d_->cuMemFreeHost(b.host);
@@ -325,7 +332,8 @@ class CudaExecutor final : public Executor {
       devs.push(Json::object()
                     .set("index", static_cast<int>(i))
                     .set("kernels", s.kernels ? Json(true) : Json(s.kernel_error))
-                    .set("batch", s.batch ? Json(true) : Json(s.batch_error)));
+                    .set("batch", s.batch ? Json(true) : Json(s.batch_error))
+                    .set("sm_limit", s.sm_limit));
     }
     return devs;
   }
@@ -365,6 +373,12 @@ class CudaExecutor final : public Executor {
     CUstream staging_stream{};
     bool staging_used = false;
     std::array<Bounce, 2> bounce;
+    // SM limit (EngineOptions::max_sms)
+    CUgreenCtx green{};
+    CUstream sm_stream{};       // copy kernels run here when the limit is hard
+    CUevent sm_in{}, sm_out{};
+    unsigned grid_cap = 0;      // soft limit: max thread blocks per launch (0: none)
+    std::string sm_limit = "none";
   };
 
   // Makes `c` current for a scope. torch and ce share each device's primary
@@ -405,6 +419,7 @@ class CudaExecutor final : public Executor {
     for (Slot& sl : s.slots) check(d_->cuEventCreate(&sl.done, CU_EVENT_DISABLE_TIMING), "cuEventCreate");
     admit_kernels(s);
     admit_batch(s);
+    if (opt_.max_sms > 0 && s.kernels) setup_sm_limit(s);
     return s;
   }
 
@@ -730,6 +745,107 @@ class CudaExecutor final : public Executor {
     return sl;
   }
 
+  // Every copy kernel launches here, within the engine's SM limit: on the
+  // green-context stream (ordered after and before `st` by events, the host
+  // never waits), or with the grid capped to that many blocks. All kernels
+  // stride over their work, so any grid is correct.
+  void run_kernel(Dev& s, CUfunction f, std::array<unsigned, 3> grid, std::array<unsigned, 3> block, void** args,
+                  CUstream st, const char* what) {
+    CUstream on = st;
+    if (s.sm_stream) {
+      check(d_->cuEventRecord(s.sm_in, st), "cuEventRecord");
+      check(d_->cuStreamWaitEvent(s.sm_stream, s.sm_in, 0), "cuStreamWaitEvent");
+      on = s.sm_stream;
+    } else if (s.grid_cap) {
+      const unsigned cap = s.grid_cap;
+      grid[2] = std::min(grid[2], cap);
+      grid[1] = std::min(grid[1], std::max(1u, cap / grid[2]));
+      grid[0] = std::min(grid[0], std::max(1u, cap / (grid[1] * grid[2])));
+    }
+    check(d_->cuLaunchKernel(f, grid[0], grid[1], grid[2], block[0], block[1], block[2], 0, on, args, nullptr),
+          (std::string("cuLaunchKernel ") + what).c_str());
+    if (s.sm_stream) {
+      check(d_->cuEventRecord(s.sm_out, s.sm_stream), "cuEventRecord");
+      check(d_->cuStreamWaitEvent(st, s.sm_out, 0), "cuStreamWaitEvent");
+    }
+  }
+
+  // ---- SM limit ------------------------------------------------------------------------
+
+  // Distinct SMs the blocks of one ce_smid launch on `st` ran on.
+  int smids_used(Dev& s, CUstream st, int blocks) {
+    CUdeviceptr out = 0;
+    check(d_->cuMemAlloc(&out, blocks * sizeof(unsigned)), "cuMemAlloc");
+    struct Free {
+      const Driver* d;
+      CUdeviceptr p;
+      ~Free() { d->cuMemFree(p); }
+    } free_out{d_, out};
+    long long spin = 2'000'000;  // ~1 ms of clocks per block: long enough for every block to be resident at once
+    void* args[] = {&out, &spin};
+    check(d_->cuLaunchKernel(function(s, "ce_smid"), blocks, 1, 1, 32, 1, 1, 0, st, args, nullptr),
+          "cuLaunchKernel ce_smid");
+    std::vector<unsigned> ids(blocks);
+    check(d_->cuMemcpyDtoHAsync(ids.data(), out, blocks * sizeof(unsigned), st), "cuMemcpyDtoHAsync");
+    check(d_->cuStreamSynchronize(st), "cuStreamSynchronize");
+    std::sort(ids.begin(), ids.end());
+    return static_cast<int>(std::unique(ids.begin(), ids.end()) - ids.begin());
+  }
+
+  // Hard limit through a green context, admitted only if a launch on it stays
+  // within its SMs while the same launch unconfined does not; else the soft
+  // limit (a block cap). Planning time: called once per device.
+  void setup_sm_limit(Dev& s) {
+    const int want = opt_.max_sms;
+    int total = 0;
+    check(d_->cuDeviceGetAttribute(&total, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, s.dev), "cuDeviceGetAttribute");
+    if (want >= total) {
+      s.sm_limit = "none (the limit is not below the GPU's " + std::to_string(total) + " SMs)";
+      return;
+    }
+    s.grid_cap = static_cast<unsigned>(std::max(1, want));
+    s.sm_limit = "soft: at most " + std::to_string(s.grid_cap) + " thread blocks per copy kernel";
+    std::string why;
+    try {
+      for (const char* sym : {"cuDeviceGetDevResource", "cuDevSmResourceSplitByCount", "cuDevResourceGenerateDesc",
+                              "cuGreenCtxCreate", "cuGreenCtxStreamCreate"})
+        if (auto m = cuda::missing_reason(sym); !m.empty()) throw std::runtime_error(std::string(sym) + ": " + m);
+      CUdevResource all{}, part{}, rest{};
+      check(d_->cuDeviceGetDevResource(s.dev, &all, CU_DEV_RESOURCE_TYPE_SM), "cuDeviceGetDevResource");
+      // The driver rounds a group up to its granularity: if that exceeds the
+      // limit, ask for as much less as it rounded up (at most the limit, then).
+      auto split = [&](int n) {
+        unsigned groups = 1;
+        check(d_->cuDevSmResourceSplitByCount(&part, &groups, &all, &rest, 0, static_cast<unsigned>(n)),
+              "cuDevSmResourceSplitByCount");
+        if (groups != 1) throw std::runtime_error("no SM group of " + std::to_string(n));
+        return static_cast<int>(part.sm.smCount);
+      };
+      int granted = split(want);
+      if (granted > want && want - (granted - want) > 0) granted = split(want - (granted - want));
+      if (granted > want)
+        throw std::runtime_error("the driver's SM groups (" + std::to_string(granted) + ") exceed the limit");
+      CUdevResourceDesc desc{};
+      check(d_->cuDevResourceGenerateDesc(&desc, &part, 1), "cuDevResourceGenerateDesc");
+      check(d_->cuGreenCtxCreate(&s.green, desc, s.dev, CU_GREEN_CTX_DEFAULT_STREAM), "cuGreenCtxCreate");
+      check(d_->cuGreenCtxStreamCreate(&s.sm_stream, s.green, CU_STREAM_NON_BLOCKING, 0), "cuGreenCtxStreamCreate");
+      const int blocks = 8 * total;
+      const int confined = smids_used(s, s.sm_stream, blocks), free = smids_used(s, s.side, blocks);
+      if (confined > granted || free <= granted)
+        throw std::runtime_error("confinement not verified (" + std::to_string(confined) + " SMs used on the green "
+                                 "context, " + std::to_string(free) + " without)");
+      check(d_->cuEventCreate(&s.sm_in, CU_EVENT_DISABLE_TIMING), "cuEventCreate");
+      check(d_->cuEventCreate(&s.sm_out, CU_EVENT_DISABLE_TIMING), "cuEventCreate");
+      s.grid_cap = 0;
+      s.sm_limit = "hard: green context of " + std::to_string(granted) + " SMs (verified)";
+    } catch (const std::exception& e) {
+      if (s.sm_stream) d_->cuStreamDestroy(s.sm_stream);
+      if (s.green) d_->cuGreenCtxDestroy(s.green);
+      s.sm_stream = nullptr, s.green = nullptr;
+      s.sm_limit += std::string("; no green context: ") + e.what();
+    }
+  }
+
   // A parameter table in device memory for the life of the group that built
   // it: launches read it in place, so the hot path uploads nothing.
   struct DevTable {
@@ -780,8 +896,7 @@ class CudaExecutor final : public Executor {
       void* bytes_args[] = {&t, &count, &sadd, &dadd};
       const unsigned threads = 256, warps = threads / 32;
       const unsigned blocks = static_cast<unsigned>((n + warps - 1) / warps);
-      check(d_->cuLaunchKernel(f, blocks, 1, 1, threads, 1, 1, 0, st, bytes ? bytes_args : typed_args, nullptr),
-            ("cuLaunchKernel " + name).c_str());
+      run_kernel(s, f, {blocks, 1, 1}, {threads, 1, 1}, bytes ? bytes_args : typed_args, st, name.c_str());
       at += n;
     }
   }
@@ -837,9 +952,10 @@ class CudaExecutor final : public Executor {
       long long count = static_cast<long long>(table.count) * (static_cast<long long>(desc.numel) / (sa * sb));
       int a = batch.tile_a, b = batch.tile_b;
       void* args[] = {&t, &count, &dcopy, &fcopy, &a, &b, &sadd, &dadd};
-      const unsigned gx = static_cast<unsigned>((sb + 31) / 32), gy = static_cast<unsigned>((sa + 31) / 32);
+      const long long tiles = ((sb + 31) / 32) * ((sa + 31) / 32);
+      const unsigned gx = static_cast<unsigned>(std::min<long long>(tiles, 1u << 30));
       const unsigned gz = static_cast<unsigned>(std::min<long long>(count, 65535));
-      check(d_->cuLaunchKernel(f, gx, gy, gz, 32, 8, 1, 0, st, args, nullptr), "cuLaunchKernel ce_stmt_tile");
+      run_kernel(s, f, {gx, 1, gz}, {32, 8, 1}, args, st, "ce_stmt_tile");
     } else {
       long long count = static_cast<long long>(table.count);
       void* args[] = {&t, &count, &dcopy, &fcopy, &sadd, &dadd};
@@ -847,7 +963,7 @@ class CudaExecutor final : public Executor {
       const unsigned per = (desc.numel + desc.vec - 1) / desc.vec;
       const unsigned gx = (per + threads - 1) / threads;
       const unsigned gy = static_cast<unsigned>(std::min<long long>(count, 65535));
-      check(d_->cuLaunchKernel(f, gx, gy, 1, threads, 1, 1, 0, st, args, nullptr), "cuLaunchKernel ce_stmt");
+      run_kernel(s, f, {gx, gy, 1}, {threads, 1, 1}, args, st, "ce_stmt");
     }
   }
 

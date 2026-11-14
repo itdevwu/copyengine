@@ -43,12 +43,17 @@ struct EngineOptions {
   int online_every = 64;
   bool allow_async = false;              // scope exit may return before host-side copies finish
   bool sync_always = false;              // wait after every flush, also device-only (CE_SYNC; debugging)
+  // Copy kernels use at most this many SMs per GPU (0: no limit; CE_MAX_SMS).
+  // Enforced by a green context where the driver confines it (verified on
+  // start), else by launching at most this many thread blocks. DMA copies use
+  // the copy engines, not SMs, and are not limited.
+  int max_sms = 0;
   bool disable = false;                  // every op natively, else as submitted (CE_DISABLE)
   bool log_plan = false;                 // print plans to stderr (CE_LOG=plan)
   int host_threads = 0;                  // 0: min(hardware threads, 8)
   int plan_cache = 4096;                 // max cached plans
 
-  // Applies CE_DISABLE, CE_LOG, CE_STAGING_MB, CE_EXPLORE, CE_SYNC on top of `base`.
+  // Applies CE_DISABLE, CE_LOG, CE_STAGING_MB, CE_EXPLORE, CE_SYNC, CE_MAX_SMS on top of `base`.
   static EngineOptions from_env(EngineOptions base);
   static EngineOptions from_env();
 };

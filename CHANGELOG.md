@@ -13,6 +13,10 @@ change incompatibly only in a new minor (0.x) or major release.
   dequantization with a scale run in one pass.
 - `float4_e2m1fn_x2` (packed FP4): copied between tensors of that dtype,
   any layout; never converted.
+- `Engine(max_sms=N)` / `CE_MAX_SMS`: copy kernels occupy at most N SMs per
+  GPU, through a green context where its confinement verifies on start
+  (rounded down to the driver's SM granularity), else by launching at most N
+  thread blocks. `stats()["cuda"]` reports which. DMA copies are unaffected.
 - The no-regression and same-results guarantees now state what holds for
   NaN: NaN stays NaN, its payload is not kept (torch's differs per device).
 

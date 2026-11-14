@@ -39,6 +39,7 @@ EngineOptions EngineOptions::from_env(EngineOptions o) {
   if (auto v = env("CE_STAGING_MB"); !v.empty()) o.staging_budget = std::stoll(v) << 20;
   if (auto v = env("CE_EXPLORE"); !v.empty()) o.explore = truthy(v);
   if (truthy(env("CE_SYNC"))) o.sync_always = true;
+  if (auto v = env("CE_MAX_SMS"); !v.empty()) o.max_sms = std::stoi(v);
   return o;
 }
 

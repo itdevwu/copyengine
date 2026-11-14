@@ -539,3 +539,65 @@ def test_sparse_tensors_take_the_general_path():
     sparse = dense.to_sparse()
     with pytest.raises((TypeError, ValueError, ce.CopyEngineError, RuntimeError)):
         ce.Engine(prior_only=True).copy_(torch.zeros(8, 8), sparse)
+
+
+# ---- SM limit --------------------------------------------------------------------------------
+
+
+def _sm_engine(n):
+    e = ce.Engine(prior_only=True, max_sms=n)
+    e.copy_(torch.empty(4, device=DEV), torch.ones(4, device=DEV))  # initializes the device
+    return e, e.stats()["cuda"][0]["sm_limit"]
+
+
+def test_sm_limit_is_enforced_and_reported():
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    e, how = _sm_engine(max(2, sms // 4))
+    assert how.startswith(("hard:", "soft:")), how
+    _, none = _sm_engine(sms)
+    assert none.startswith("none")
+
+
+@pytest.mark.parametrize("n", [1, 2, 6])
+def test_copies_are_correct_under_an_sm_limit(n):
+    e, _ = _sm_engine(n)
+    x = torch.randn(1 << 20, device=DEV)
+    for case in range(4):
+        if case == 0:  # chunk kernels: cast
+            out = torch.empty_like(x, dtype=torch.float16)
+            e.copy_(out, x)
+            want = x.half()
+        elif case == 1:  # tiled transpose
+            m = x.view(1024, 1024)
+            out = torch.empty(1024, 1024, dtype=torch.bfloat16, device=DEV)
+            e.copy_(out, m.t())
+            want = m.t().bfloat16()
+        elif case == 2:  # structured statements, many of them
+            src = x[:4096].view(4096, 1)
+            out = torch.empty(4096, 64, device=DEV)
+            with e.scope():
+                for i in range(0, 4096, 32):
+                    e.copy_(out[i:i + 32], src[i:i + 32].expand(32, 64))
+            want = src.expand(4096, 64)
+        else:  # gather table
+            cache = x.view(4096, 256)
+            ids = torch.randperm(4096)[:3000].tolist()
+            out = torch.empty(3000, 256, dtype=torch.float16, device=DEV)
+            e.copy_(out, ce.lazy(cache).index_select(0, ids))
+            want = cache[torch.tensor(ids, device=DEV)].half()
+        torch.testing.assert_close(out, want, rtol=0, atol=0)
+
+
+def test_hard_sm_limit_keeps_kernels_on_its_sms():
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    e, how = _sm_engine(max(2, sms // 4))
+    if not how.startswith("hard:"):
+        pytest.skip(how)
+    # A long copy on the limited engine leaves the other SMs free: a kernel on
+    # the default stream of another stream runs concurrently.
+    big = torch.randn(1 << 24, device=DEV)
+    out = torch.empty_like(big, dtype=torch.float16)
+    torch.cuda.synchronize()
+    e.copy_(out, big)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, big.half(), rtol=0, atol=0)

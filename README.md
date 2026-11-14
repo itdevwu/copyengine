@@ -63,7 +63,12 @@ scope: it runs as usual, ordered correctly around the copies.
 3. **Easy to turn off.** `CE_DISABLE=1` turns copyengine's choices off: every
    copy runs through torch's own `copy_`, or exactly as submitted where torch
    has no equivalent.
-4. **Bounded resources.** Device staging memory has a budget (`CE_STAGING_MB`).
+4. **Bounded resources.** Device staging memory has a budget (`CE_STAGING_MB`),
+   and `Engine(max_sms=N)` (or `CE_MAX_SMS`) keeps copy kernels on at most N
+   SMs per GPU, leaving the rest to your compute. Where the driver supports
+   green contexts the limit is hard (checked on start); otherwise copyengine
+   launches at most N thread blocks. DMA copies use the copy engines and no
+   SMs; memory bandwidth is still shared.
 
 The first runs of each new copy pattern are a warmup: copyengine measures its
 options, then locks the fastest. Save the result with `eng.save_profile(path)`
@@ -181,6 +186,7 @@ fastest.
 | `CE_STAGING_MB` | device staging budget in MB (default 256) |
 | `CE_LOG=plan` | print plans to stderr |
 | `CE_SYNC=1` | wait for every copy to finish (debugging) |
+| `CE_MAX_SMS` | at most this many SMs per GPU for copy kernels (see guarantee 4) |
 | `CE_SHIM=0` | skip the compiled `copy_` interception; scopes intercept in Python |
 | `CE_CACHE_DIR` | where interception builds compiled on import are cached (default `~/.cache/copyengine`) |
 

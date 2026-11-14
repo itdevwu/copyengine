@@ -40,12 +40,7 @@ __device__ __forceinline__ D convert(S x, const Fn& fn) {
 }
 
 template <class D, class S, bool kIdentity>
-__device__ __forceinline__ void typed(const Chunk* __restrict__ chunks, int n, Fn fn, long long sadd, long long dadd) {
-  const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
-  const int lane = threadIdx.x & 31;
-  if (warp >= n) return;
-  Chunk c = chunks[warp];
-  c.src += sadd, c.dst += dadd;
+__device__ __forceinline__ void typed_one(Chunk c, int lane, const Fn& fn) {
   const S* __restrict__ s = reinterpret_cast<const S*>(static_cast<uintptr_t>(c.src) * sizeof(S));
   D* __restrict__ d = reinterpret_cast<D*>(static_cast<uintptr_t>(c.dst) * sizeof(D));
   auto one = [&](long long so, long long dof) { d[dof] = convert<D, S, kIdentity>(s[so], fn); };
@@ -82,6 +77,19 @@ __device__ __forceinline__ void typed(const Chunk* __restrict__ chunks, int n, F
   }
 }
 
+// Chunk kernels take any grid: each warp strides over the chunks (the grid
+// may be capped to bound the SMs a copy occupies).
+#define CE_FOR_CHUNKS(chunks, n, sadd, dadd)                                  \
+  const int lane = threadIdx.x & 31;                                         \
+  const int warps = static_cast<int>((gridDim.x * blockDim.x) >> 5);         \
+  for (int w = static_cast<int>((blockIdx.x * blockDim.x + threadIdx.x) >> 5); w < (n); w += warps) \
+    if (Chunk c = (chunks)[w]; (c.src += (sadd), c.dst += (dadd), true))
+
+template <class D, class S, bool kIdentity>
+__device__ __forceinline__ void typed(const Chunk* __restrict__ chunks, int n, Fn fn, long long sadd, long long dadd) {
+  CE_FOR_CHUNKS(chunks, n, sadd, dadd) typed_one<D, S, kIdentity>(c, lane, fn);
+}
+
 template <class V>
 __device__ __forceinline__ void move(uintptr_t s, uintptr_t d, long long nbytes, int lane) {
   const V* __restrict__ sv = reinterpret_cast<const V*>(s);
@@ -93,12 +101,7 @@ __device__ __forceinline__ void move(uintptr_t s, uintptr_t d, long long nbytes,
 }  // namespace
 
 // Pure byte copies: widest vector the chunk's alignment allows.
-extern "C" __global__ void ce_bytes(const Chunk* __restrict__ chunks, int n, long long sadd, long long dadd) {
-  const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
-  const int lane = threadIdx.x & 31;
-  if (warp >= n) return;
-  Chunk c = chunks[warp];
-  c.src += sadd, c.dst += dadd;
+__device__ __forceinline__ void bytes_one(Chunk c, int lane) {
   const uintptr_t a = static_cast<uintptr_t>(c.src | c.dst | c.width | c.spitch | c.dpitch);
   for (long long r = 0; r < c.rows; ++r) {
     const uintptr_t s = static_cast<uintptr_t>(c.src + r * c.spitch), d = static_cast<uintptr_t>(c.dst + r * c.dpitch);
@@ -107,6 +110,10 @@ extern "C" __global__ void ce_bytes(const Chunk* __restrict__ chunks, int n, lon
     else if ((a & 3) == 0) move<uint32_t>(s, d, c.width, lane);
     else move<uint8_t>(s, d, c.width, lane);
   }
+}
+
+extern "C" __global__ void ce_bytes(const Chunk* __restrict__ chunks, int n, long long sadd, long long dadd) {
+  CE_FOR_CHUNKS(chunks, n, sadd, dadd) bytes_one(c, lane);
 }
 
 // Structured statements: dst[D(i)] = f(src[S(i)]) over a shared domain, for a
@@ -168,9 +175,9 @@ struct TypedConv {
 template <class Conv>
 __device__ __forceinline__ void stmt_body(const Base* __restrict__ bases, long long count, const StmtDesc& D,
                                           long long sadd, long long dadd, int ssz, int dsz, Conv conv) {
-  const unsigned e = (blockIdx.x * blockDim.x + threadIdx.x) * static_cast<unsigned>(D.vec);
-  if (e >= D.numel) return;
   const long long sstep = D.rank > 0 ? D.ss[D.rank - 1] : 0;
+  const unsigned stride = gridDim.x * blockDim.x * static_cast<unsigned>(D.vec);
+  for (unsigned e = (blockIdx.x * blockDim.x + threadIdx.x) * static_cast<unsigned>(D.vec); e < D.numel; e += stride)
   for (long long op = blockIdx.y; op < count; op += gridDim.y) {
     unsigned r = e;
     long long so = bases[op].src + sadd, dof = bases[op].dst + dadd;
@@ -265,9 +272,11 @@ extern "C" __global__ void ce_stmt_tile(const Base* __restrict__ bases, long lon
   __shared__ uint64_t tile[32][33];
   const long long sa = D.shape[a], sb = D.shape[b];
   const long long outer = static_cast<long long>(D.numel) / (sa * sb);
-  const long long ia0 = static_cast<long long>(blockIdx.y) * 32, ib0 = static_cast<long long>(blockIdx.x) * 32;
+  const long long tb = (sb + 31) / 32, tiles = tb * ((sa + 31) / 32);
   const int ssz = dt_size(D.sdt), dsz = dt_size(D.ddt);
+  for (long long t = blockIdx.x; t < tiles; t += gridDim.x)  // grid-stride over tiles (the grid may be capped)
   for (long long z = blockIdx.z; z < count; z += gridDim.z) {
+    const long long ia0 = (t / tb) * 32, ib0 = (t % tb) * 32;
     const long long op = z / outer;
     long long r = z - op * outer;
     long long so = bases[op].src + sadd, dof = bases[op].dst + dadd;
@@ -372,18 +381,27 @@ CE_KERNEL(f8e8m0, f8e8m0_t, f32, float)
 // Any convertible pair, dtypes read at run time (sdt / ddt: the DType codes).
 extern "C" __global__ void ce_convert_dyn(const Chunk* __restrict__ chunks, int n, Fn fn, long long sadd,
                                           long long dadd, int sdt, int ddt, int identity) {
-  const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
-  const int lane = threadIdx.x & 31;
-  if (warp >= n) return;
-  Chunk c = chunks[warp];
-  c.src += sadd, c.dst += dadd;
   const int ss = dt_size(sdt), ds = dt_size(ddt);
-  const long long total = c.width * c.rows;
-  for (long long e = lane; e < total; e += 32) {
-    const long long r = e / c.width, i = e - r * c.width;
-    const void* sp = reinterpret_cast<const void*>(static_cast<uintptr_t>(c.src + r * c.spitch + i) * ss);
-    void* dp = reinterpret_cast<void*>(static_cast<uintptr_t>(c.dst + r * c.dpitch + i) * ds);
-    if (identity) dyn_cast(sp, sdt, dp, ddt);
-    else dyn_apply(sp, sdt, dp, ddt, fn);
+  CE_FOR_CHUNKS(chunks, n, sadd, dadd) {
+    const long long total = c.width * c.rows;
+    for (long long e = lane; e < total; e += 32) {
+      const long long r = e / c.width, i = e - r * c.width;
+      const void* sp = reinterpret_cast<const void*>(static_cast<uintptr_t>(c.src + r * c.spitch + i) * ss);
+      void* dp = reinterpret_cast<void*>(static_cast<uintptr_t>(c.dst + r * c.dpitch + i) * ds);
+      if (identity) dyn_cast(sp, sdt, dp, ddt);
+      else dyn_apply(sp, sdt, dp, ddt, fn);
+    }
   }
+}
+
+// SM-limit admission: each block records the SM it ran on, after spinning a
+// little so that an unconfined launch spreads over every SM.
+extern "C" __global__ void ce_smid(unsigned* out, long long spin) {
+  if (threadIdx.x != 0) return;
+  const long long t0 = clock64();
+  while (clock64() - t0 < spin) {
+  }
+  unsigned id;
+  asm volatile("mov.u32 %0, %%smid;" : "=r"(id));
+  out[blockIdx.x] = id;
 }

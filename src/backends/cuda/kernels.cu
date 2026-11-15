@@ -769,7 +769,9 @@ __device__ void tile_vec(const cv::TileK& t, int lane, long long warp0, long lon
   using cv::QFmt;
   constexpr QFmt f = static_cast<QFmt>(F);
   constexpr bool range = f == QFmt::uint4;
-  constexpr int kC = 4;  // 4-value chunks kept in registers per thread (units up to 16 * tpu values)
+  // 4-value chunks kept in registers per thread: fewer for the byte formats,
+  // whose kernels trade registers for occupancy (see CE_TILE).
+  constexpr int kC = cv::qfmt_packed(f) ? 4 : 2;
   const int upw = 32 / tpu, sub = lane & (tpu - 1);
   const long long units = t.units();
   for (long long w = warp0; w * upw < units; w += warps) {
@@ -874,14 +876,18 @@ __device__ __forceinline__ void tile_kernel(const cv::TileK* __restrict__ tiles,
   }
 }
 
-#define CE_TILE(F)                                                                                \
-  extern "C" __global__ void ce_tile_q##F(const cv::TileK* __restrict__ t, int n) { tile_kernel<F, true>(t, n); } \
-  extern "C" __global__ void ce_tile_d##F(const cv::TileK* __restrict__ t, int n) { tile_kernel<F, false>(t, n); }
+// Byte formats: at least 3 blocks of 256 per SM (occupancy keeps loads in
+// flight when few SMs run them); the packed formats need their registers.
+#define CE_TILE_K(F, BOUNDS)                                                                             \
+  extern "C" __global__ void BOUNDS ce_tile_q##F(const cv::TileK* __restrict__ t, int n) { tile_kernel<F, true>(t, n); } \
+  extern "C" __global__ void BOUNDS ce_tile_d##F(const cv::TileK* __restrict__ t, int n) { tile_kernel<F, false>(t, n); }
+#define CE_TILE(F) CE_TILE_K(F, __launch_bounds__(256, 3))
+#define CE_TILE_PACKED(F) CE_TILE_K(F, )
 CE_TILE(0)
 CE_TILE(1)
 CE_TILE(2)
 CE_TILE(3)
 CE_TILE(4)
-CE_TILE(5)
-CE_TILE(6)
-CE_TILE(7)
+CE_TILE_PACKED(5)
+CE_TILE_PACKED(6)
+CE_TILE_PACKED(7)

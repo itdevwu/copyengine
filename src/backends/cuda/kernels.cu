@@ -50,7 +50,20 @@ __device__ __forceinline__ void typed_one(Chunk c, int lane, const Fn& fn) {
   // conversion is still per element, so results do not change.
   constexpr int V = 16 / (sizeof(S) > sizeof(D) ? sizeof(S) : sizeof(D));
   const bool aligned = ((c.src | c.dst | c.spitch | c.dpitch) & (V - 1)) == 0;
-  if (aligned && (c.width >= 32 * V || c.rows == 1)) {
+  if (aligned && c.rows > 1 && c.width < 32 * V && c.width % V == 0) {
+    // Narrow rows (a head of 128 values, say): lanes span rows, V per access.
+    const long long nv = c.width / V, n = nv * c.rows;
+#pragma unroll 4
+    for (long long e = lane; e < n; e += 32) {
+      const long long r = e / nv, i = e - r * nv;
+      Pack<S, V> in;
+      in.word = reinterpret_cast<const Pack<S, V>*>(s + r * c.spitch)[i].word;
+      Pack<D, V> out;
+#pragma unroll
+      for (int k = 0; k < V; ++k) out.v[k] = convert<D, S, kIdentity>(in.v[k], fn);
+      reinterpret_cast<Pack<D, V>*>(d + r * c.dpitch)[i].word = out.word;
+    }
+  } else if (aligned && (c.width >= 32 * V || c.rows == 1)) {
     const long long nv = c.width / V;
     for (long long r = 0; r < c.rows; ++r) {
       const auto* sv = reinterpret_cast<const Pack<S, V>*>(s + r * c.spitch);

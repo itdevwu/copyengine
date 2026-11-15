@@ -9,6 +9,11 @@ change incompatibly only in a new minor (0.x) or major release.
 - Prebuilt interception shims for torch 2.12.0, 2.12.1 and 2.13.0 (with
   2.9.1, 2.10.0 and 2.11.0): those install without a C++ compiler. CI tests
   torch 2.12 and 2.13, and the explicit API's ops built against 2.11 on 2.13.
+- Faster converting copies with narrow rows (a head of 128 values under a
+  permute, say): lanes now span rows with 16-byte accesses instead of moving
+  one element each.
+- `bench/bench_compile.py`: copyengine against torch eager and torch.compile
+  on the same copies. The adopt Skill says when each fits.
 
 ## 0.4.0
 

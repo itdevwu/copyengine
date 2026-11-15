@@ -41,6 +41,26 @@ GPU memcpy / kernel inventory). Good candidates, in order:
 Skip: one large contiguous copy (already at bandwidth), copies fused into
 compute kernels, anything needing autograd through the copy.
 
+## copyengine or torch.compile
+
+They do different jobs and combine: compile the model, hand the data
+movement around it to copyengine. copyengine leaves compiled graphs alone
+(importing it or running a compiled model inside `ce.scope()` changes neither
+results, graphs nor speed).
+
+| Work | Better with |
+|---|---|
+| Elementwise math or quantization on one GPU, fused into the model, static shapes | torch.compile (shape-specialized kernels) |
+| Host <-> GPU transfers, paged offload / load, gathers and scatters whose indices change every step | copyengine (no recompiles; DMA engines; overlap) |
+| Hundreds of small tensors per step (one per layer and kind) | copyengine (`ce.copy_many`, one launch) |
+| Background copies that must not take SMs or bandwidth from compute | copyengine (`max_sms`, `bandwidth=`) |
+| Paths where a compile (seconds, again per new shape) is not affordable | copyengine |
+
+Call copyengine outside compiled regions: a `ce.*` call inside a
+`torch.compile`d function works but splits its graph. When unsure, measure
+both on the real step; `bench/bench_compile.py` in the repository compares
+the common patterns.
+
 ## Pick the integration
 
 Read [patterns](references/patterns.md) for code. In short:

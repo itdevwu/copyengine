@@ -744,3 +744,21 @@ def test_bulk_copies_through_shared_memory(offset):
         assert "bulk" in seen
     else:
         assert "bulk" not in seen
+
+
+@pytest.mark.parametrize("D", [8, 16, 64, 120, 128, 248, 256, 260])
+@pytest.mark.parametrize("pair", [(torch.bfloat16, torch.float16), (torch.float32, torch.bfloat16),
+                                  (torch.float16, torch.float32)])
+def test_narrow_rows_cast_matches_torch(D, pair):
+    # A head-sized innermost dimension under a permute: rows narrower than a
+    # warp's vector span (lanes spread across rows), at and around the bounds.
+    src_dt, dst_dt = pair
+    x = (torch.randn(4, 96, 8, D, device=DEV) * 100).to(src_dt)
+    x.view(-1)[:4] = torch.tensor([float("nan"), float("inf"), -0.0, 65504.0])
+    out = torch.empty(4, 8, 96, D, device=DEV, dtype=dst_dt)
+    e = ce.Engine(prior_only=True)
+    e.copy_(out, x.permute(0, 2, 1, 3))
+    e.synchronize()
+    want = x.permute(0, 2, 1, 3).to(dst_dt)
+    nan = want.isnan()
+    assert torch.equal(out.isnan(), nan) and torch.equal(out[~nan], want[~nan])

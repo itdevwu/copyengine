@@ -714,18 +714,149 @@ __device__ __forceinline__ void tile_unit_warp(const cv::TileK& t, long long u, 
   }
 }
 
+// ---- the vector path: 4 consecutive values per thread, several units per warp ----------
+
+__device__ __forceinline__ void load4(long long p, int dt, float v[4]) {
+  if (dt == cv::kF32) {
+    const float4 w = *reinterpret_cast<const float4*>(static_cast<uintptr_t>(p));
+    v[0] = w.x, v[1] = w.y, v[2] = w.z, v[3] = w.w;
+    return;
+  }
+  const uint2 w = *reinterpret_cast<const uint2*>(static_cast<uintptr_t>(p));
+  const uint16_t h[4] = {static_cast<uint16_t>(w.x), static_cast<uint16_t>(w.x >> 16), static_cast<uint16_t>(w.y),
+                         static_cast<uint16_t>(w.y >> 16)};
+#pragma unroll
+  for (int i = 0; i < 4; ++i) v[i] = dt == cv::kF16 ? cv::half_to_float(h[i]) : cv::bf16_to_float(h[i]);
+}
+
+__device__ __forceinline__ void store4(long long p, int dt, const float v[4]) {
+  if (dt == cv::kF32) {
+    *reinterpret_cast<float4*>(static_cast<uintptr_t>(p)) = make_float4(v[0], v[1], v[2], v[3]);
+    return;
+  }
+  uint16_t h[4];
+#pragma unroll
+  for (int i = 0; i < 4; ++i) h[i] = dt == cv::kF16 ? cv::float_to_half(v[i]) : cv::float_to_bf16(v[i]);
+  *reinterpret_cast<uint2*>(static_cast<uintptr_t>(p)) =
+      make_uint2(h[0] | (static_cast<uint32_t>(h[1]) << 16), h[2] | (static_cast<uint32_t>(h[3]) << 16));
+}
+
+// Threads per unit: 4 values each; a power of two dividing the warp (or the
+// whole warp, looping, for long units). 0: the vector path does not apply.
+__device__ __forceinline__ int tile_tpu(const cv::TileK& t) {
+  if (!t.vec) return 0;
+  const int per = t.g >> 2;
+  if (per >= 32) return 32;
+  return (per & (per - 1)) == 0 ? per : 0;
+}
+
+template <int F, bool Q>
+__device__ void tile_vec(const cv::TileK& t, int lane, long long warp0, long long warps, int tpu) {
+  using cv::QFmt;
+  constexpr QFmt f = static_cast<QFmt>(F);
+  constexpr bool range = f == QFmt::uint4;
+  constexpr int kC = 4;  // 4-value chunks kept in registers per thread (units up to 16 * tpu values)
+  const int upw = 32 / tpu, sub = lane & (tpu - 1);
+  const long long units = t.units();
+  for (long long w = warp0; w * upw < units; w += warps) {
+    const long long u = w * upw + lane / tpu;
+    cv::UnitAt a{};
+    a.bad = true;
+    if (u < units) {
+      a = cv::unit_at(t, u);
+      if (a.bad && sub == 0 && t.err) atomicOr(reinterpret_cast<unsigned long long*>(t.err), 1ull);
+    }
+    const bool ok = u < units && !a.bad;  // the same for a unit's threads: shuffles stay within its group
+    if (!Q) {  // dequantize
+      if (!ok) continue;
+      const float s = t.scale_byte ? 0.0f : cv::rd<float>(cv::addr(a.s));
+      const uint8_t bits =
+          t.scale_byte ? cv::rd<uint8_t>(cv::addr(a.s)) : (f == QFmt::uint4 ? cv::rd<uint8_t>(cv::addr(a.z)) : 0);
+      const float factor = cv::unit_scale(f, s, bits, t.gs);
+      const uint8_t* q0 = static_cast<const uint8_t*>(cv::addr(cv::q_at(t, a, 0)));
+      for (int base = sub * 4; base < t.g; base += tpu * 4) {
+        float v[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) v[i] = cv::dequantize_at(q0, 1, base + i, f, factor, bits);
+        store4(cv::x_at(t, a, base), t.xdt, v);
+      }
+      continue;
+    }
+    float c[kC][4];
+    float amax = 0.0f, lo = 0.0f, hi = 0.0f;
+    int n = 0;
+    for (int base = sub * 4; base < t.g; base += tpu * 4, ++n) {
+      float v[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+      if (ok) load4(cv::x_at(t, a, base), t.xdt, v);
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        if (n < kC) c[n][i] = v[i];
+        amax = cv::amax_step(amax, cv::abs_f(v[i]));
+        if (range) lo = cv::amin_step(lo, v[i]), hi = cv::amax_step(hi, v[i]);
+      }
+    }
+    for (int o = tpu >> 1; o; o >>= 1) {
+      amax = cv::amax_step(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, o));
+      if (range) {
+        lo = cv::amin_step(lo, __shfl_xor_sync(0xFFFFFFFFu, lo, o));
+        hi = cv::amax_step(hi, __shfl_xor_sync(0xFFFFFFFFu, hi, o));
+      }
+    }
+    if (!ok) continue;
+    cv::UnitQ p;
+    if (t.static_scale) {
+      const float s = t.scale_byte ? 0.0f : cv::rd<float>(cv::addr(a.s));
+      const uint8_t sb = t.scale_byte ? cv::rd<uint8_t>(cv::addr(a.s)) : 0;
+      const uint8_t z = f == QFmt::uint4 ? cv::rd<uint8_t>(cv::addr(a.z)) : 0;
+      p = cv::unit_from_scale(f, s, sb, z, t.gs);
+    } else {
+      p = cv::unit_params(f, amax, lo, hi, t.eps, t.gs);
+      if (sub == 0) {
+        if (t.scale_byte) cv::wr<uint8_t>(cv::addr(a.s), p.bits);
+        else cv::wr<float>(cv::addr(a.s), p.scale);
+        if (f == QFmt::uint4) cv::wr<uint8_t>(cv::addr(a.z), p.bits);
+      }
+    }
+    n = 0;
+    for (int base = sub * 4; base < t.g; base += tpu * 4, ++n) {
+      float v[4];
+      if (n < kC) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) v[i] = c[n][i];
+      } else {
+        load4(cv::x_at(t, a, base), t.xdt, v);
+      }
+      uint8_t k[4];
+#pragma unroll
+      for (int i = 0; i < 4; ++i) k[i] = cv::quant_elem(f, v[i], p);
+      if constexpr (cv::qfmt_packed(f)) {
+        *reinterpret_cast<uint16_t*>(static_cast<uintptr_t>(cv::q_at(t, a, base))) =
+            static_cast<uint16_t>((k[0] | (k[1] << 4)) | ((k[2] | (k[3] << 4)) << 8));
+      } else {
+        *reinterpret_cast<uint32_t*>(static_cast<uintptr_t>(cv::q_at(t, a, base))) =
+            k[0] | (static_cast<uint32_t>(k[1]) << 8) | (static_cast<uint32_t>(k[2]) << 16) |
+            (static_cast<uint32_t>(k[3]) << 24);
+      }
+    }
+  }
+}
+
 }  // namespace
 
-// Grid: x over units (8 warps per block, grid-stride), y over the group's ops.
+// Grid: x over warps (8 per block, grid-stride over units), y over the group's ops.
 template <int F, bool Q>
 __device__ __forceinline__ void tile_kernel(const cv::TileK* __restrict__ tiles, int count) {
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, wpb = blockDim.x >> 5;
+  const long long warp0 = static_cast<long long>(blockIdx.x) * wpb + warp;
+  const long long warps = static_cast<long long>(gridDim.x) * wpb;
   for (int op = blockIdx.y; op < count; op += gridDim.y) {
     const cv::TileK t = tiles[op];
+    if (const int tpu = tile_tpu(t)) {
+      tile_vec<F, Q>(t, lane, warp0, warps, tpu);
+      continue;
+    }
     const long long units = t.units();
-    for (long long u = static_cast<long long>(blockIdx.x) * wpb + warp; u < units;
-         u += static_cast<long long>(gridDim.x) * wpb)
-      tile_unit_warp<F, Q>(t, u, lane);
+    for (long long u = warp0; u < units; u += warps) tile_unit_warp<F, Q>(t, u, lane);
   }
 }
 

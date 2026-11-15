@@ -691,6 +691,13 @@ struct Engine::Impl {
     k->g = t.g, k->upr = static_cast<int>(t.upr), k->fmt = t.fmt, k->xdt = static_cast<int>(xd);
     k->scale_byte = byte_scale, k->quantize = t.quantize, k->eps = t.eps, k->gs = t.gs;
     k->static_scale = t.quantize && t.static_scale;
+    {  // the kernels' vector path (TileK::vec)
+      const long long xa = 4 * static_cast<long long>(itemsize(xd)), qa = packed ? 2 : 4;
+      bool v = t.g % 4 == 0 && k->xe == static_cast<long long>(itemsize(xd)) && k->qe == 1 && k->x % xa == 0 &&
+               k->q % qa == 0;
+      for (int i = 0; i < 3; ++i) v = v && k->xr[i] % xa == 0 && k->qr[i] % qa == 0;
+      k->vec = v;
+    }
     // Index tables: host values live with the op (the executor reads them, or
     // uploads them for a kernel); GPU ones are this call's pointer.
     std::shared_ptr<std::vector<int64_t>> hx, hc;

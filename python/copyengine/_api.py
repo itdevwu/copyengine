@@ -699,6 +699,7 @@ class _Site:
 
     PAIRS = 10
     SETTLE = 3
+    MAX_SKIPS = 40  # entries skipped because the stream was busy at entry, at most
     MAX_WARM = 256  # an engine that never settles: compare anyway
 
     def __init__(self, on_kind: str = "mode"):
@@ -708,6 +709,7 @@ class _Site:
         self.decided: Optional[bool] = None
         self.settled = 0
         self.warm = 0
+        self.skips = 0
         self.waiting: list = []  # (used, host seconds, start event, end event) not yet complete
 
     def choose(self):
@@ -825,8 +827,16 @@ class _Scope:
         if self.timed:
             self.runs0 = e._e.tuning_runs
             if self.timed is True and torch is not None and torch.cuda.is_available() and torch.cuda.is_initialized():
-                self.ev0 = torch.cuda.Event(enable_timing=True)
-                self.ev0.record()
+                cur = self.stream if self.stream is not None else torch.cuda.current_stream()
+                site = e._sites[self.site]
+                # A busy stream would put earlier work into the GPU span: not a sample, unless
+                # the site's own work keeps it busy (then noisy samples are all there is).
+                if cur.query() or site.skips >= _Site.MAX_SKIPS:
+                    self.ev0 = torch.cuda.Event(enable_timing=True)
+                    self.ev0.record()
+                else:
+                    site.skips += 1
+                    self.timed = "skip"
             self.t0 = time.perf_counter()
         if self.kind == "shim":
             if _shim.lib is None:
@@ -873,6 +883,8 @@ class _Scope:
             quiet = e._e.tuning_runs == self.runs0
             if self.timed == "warm":
                 site.warmed(quiet)
+            elif self.timed == "skip":
+                pass  # the stream was busy at entry: its GPU span would include earlier work
             elif quiet:  # an entry that ran tuning measurements is not a sample
                 end = None
                 if self.ev0 is not None:

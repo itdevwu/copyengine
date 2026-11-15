@@ -156,6 +156,15 @@ class Engine {
   // rebinds): groups reading device tables never take the frontend's native
   // copy, whose payload holds the traced index tensors.
   std::shared_ptr<Frozen> freeze(bool rebindable) const;
+  // The same, with copies through temporaries composed away: `dead` lists
+  // allocations (device index, lo, hi; GPU memory) the step wrote and read
+  // but nobody reads afterwards. A pure copy reading one gets the bytes'
+  // sources instead, and copies into them are dropped. Null when it cannot
+  // (anything but pure copies touches them, or bytes are read before written).
+  std::shared_ptr<Frozen> freeze_composed(const std::vector<std::array<int64_t, 3>>& dead, bool rebindable) const;
+  // Drops the last flush's references to the frontend's copies (their
+  // tensors), so memory only they kept alive is free (see freeze_composed).
+  void release_payloads();
   int64_t flushes() const;
   // While on, every copy goes through the queue (none runs as torch's copy at
   // interception time): a frontend tracing a region for freeze() sets it.

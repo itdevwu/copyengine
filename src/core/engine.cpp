@@ -1438,6 +1438,126 @@ int64_t Engine::flushes() const {
   return impl_->total_flushes;
 }
 
+void Engine::release_payloads() {
+  Locked lk(*impl_);
+  if (!impl_->last_ops) return;
+  auto v = std::make_shared<std::vector<Op>>(*impl_->last_ops);
+  for (Op& op : *v) op.native.reset();
+  impl_->last_ops = std::move(v);
+}
+
+std::shared_ptr<Frozen> Engine::freeze_composed(const std::vector<std::array<int64_t, 3>>& dead,
+                                                bool rebindable) const {
+  Locked lk(*impl_);
+  Impl& m = *impl_;
+  if (!m.last_ops) fail(Errc::invalid_argument, "freeze: nothing has been flushed yet");
+  const auto& ops = *m.last_ops;
+  // Which dead allocation (index into `dead`) a side's allocation is, or -1.
+  auto dead_of = [&](const Side& side, int64_t lo, int64_t hi) -> int {
+    if (side.device.kind != DeviceKind::cuda) return -1;
+    for (size_t i = 0; i < dead.size(); ++i)
+      if (dead[i][0] == side.device.index && lo < dead[i][2] && hi > dead[i][1]) {
+        return lo >= dead[i][1] && hi <= dead[i][2] ? static_cast<int>(i) : -2;  // -2: straddles
+      }
+    return -1;
+  };
+  auto pure = [](const Op& op) {
+    return !op.opaque && !op.tile && op.extras.empty() && op.bandwidth == 0 && op.fn.identity() &&
+           op.src.dtype == op.dst.dtype && op.body;
+  };
+  // Bytes written into dead memory so far: [d, d + len) holds the bytes at s on the side.
+  struct Piece {
+    int64_t d, len, s;
+    Side side;
+    int64_t lo, hi;  // the source allocation
+  };
+  std::vector<Piece> written;
+  // The sources of [s, s + len) of dead memory, in order; false if a byte was never written.
+  auto resolve = [&](int64_t s, int64_t len, std::vector<Piece>& out) {
+    int64_t at = s;
+    const int64_t end = s + len;
+    while (at < end) {
+      const Piece* best = nullptr;  // the latest write covering `at`
+      for (auto it = written.rbegin(); it != written.rend(); ++it)
+        if (at >= it->d && at < it->d + it->len) {
+          best = &*it;
+          break;
+        }
+      if (!best) return false;
+      // up to the end of this piece, or where a later write starts covering
+      int64_t stop = std::min(end, best->d + best->len);
+      for (auto it = written.rbegin(); &*it != best; ++it)
+        if (it->d > at && it->d < stop) stop = it->d;
+      out.push_back({at, stop - at, best->s + (at - best->d), best->side, best->lo, best->hi});
+      at = stop;
+    }
+    return true;
+  };
+  std::vector<Op> out;
+  for (const Op& op : ops) {
+    const int sd = dead_of(op.src, op.src_lo, op.src_hi), dd = dead_of(op.dst, op.dst_lo, op.dst_hi);
+    bool extra_dead = false;
+    for (const Op::Extra& x : op.extras) extra_dead = extra_dead || dead_of({x.device, DType::u8, false}, x.lo, x.hi) != -1;
+    if (sd == -1 && dd == -1 && !extra_dead) {
+      out.push_back(op);
+      continue;
+    }
+    if (sd == -2 || dd == -2 || extra_dead || !pure(op)) return nullptr;
+    // Composed runs, grouped by where their bytes come from.
+    struct Out {
+      Side side;
+      int64_t lo, hi;
+      Runs runs;
+    };
+    std::vector<Out> outs;
+    auto out_for = [&](const Side& side, int64_t lo, int64_t hi) -> Runs& {
+      for (Out& o : outs)
+        if (o.side.device == side.device && o.side.pinned == side.pinned && o.lo == lo && o.hi == hi) return o.runs;
+      outs.push_back({side, lo, hi, {}});
+      return outs.back().runs;
+    };
+    const Runs& r = op.runs();
+    std::vector<Piece> src;
+    for (size_t i = 0; i < r.size(); ++i) {
+      src.clear();
+      if (sd >= 0) {
+        if (!resolve(r.src[i], r.len[i], src)) return nullptr;  // read before written: not a temporary
+      } else {
+        src.push_back({r.src[i], r.len[i], r.src[i], op.src, op.src_lo, op.src_hi});
+      }
+      int64_t d = r.dst[i];
+      for (const Piece& p : src) {
+        if (dd >= 0) written.push_back({d, p.len, p.s, p.side, p.lo, p.hi});
+        else out_for(p.side, p.lo, p.hi).push(p.s, d, p.len);
+        d += p.len;
+      }
+    }
+    for (Out& o : outs) {  // pure copies in bytes: endpoints are the allocations
+      Endpoint se{o.side.device, static_cast<uintptr_t>(o.lo), o.hi - o.lo, DType::u8, o.side.pinned};
+      Endpoint de{op.dst.device, static_cast<uintptr_t>(op.dst_lo), op.dst_hi - op.dst_lo, DType::u8, op.dst.pinned};
+      for (size_t i = 0; i < o.runs.size(); ++i) o.runs.src[i] -= o.lo, o.runs.dst[i] -= op.dst_lo;
+      Hints h;
+      h.ctx = op.ctx;
+      Op c = m.make_op(se, de, std::move(o.runs), Elementwise{}, h);
+      if (!c.runs().empty()) out.push_back(std::move(c));
+    }
+  }
+  if (out.empty()) return nullptr;
+  auto plan = std::make_shared<Plan>(build_plan(out));
+  Ran ran{plan, {}};
+  for (Group& g : plan->groups) {
+    g.candidates = m.tuner.shortlist(m.exec_for(g.src, g.dst).candidates(g));
+    g.bucket = bucket_key(g, static_cast<int>(g.ops.size()));
+    const Choice c = m.choice_for(g, out);
+    auto l = m.tuner.locked_strategy(g.bucket);
+    Strategy s = l && std::find(c.cands.begin(), c.cands.end(), *l) != c.cands.end() ? *l : c.reference();
+    if (s == Strategy::native) s = c.cands.empty() ? Strategy::passthrough : c.cands.front();  // no payload here
+    if (rebindable && g.opaque() && s == Strategy::native) s = c.cands.front();
+    ran.strategies.push_back(s);
+  }
+  return std::make_shared<FrozenImpl>(impl_.get(), std::make_shared<std::vector<Op>>(std::move(out)), std::move(ran));
+}
+
 std::shared_ptr<Frozen> Engine::freeze(bool rebindable) const {
   Locked lk(*impl_);
   if (!impl_->last_ops) fail(Errc::invalid_argument, "freeze: nothing has been flushed yet");

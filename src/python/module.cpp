@@ -404,6 +404,12 @@ NB_MODULE(_core, m) {
       .def("dump_profile", &ce::Engine::dump_profile)
       .def("load_profile", &ce::Engine::load_profile)
       .def("freeze", [](const ce::Engine& e, bool rebindable) { return e.freeze(rebindable); }, "rebindable"_a = false)
+      .def("freeze_composed",
+           [](const ce::Engine& e, const std::vector<std::array<int64_t, 3>>& dead, bool rebindable) {
+             return e.freeze_composed(dead, rebindable);
+           },
+           "dead"_a, "rebindable"_a = false)
+      .def("release_payloads", &ce::Engine::release_payloads)
       .def_prop_ro("flushes", &ce::Engine::flushes)
       .def("set_recording", &ce::Engine::set_recording);
 

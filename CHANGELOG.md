@@ -6,6 +6,10 @@ change incompatibly only in a new minor (0.x) or major release.
 
 ## Unreleased
 
+- Step plans replay steps that stage copies through tensors they allocate
+  and drop: copies into and out of such a temporary compose into direct
+  copies, and it is not written (before, the step ran plainly).
+
 - einops on lazy views: `einops.rearrange(ce.lazy(x), ...)` and
   `einops.repeat` compose into the view (no materialization), so a chain of
   rearrangements, gathers, conversions and the write into a destination is

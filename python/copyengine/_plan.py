@@ -51,6 +51,33 @@ def note_values() -> None:
         _tracing.values += 1
 
 
+def _dead_temporaries(allocs):
+    """GPU allocations the step's copies used that no tensor holds now (the step
+    allocated and dropped them: torch's allocator has them free), as
+    (device, lo, hi); None if any is anything else (host memory, alive)."""
+    if not allocs or torch is None or not torch.cuda.is_available():
+        return None
+    if any(kind != 1 for kind, _, _, _ in allocs):
+        return None
+    try:
+        segments = torch.cuda.memory._snapshot()["segments"]
+    except Exception:  # pragma: no cover - allocator without snapshots
+        return None
+    free = {}
+    for seg in segments:
+        for b in seg["blocks"]:
+            free.setdefault(seg["device"], []).append((b["address"], b["address"] + b["size"], b["state"]))
+    dead = []
+    for _, index, lo, hi in allocs:
+        blocks = free.get(index, [])
+        inside_free = any(a <= lo and hi <= b and st == "inactive" for a, b, st in blocks)
+        overlaps_live = any(a < hi and lo < b and st != "inactive" for a, b, st in blocks)
+        if not inside_free or overlaps_live:
+            return None
+        dead.append((index, lo, hi))
+    return dead
+
+
 def _is_host_index(x) -> bool:
     if isinstance(x, np.ndarray):
         return x.ndim <= 1 and x.dtype.kind in "iu"
@@ -256,6 +283,14 @@ class StepPlan:
             if lay["warm"] < _Site.SETTLE:
                 return  # the engine is still tuning this step
             tr.frozen = e._e.freeze(rebindable=True)
+            if self._unbound(tr, leaves):
+                # Copies through tensors the step allocated and dropped: compose them away.
+                # The engine's own references (torch's copies, its baseline) go first.
+                tr.frozen = None
+                e._e.release_payloads()
+                dead = _dead_temporaries(self._unbound_of(e._e.freeze(rebindable=True).allocations, leaves))
+                composed = e._e.freeze_composed(dead, rebindable=True) if dead else None
+                tr.frozen = composed if composed is not None else e._e.freeze(rebindable=True)
             for i in cands:
                 if id(leaves[i]) in used and not values:
                     tr.params.append((i, params[id(leaves[i])]))
@@ -269,6 +304,26 @@ class StepPlan:
         if len(lay["traces"]) > self.MAX_TRACES:
             lay["traces"].pop(0)
         self._last = (leaves, tr)
+
+    @staticmethod
+    def _storages(leaves):
+        storages = {}
+        for i, x in enumerate(leaves):
+            if _is_tensor(x):
+                s = x.untyped_storage()
+                storages.setdefault((x.device.type == "cuda", x.device.index or 0, s.data_ptr()), (i, s.nbytes()))
+        return storages
+
+    @staticmethod
+    def _unbound(tr: _Trace, leaves):
+        """The frozen copies' allocations that are no argument: (kind, index, lo, hi)."""
+        return StepPlan._unbound_of(tr.frozen.allocations, leaves)
+
+    @staticmethod
+    def _unbound_of(allocations, leaves):
+        storages = StepPlan._storages(leaves)
+        return [(kind, index, lo, hi) for kind, index, lo, hi in allocations
+                if storages.get((kind == 1, index if kind == 1 else 0, lo)) is None]
 
     @staticmethod
     def _bind(tr: _Trace, leaves):

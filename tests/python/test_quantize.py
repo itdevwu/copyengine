@@ -328,6 +328,60 @@ def test_paged_offload_through_device_staging(fmt, g, gpu_pages):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("fmt,g", [("fp8_e4m3", 128), ("nvfp4", 16), ("uint4", 64)])
+@pytest.mark.parametrize("slots", [False, True])
+def test_staging_in_chunks(fmt, g, slots):
+    # Larger than one staging round (4 MB budget: chunks of up to 2 MB in two
+    # halves): DMA of one chunk overlaps the kernel of another.
+    blocks, tokens, D = 64, 64, 1024  # host side: 2-4 MB of codes
+    gs = 0.02 if fmt == "nvfp4" else 1.0
+    kv = data((blocks, tokens), D, torch.bfloat16, "cuda", seed=13)
+    pool = blocks + 8 if slots else blocks
+    q, scale, zero = (None if t is None else t.pin_memory() for t in outputs(fmt, (pool, tokens), D, g, "cpu"))
+    idx = torch.randperm(pool)[:blocks] if slots else None
+    ix = None if idx is None else idx.tolist()
+    e = ce.Engine(tune_trials=1, tune_topk=4, staging_budget_mb=4)
+    seen, chunked = set(), 0
+    for _ in range(6):
+        e.quantize(kv, q, scale, zero, fmt=fmt, group=g, global_scale=gs, index=ix)
+        e.synchronize()
+        last = e.stats()["last"]
+        seen.update(last["strategies"])
+        if last["strategies"] == ["tile_staged"]:
+            chunked = max(chunked, last["calls"])
+        sel = idx if idx is not None else torch.arange(blocks)
+        check(fmt, g, kv, rows(q, sel), rows(scale, sel), None if zero is None else zero[sel], gs)
+        back = torch.zeros(blocks, tokens, D, device="cuda")
+        e.dequantize(q, scale, back, zero, fmt=fmt, group=g, global_scale=gs, index=ix)
+        torch.cuda.synchronize()
+        seen.update(e.stats()["last"]["strategies"])
+        codes, s, bits = _quant.quantize(kv.cpu(), g, fmt, gs=gs)
+        want = _quant.dequantize(codes, s, bits, g, fmt, gs).view(back.shape)
+        got = back.cpu()
+        nan = got.isnan()
+        assert torch.equal(nan, want.isnan()) and torch.equal(got[~nan], want[~nan])
+    assert "tile_staged" in seen and chunked >= 4
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_staging_interleaved_host_rows():
+    # Host tensors viewed transposed (rows of the first dimension interleave):
+    # staged as one piece, results unchanged.
+    g, T, C = 64, 128, 512
+    v = data((T,), C, torch.bfloat16, "cuda", seed=14)                     # [tokens, channels]
+    q = torch.zeros(C, T, dtype=torch.float8_e4m3fn).pin_memory()        # per channel over tokens
+    scale = torch.zeros(T // g, C).pin_memory()
+    e = ce.Engine(tune_trials=1, tune_topk=4)
+    seen = set()
+    for _ in range(6):
+        e.quantize(v.transpose(0, 1), q, scale.transpose(0, 1), fmt="fp8_e4m3", group=g)
+        e.synchronize()
+        seen.update(e.stats()["last"]["strategies"])
+        check("fp8_e4m3", g, v.transpose(0, 1).contiguous(), q, scale.transpose(0, 1).contiguous(), None)
+    assert seen <= {"tile", "tile_staged", "native"}
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_staging_leaves_other_host_rows_alone():
     # Quantizing into some slots of a pinned pool through staging writes
     # those slots only.

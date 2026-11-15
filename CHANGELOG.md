@@ -13,7 +13,8 @@ change incompatibly only in a new minor (0.x) or major release.
   (zero-copy) or through device staging (compress then move, move then
   decompress), chosen by measurement; with indices too (paged offload: GPU
   pages by `x_index`, host pool slots by `index`, the slots moved by batched
-  DMA).
+  DMA). Staging runs in chunks, so DMA overlaps the kernels, and within the
+  staging budget.
 - Fixes: explicit quantize calls with host indices planned anew on every
   call (new index values missed the plan cache), so they were never tuned;
   device staging of several tile ops in one group could write descriptors

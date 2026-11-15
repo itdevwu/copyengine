@@ -757,20 +757,31 @@ struct Engine::Impl {
                         {t.q, t.index, qr, 1, packed ? vals / 2 : vals, !t.quantize},
                         {t.scale, t.index, sr, sw, t.upr, reads_scale}};
       if (zero) ss.push_back({t.zero, t.index, zr, 1, t.upr, reads_scale});
-      bool host = false, ok = true, c_host = false, c_dev = false;
+      // Staging runs in chunks of rows of the first dimension, two at a time
+      // in the staging budget: a row (or, where rows interleave, the whole
+      // op) must fit in half of it.
+      const auto al = [](int64_t b) { return (b + 255) & ~int64_t{255}; };
+      bool host = false, ok = true, c_host = false, c_dev = false, split = t.rows[0] > 1;
+      int64_t row_bytes = 0, whole_bytes = 0;
       for (const S& s : ss) {
         if (&s.index == &t.index && s.index.used()) (s.side.ep.device.kind == DeviceKind::host ? c_host : c_dev) = true;
         if (s.side.ep.device.kind != DeviceKind::host) continue;
         host = true;
+        const auto e1 = tile_extent(t1, s.side, s.count, s.width);
+        const int64_t span1 = e1.second - e1.first;
         int64_t span = s.e.second - s.e.first, need = t.rows[0] * t.rows[1] * t.rows[2] * s.count * s.width;
+        row_bytes += al(span1);
         if (s.index.used()) {
           ok = ok && !s.index.dev;
-          const auto e1 = tile_extent(t1, s.side, s.count, s.width);
-          span = e1.second - e1.first, need = t.rows[1] * t.rows[2] * s.count * s.width;
+          span = span1, need = t.rows[1] * t.rows[2] * s.count * s.width;
+          whole_bytes += t.rows[0] * al(span1);
+        } else {
+          whole_bytes += al(span);
+          split = split && std::llabs(s.side.row_stride[0]) >= span1;
         }
         ok = ok && (s.input ? span <= 2 * need : span == need);
       }
-      ok = ok && !(c_host && c_dev);
+      ok = ok && !(c_host && c_dev) && (split ? row_bytes : whole_bytes) <= opt.staging_budget / 2;
       op.tile_host = host;
       op.tile_staged_ok = host && ok && dev.kind == DeviceKind::cuda;
     }

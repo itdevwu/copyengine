@@ -29,3 +29,7 @@ DType parse_dtype(std::string_view name) {
 }
 
 }  // namespace ce
+
+namespace ce::cv {
+int f8e4m3_saturate = 0;  // see convert.hpp: torch's float8_e4m3fn overflow (NaN, or +-448 from torch 2.13)
+}  // namespace ce::cv

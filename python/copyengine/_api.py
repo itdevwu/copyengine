@@ -43,6 +43,21 @@ _STRIDED = torch.strided if torch is not None else None
 # dtypes torch's stable ABI cannot pass to a custom op yet: these take the Python path.
 _NOT_STABLE = (torch.float8_e8m0fnu, torch.float4_e2m1fn_x2) if torch is not None else ()
 
+def _torch_f8e4m3_saturates() -> bool:
+    """Whether the installed torch saturates float -> float8_e4m3fn beyond the
+    format (+-448, torch 2.13 on) instead of returning NaN (up to 2.12).
+    CE_F8E4M3_SATURATE=0/1 overrides it (tests)."""
+    import os
+    v = os.environ.get("CE_F8E4M3_SATURATE")
+    if v is not None:
+        return v == "1"
+    x = torch.tensor([1000.0, float("inf")]).to(torch.float8_e4m3fn).view(torch.uint8).tolist()
+    return x == [0x7E, 0x7E]
+
+
+if torch is not None:
+    _core._set_f8e4m3_saturate(_torch_f8e4m3_saturates())  # copies keep matching torch
+
 if torch is not None:
     _FLOATS = (torch.float16, torch.bfloat16, torch.float32, torch.float64,
                torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e8m0fnu)

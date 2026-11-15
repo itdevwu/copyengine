@@ -138,3 +138,50 @@ def test_intercepted_fp8_copies(dev, intercept):
                 cache[l, b].copy_(src[l, i])
     assert e.stats()["last"]["ops"] == 8 * 16
     assert same(rows(cache.transpose(0, 1), ids).transpose(0, 1), src.to(torch.float8_e4m3fn))
+
+
+_OVERFLOW_SCRIPT = r"""
+import sys, torch, copyengine as ce
+dev, sat = sys.argv[1], sys.argv[2] == "1"
+assert ce._core._f8e4m3_saturate() == sat
+x = torch.tensor([447.0, 448.0, 463.99, 464.0, 465.0, 480.0, 1e4, 3.4e38, float("inf"), float("nan"), 1.0, 0.0])
+x = torch.cat([x, -x]).to(dev)
+for wide in (torch.float32, torch.float16, torch.bfloat16):
+    xs = x.to(wide)
+    # The expected bits: torch's conversion where both modes agree; beyond the
+    # format (|x| > 464, 464 rounding to even 448) NaN or +-448 by the mode.
+    xc = xs.cpu()
+    want = xc.to(torch.float8_e4m3fn).view(torch.uint8)
+    beyond = ~xc.isnan() & (xc.float().abs() > 464)
+    sign = torch.where(torch.signbit(xc.float()), 0x80, 0).to(torch.uint8)
+    want = torch.where(beyond, sign | (0x7E if sat else 0x7F), want)
+    out = torch.empty(xs.shape, dtype=torch.float8_e4m3fn, device=dev)
+    ce.copy_(out, xs)
+    if dev == "cuda":
+        torch.cuda.synchronize()
+    got = out.view(torch.uint8).cpu()
+    nan = (want & 0x7F) == 0x7F
+    assert torch.equal(got[~nan], want[~nan]) and torch.equal((got[nan] & 0x7F), want[nan] & 0x7F), (wide, got, want)
+print("ok")
+"""
+
+
+@pytest.mark.parametrize("dev", DEVS)
+@pytest.mark.parametrize("sat", ["0", "1"])
+def test_e4m3_overflow_follows_torch_mode(dev, sat, tmp_path):
+    # torch 2.13 saturates float -> float8_e4m3fn beyond the format (+-448);
+    # earlier releases return NaN. Copies follow the installed torch, on the
+    # host and in the kernels; CE_F8E4M3_SATURATE forces either mode here.
+    import os, subprocess, sys
+    env = dict(os.environ, CE_F8E4M3_SATURATE=sat)
+    r = subprocess.run([sys.executable, "-c", _OVERFLOW_SCRIPT, dev, sat], env=env, capture_output=True, text=True,
+                       cwd=tmp_path, timeout=300)
+    assert r.returncode == 0 and "ok" in r.stdout, r.stdout + r.stderr
+
+
+def test_e4m3_overflow_mode_matches_installed_torch():
+    import os
+    if "CE_F8E4M3_SATURATE" in os.environ:
+        pytest.skip("mode forced")
+    sat = torch.tensor([1000.0]).to(torch.float8_e4m3fn).view(torch.uint8).item() == 0x7E
+    assert ce._core._f8e4m3_saturate() == sat

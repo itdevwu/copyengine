@@ -264,7 +264,10 @@ class CudaExecutor final : public Executor {
   std::vector<Strategy> candidates(const Group& g) override {
     const int di = device_of(g);
     Dev& s = state(di);
-    if (g.tiles) fail(Errc::unsupported, "quantization on the GPU is not built yet");
+    if (g.tiles) {  // quantization while copying: the tile kernel, all tensors on this GPU
+      if (!s.kernels) fail(Errc::unsupported, "quantization on the GPU needs the copy kernels: " + s.kernel_error);
+      return {Strategy::tile};
+    }
     if (g.opaque()) {  // indices read at run time: the statement kernel, or (host tables) DMA expanded per run
       std::vector<Strategy> c;
       if (g.pure() && host_tables_only(g)) c.push_back(Strategy::lowered);
@@ -336,6 +339,7 @@ class CudaExecutor final : public Executor {
       case Strategy::runs: return !g.opaque() && g.pure() && src_ok && dst_ok;  // plain DMA calls
       case Strategy::passthrough: return !g.opaque() && g.pure() && src_ok && dst_ok;
       case Strategy::kernel: return on_device && g.exec_cache[static_cast<int>(Strategy::kernel)] != nullptr;
+      case Strategy::tile: return on_device && g.exec_cache[static_cast<int>(Strategy::tile)] != nullptr;
       case Strategy::fused: {
         if (!on_device || !devs_[di].kernels) return false;
         if (g.opaque()) fused_plan(g);  // host-only planning: fine under capture
@@ -386,6 +390,7 @@ class CudaExecutor final : public Executor {
       case Strategy::fused: return fused(s, g, ops, st);
       case Strategy::paced: return paced(s, g, st);
       case Strategy::lowered: return lowered(s, g, ops, st);
+      case Strategy::tile: return tile(s, g, ops, st);
       default: fail(Errc::unsupported, "CUDA backend cannot run strategy " + std::string(strategy_name(strat)));
     }
   }
@@ -1264,6 +1269,27 @@ class CudaExecutor final : public Executor {
     return !g.forms.empty() && std::all_of(g.forms.begin(), g.forms.end(), [](const auto& f) {
              return (f->stab_dim < 0 || f->stab_host) && (f->dtab_dim < 0 || f->dtab_host) && f->host_tables();
            });
+  }
+
+  // Tile ops: their descriptors resident with the plan, one launch per group.
+  int64_t tile(Dev& s, const Group& g, const std::vector<Op>& ops, CUstream st) {
+    auto& slot = g.exec_cache[static_cast<int>(Strategy::tile)];
+    long long most = 0;
+    if (!slot) {
+      std::vector<cv::TileK> v;
+      for (int k : g.ops) v.push_back(*ops[k].tile);
+      slot = resident(s, v);
+    }
+    for (int k : g.ops) most = std::max(most, ops[k].tile->units());
+    const auto& t = *static_cast<DevTable*>(slot.get());
+    CUfunction f = function(s, "ce_tile");
+    CUdeviceptr table = t.ptr;
+    int count = static_cast<int>(t.count);
+    void* args[] = {&table, &count};
+    const unsigned gx = static_cast<unsigned>(std::min<long long>((most + 7) / 8, 1 << 20));
+    const unsigned gy = static_cast<unsigned>(std::min<long long>(count, 65535));
+    run_kernel(s, f, {std::max(1u, gx), gy, 1}, {256, 1, 1}, args, st, "ce_tile");
+    return 1;
   }
 
   // Host index tables expanded into copy descriptors now (DMA; pure copies).

@@ -101,7 +101,7 @@ if(CE_WITH_CUDA)
       # older drivers fail kernel admission with a clear reason.
       COMMAND ${CE_NVCC} --fatbin -std=c++17 -O3 --fmad=false --compress-mode=size ${_gencode}
               -I${CMAKE_CURRENT_SOURCE_DIR}/src -o ${_fatbin} ${CMAKE_CURRENT_SOURCE_DIR}/src/backends/cuda/kernels.cu
-      DEPENDS src/backends/cuda/kernels.cu src/core/convert.hpp
+      DEPENDS src/backends/cuda/kernels.cu src/core/convert.hpp src/core/quant.hpp src/core/tile.hpp
       COMMENT "Compiling copy kernels (${CE_CUDA_ARCHS})"
       VERBATIM)
     add_custom_command(

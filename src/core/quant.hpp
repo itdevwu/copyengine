@@ -28,6 +28,24 @@ CE_HD float qmax_of(QFmt f) {
 }
 
 CE_HD bool is_nan(float x) { return x != x; }
+
+// IEEE float32 product and quotient, round to nearest: on the GPU through
+// the _rn intrinsics, which the compiler may not reassociate (it otherwise
+// turns a * (1 / b) into a / b, a different rounding).
+CE_HD float mul_rn(float a, float b) {
+#if defined(__CUDA_ARCH__)
+  return __fmul_rn(a, b);
+#else
+  return a * b;
+#endif
+}
+CE_HD float div_rn(float a, float b) {
+#if defined(__CUDA_ARCH__)
+  return __fdiv_rn(a, b);
+#else
+  return a / b;
+#endif
+}
 CE_HD float abs_f(float x) { return u2f(f2u(x) & 0x7FFFFFFFu); }
 // torch.amax: NaN wins.
 CE_HD float amax_step(float m, float v) { return is_nan(m) ? m : is_nan(v) ? v : (v > m ? v : m); }
@@ -98,12 +116,14 @@ CE_HD UnitQ unit_params(QFmt f, float amax, float lo, float hi, float eps, float
   UnitQ u;
   auto floor_eps = [&](float v) { return is_nan(v) ? v : (v < eps ? eps : v); };
   switch (f) {
+    // Constants divide as products with their float32 reciprocal: what torch
+    // computes for tensor / scalar on the GPU, and the same on every device.
     case QFmt::fp8_e4m3: case QFmt::fp8_e5m2: case QFmt::int8: case QFmt::int4:
-      u.scale = u.div = floor_eps(amax) / qmax_of(f);
+      u.scale = u.div = mul_rn(floor_eps(amax), div_rn(1.0f, qmax_of(f)));
       return u;
     case QFmt::uint4: {
-      u.scale = u.div = floor_eps(hi - lo) / 15.0f;
-      const float zf = clamp_f(rintf(-lo / u.div), 0.0f, 15.0f);
+      u.scale = u.div = mul_rn(floor_eps(hi - lo), div_rn(1.0f, 15.0f));
+      const float zf = clamp_f(rintf(div_rn(-lo, u.div)), 0.0f, 15.0f);
       u.bits = is_nan(zf) ? 0 : static_cast<uint8_t>(zf);
       return u;
     }
@@ -128,12 +148,12 @@ CE_HD UnitQ unit_params(QFmt f, float amax, float lo, float hi, float eps, float
       return u;
     }
     case QFmt::nvfp4: {
-      float sv = amax / 6.0f / gs;  // .clamp(max=448)
+      float sv = mul_rn(mul_rn(amax, div_rn(1.0f, 6.0f)), div_rn(1.0f, gs));  // .clamp(max=448)
       if (!is_nan(sv) && sv > 448.0f) sv = 448.0f;
       u.bits = float_to_f8e4m3(sv);
       const float sf = f8e4m3_to_float(u.bits);
       u.zero_all = sf == 0.0f;
-      u.div = sf * gs;
+      u.div = mul_rn(sf, gs);
       return u;
     }
   }
@@ -144,17 +164,17 @@ CE_HD UnitQ unit_params(QFmt f, float amax, float lo, float hi, float eps, float
 CE_HD uint8_t quant_elem(QFmt f, float x, const UnitQ& u) {
   switch (f) {
     case QFmt::int4: {
-      const float v = x / u.div;
+      const float v = div_rn(x, u.div);
       return is_nan(v) ? 0 : static_cast<uint8_t>(static_cast<int>(clamp_f(rintf(v), -8.0f, 7.0f)) & 0xF);
     }
     case QFmt::uint4: {
-      const float v = rintf(x / u.div) + static_cast<float>(u.bits);
+      const float v = rintf(div_rn(x, u.div)) + static_cast<float>(u.bits);
       return is_nan(v) ? 0 : static_cast<uint8_t>(clamp_f(v, 0.0f, 15.0f));
     }
     case QFmt::nvfp4:
-      return u.zero_all ? 0 : float_to_e2m1(clamp_f(x / u.div, -6.0f, 6.0f));
+      return u.zero_all ? 0 : float_to_e2m1(clamp_f(div_rn(x, u.div), -6.0f, 6.0f));
     default:
-      return quant_scaled(x / u.div, f);
+      return quant_scaled(div_rn(x, u.div), f);
   }
 }
 
@@ -186,7 +206,7 @@ CE_HD void quantize_unit(In x, long long xs, int g, QFmt f, float eps, float gs,
 // The scale of one unit as a float32 factor (dequantization multiplies by it).
 CE_HD float unit_scale(QFmt f, float scale, uint8_t scale_bits, float gs) {
   if (qfmt_mx(f)) return f8e8m0_to_float(scale_bits);
-  if (f == QFmt::nvfp4) return f8e4m3_to_float(scale_bits) * gs;
+  if (f == QFmt::nvfp4) return mul_rn(f8e4m3_to_float(scale_bits), gs);
   return scale;
 }
 
@@ -196,11 +216,11 @@ CE_HD float dequantize_at(const uint8_t* q, long long qs, int i, QFmt f, float f
   if (qfmt_packed(f)) {
     const uint8_t b = q[(i / 2) * qs];
     const uint8_t n = (i & 1) ? static_cast<uint8_t>(b >> 4) : static_cast<uint8_t>(b & 0xFu);
-    if (f == QFmt::nvfp4) return e2m1_to_float(n) * factor;
-    if (f == QFmt::int4) return static_cast<float>(static_cast<int>(n) - ((n & 8u) ? 16 : 0)) * factor;
-    return (static_cast<float>(n) - static_cast<float>(zero)) * factor;  // uint4
+    if (f == QFmt::nvfp4) return mul_rn(e2m1_to_float(n), factor);
+    if (f == QFmt::int4) return mul_rn(static_cast<float>(static_cast<int>(n) - ((n & 8u) ? 16 : 0)), factor);
+    return mul_rn(static_cast<float>(n) - static_cast<float>(zero), factor);  // uint4
   }
-  return dequant_scaled(q[i * qs], f) * factor;
+  return mul_rn(dequant_scaled(q[i * qs], f), factor);
 }
 
 }  // namespace ce::cv

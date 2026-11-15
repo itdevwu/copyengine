@@ -60,8 +60,6 @@ def check(fmt, g, x, q, scale, zero, gs=1.0):
 @pytest.mark.parametrize("fmt,g", FORMATS)
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_quantize(dev, fmt, g, dtype):
-    if dev == "cuda":
-        pytest.skip("the GPU tile kernel comes next")
     lead, D = (3, 5), 4 * g
     x = data(lead, D, dtype, dev)
     gs = 0.02 if fmt == "nvfp4" else 1.0
@@ -109,3 +107,25 @@ def test_bad_shapes_are_rejected():
         ce.quantize(x, q, s, fmt="fp8_e4m3", group=128)
     with pytest.raises(ValueError):
         ce.quantize(torch.randn(4, 64), *outputs("mxfp8_e4m3", (4,), 64, 32, "cpu")[:2], fmt="mxfp8_e4m3", group=16)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("fmt,g", FORMATS + [("fp8_e4m3", 4096), ("uint4", 1024)])  # long units: many values per lane
+def test_gpu_strided_and_dequantize(fmt, g):
+    D = 2 * g
+    x = data((6, 4), D, torch.float16, "cuda").transpose(0, 1)
+    gs = 0.02 if fmt == "nvfp4" else 1.0
+    e = ce.Engine(prior_only=True)
+    q, scale, zero = outputs(fmt, (4, 6), D, g, "cuda")
+    e.quantize(x, q, scale, zero, fmt=fmt, group=g, global_scale=gs)
+    assert e.stats()["last"]["strategies"] == ["tile"]
+    torch.cuda.synchronize()
+    check(fmt, g, x, q, scale, zero, gs)
+    out = torch.empty(4, 6, D, dtype=torch.float32, device="cuda")
+    e.dequantize(q, scale, out, zero, fmt=fmt, group=g, global_scale=gs)
+    torch.cuda.synchronize()
+    codes, s, bits = _quant.quantize(x.cpu(), g, fmt, gs=gs)
+    want = _quant.dequantize(codes, s, bits, g, fmt, gs).view(out.shape)
+    got = out.cpu()
+    nan = got.isnan()
+    assert torch.equal(nan, want.isnan()) and torch.equal(got[~nan], want[~nan])

@@ -9,6 +9,7 @@
 // Build with --fmad=false: conversions must match the host backend bit for bit.
 
 #include "core/convert.hpp"
+#include "core/tile.hpp"
 
 namespace {
 
@@ -491,4 +492,74 @@ extern "C" __global__ void ce_smid(unsigned* out, long long spin) {
   unsigned id;
   asm volatile("mov.u32 %0, %%smid;" : "=r"(id));
   out[blockIdx.x] = id;
+}
+
+
+namespace cv = ce::cv;
+
+// ---- tile ops: quantization while copying (docs/design/v0.4.md) ----------------------
+
+namespace {
+
+__device__ __forceinline__ float warp_amax(float v) {
+  for (int o = 16; o; o >>= 1) v = cv::amax_step(v, __shfl_xor_sync(0xFFFFFFFFu, v, o));
+  return v;
+}
+__device__ __forceinline__ float warp_amin(float v) {
+  for (int o = 16; o; o >>= 1) v = cv::amin_step(v, __shfl_xor_sync(0xFFFFFFFFu, v, o));
+  return v;
+}
+
+// One unit on one warp: the same unit functions as the host path (the
+// reductions are exact and NaN-propagating, so their order does not matter).
+__device__ void tile_unit_warp(const cv::TileK& t, long long u, int lane) {
+  using cv::QFmt;
+  const QFmt f = static_cast<QFmt>(t.fmt);
+  const cv::UnitAt a = cv::unit_at(t, u);
+  auto xv = [&](int k) { return cv::val_float(cv::load(cv::addr(cv::x_at(t, a, k)), t.xdt)); };
+  if (t.quantize) {
+    float amax = 0.0f, lo = 0.0f, hi = 0.0f;
+    const bool range = cv::qfmt_needs_range(f);
+    for (int k = lane; k < t.g; k += 32) {
+      const float v = xv(k);
+      amax = cv::amax_step(amax, cv::abs_f(v));
+      if (range) lo = cv::amin_step(lo, v), hi = cv::amax_step(hi, v);
+    }
+    amax = warp_amax(amax);
+    if (range) lo = warp_amin(lo), hi = warp_amax(hi);
+    const cv::UnitQ p = cv::unit_params(f, amax, lo, hi, t.eps, t.gs);
+    if (lane == 0) {
+      if (t.scale_byte) cv::wr<uint8_t>(cv::addr(a.s), p.bits);
+      else cv::wr<float>(cv::addr(a.s), p.scale);
+      if (f == QFmt::uint4) cv::wr<uint8_t>(cv::addr(a.z), p.bits);
+    }
+    if (cv::qfmt_packed(f)) {
+      for (int i = lane; i < t.g / 2; i += 32)
+        cv::wr<uint8_t>(cv::addr(cv::q_at(t, a, 2 * i)),
+                        static_cast<uint8_t>(cv::quant_elem(f, xv(2 * i), p) | (cv::quant_elem(f, xv(2 * i + 1), p) << 4)));
+    } else {
+      for (int k = lane; k < t.g; k += 32) cv::wr<uint8_t>(cv::addr(cv::q_at(t, a, k)), cv::quant_elem(f, xv(k), p));
+    }
+    return;
+  }
+  const float s = t.scale_byte ? 0.0f : cv::rd<float>(cv::addr(a.s));
+  const uint8_t bits = t.scale_byte ? cv::rd<uint8_t>(cv::addr(a.s)) : (f == QFmt::uint4 ? cv::rd<uint8_t>(cv::addr(a.z)) : 0);
+  const float factor = cv::unit_scale(f, s, bits, t.gs);
+  const uint8_t* q0 = static_cast<const uint8_t*>(cv::addr(cv::q_at(t, a, 0)));
+  for (int k = lane; k < t.g; k += 32)
+    cv::store_float(cv::addr(cv::x_at(t, a, k)), t.xdt, cv::dequantize_at(q0, t.qe, k, f, factor, bits));
+}
+
+}  // namespace
+
+// Grid: x over units (8 warps per block, grid-stride), y over the group's ops.
+extern "C" __global__ void ce_tile(const cv::TileK* __restrict__ tiles, int count) {
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, wpb = blockDim.x >> 5;
+  for (int op = blockIdx.y; op < count; op += gridDim.y) {
+    const cv::TileK t = tiles[op];
+    const long long units = t.units();
+    for (long long u = static_cast<long long>(blockIdx.x) * wpb + warp; u < units;
+         u += static_cast<long long>(gridDim.x) * wpb)
+      tile_unit_warp(t, u, lane);
+  }
 }

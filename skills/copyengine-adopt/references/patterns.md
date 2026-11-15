@@ -1,4 +1,4 @@
-# Integration patterns (copyengine 0.3.x)
+# Integration patterns (copyengine 0.4.x)
 
 Each pattern shows the original, the adopted code, and how to check it.
 

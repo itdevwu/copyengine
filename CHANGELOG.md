@@ -4,7 +4,7 @@ copyengine follows [semantic versioning](https://semver.org). From 0.1.0 on,
 the Python API, the C ABI (`CE_ABI_VERSION`) and the tuning profile format
 change incompatibly only in a new minor (0.x) or major release.
 
-## Unreleased
+## 0.4.0
 
 - `bulk` copies through shared memory for pure copies on one GPU: TMA bulk
   copies on sm90 and later, `cp.async` on sm80 to sm89, admitted by a test

@@ -6,7 +6,7 @@ description: Diagnose copyengine in a PyTorch program - why copies did not get f
 # Diagnose copyengine
 
 Diagnose from copyengine's own evidence before changing code. This Skill
-supports copyengine `0.3.x`; check `copyengine.__version__` first.
+supports copyengine `0.4.x`; check `copyengine.__version__` first.
 
 ## First look
 

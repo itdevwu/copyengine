@@ -295,6 +295,61 @@ def test_many_layers_across_gpu_and_pinned_host_in_one_scope(fmt, g):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("fmt,g", [("fp8_e4m3", 128), ("nvfp4", 16), ("uint4", 64)])
+@pytest.mark.parametrize("gpu_pages", [False, True])
+def test_paged_offload_through_device_staging(fmt, g, gpu_pages):
+    # Pages of a GPU KV cache (x_index: GPU or host ids) quantized into the
+    # slots of a pinned host pool (index: host ids), and loaded back: device
+    # staging gathers / scatters the pool's rows by DMA.
+    blocks, slots_n, n, D = 32, 48, 8, 2 * g
+    gs = 0.02 if fmt == "nvfp4" else 1.0
+    kv = data((blocks, 4), D, torch.bfloat16, "cuda", seed=11)
+    q, scale, zero = (None if t is None else t.pin_memory() for t in outputs(fmt, (slots_n, 4), D, g, "cpu"))
+    seen = set()
+    e = ce.Engine(tune_trials=1, tune_topk=4)
+    for k in range(10):
+        pages, slots = torch.randperm(blocks)[:n], torch.randperm(slots_n)[:n]
+        xi = pages.cuda() if gpu_pages else pages.tolist()
+        e.quantize(kv, q, scale, zero, fmt=fmt, group=g, global_scale=gs, x_index=xi, index=slots.numpy())
+        e.synchronize()
+        seen.update(e.stats()["last"]["strategies"])
+        check(fmt, g, kv[pages], rows(q, slots), rows(scale, slots), None if zero is None else zero[slots], gs)
+        back = torch.full((blocks, 4, D), 7.0, device="cuda")
+        e.dequantize(q, scale, back, zero, fmt=fmt, group=g, global_scale=gs, x_index=xi, index=slots.tolist())
+        torch.cuda.synchronize()
+        seen.update(e.stats()["last"]["strategies"])
+        codes, s, bits = _quant.quantize(kv[pages].cpu(), g, fmt, gs=gs)
+        want = torch.full((blocks, 4, D), 7.0)
+        want[pages] = _quant.dequantize(codes, s, bits, g, fmt, gs).view(n, 4, D)
+        got = back.cpu()
+        nan = got.isnan()
+        assert torch.equal(nan, want.isnan()) and torch.equal(got[~nan], want[~nan])
+    assert "tile_staged" in seen
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_staging_leaves_other_host_rows_alone():
+    # Quantizing into some slots of a pinned pool through staging writes
+    # those slots only.
+    g, n = 128, 4
+    kv = data((n, 4), 256, torch.float32, "cuda", seed=12)
+    q, scale = (t.pin_memory() for t in outputs("fp8_e4m3", (16, 4), 256, g, "cpu")[:2])
+    e = ce.Engine(tune_trials=1, tune_topk=4)
+    slots = [3, 9, 0, 14]
+    seen = set()
+    for _ in range(8):
+        q.view(torch.uint8).fill_(0xAB)
+        scale.fill_(-1.0)
+        e.quantize(kv, q, scale, fmt="fp8_e4m3", group=g, index=slots)
+        e.synchronize()
+        seen.update(e.stats()["last"]["strategies"])
+        others = [i for i in range(16) if i not in slots]
+        assert bool((q.view(torch.uint8)[others] == 0xAB).all()) and bool((scale[others] == -1.0).all())
+        check("fp8_e4m3", g, kv, rows(q, torch.tensor(slots)), scale[slots], None)
+    assert "tile_staged" in seen
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_step_plan_quantizes_with_new_gpu_indices():
     blocks, D, g = 32, 256, 128
     kv = data((blocks, 4), D, torch.float32, "cuda", seed=3)

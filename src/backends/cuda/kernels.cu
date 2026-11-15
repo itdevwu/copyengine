@@ -122,25 +122,25 @@ __device__ __forceinline__ void bytes_one(Chunk c, int lane) {
 // ---- bulk copies through shared memory (sm80+: cp.async, sm90+: TMA) ------------------
 //
 // One warp per block per chunk; a chunk's rows are cut into segments of at
-// most kSeg bytes, moved global -> shared -> global through two buffers so the
-// next segment loads while the current one stores. On sm90+ one thread drives
+// most `seg` bytes (a launch parameter: the executor sizes it so that enough
+// blocks fit on an SM), moved global -> shared -> global through kBufs
+// buffers so later segments load while earlier ones store. On sm90+ one thread drives
 // it with TMA bulk copies (cp.async.bulk + mbarrier): few threads keep many
 // bytes in flight, which matters where copy kernels get few SMs (max_sms). On
 // sm80-89 the warp uses cp.async. Chunks not 16-byte aligned (address, width,
 // pitches) take the plain warp copy. Other architectures: the plain copy (the
 // executor only offers this kernel where it was admitted).
 
-constexpr int kSeg = 8192;   // bytes per segment
-constexpr int kBufs = 4;     // segments in flight per block
+constexpr int kBufs = 4;  // segments in flight per block
 
 struct Segs {  // the segments of one chunk
   const Chunk& c;
-  long long per_row;
+  long long seg, per_row;
   __device__ long long count() const { return c.rows * per_row; }
   __device__ void at(long long i, long long* s, long long* d, unsigned* n) const {
-    const long long r = i / per_row, o = (i - r * per_row) * kSeg;
+    const long long r = i / per_row, o = (i - r * per_row) * seg;
     *s = c.src + r * c.spitch + o, *d = c.dst + r * c.dpitch + o;
-    *n = static_cast<unsigned>(min(static_cast<long long>(kSeg), c.width - o));
+    *n = static_cast<unsigned>(min(seg, c.width - o));
   }
 };
 
@@ -185,8 +185,9 @@ __device__ __forceinline__ void async16(void* sm, long long g) {
 #endif
 
 extern "C" __global__ void __launch_bounds__(32) ce_bytes_bulk(const Chunk* __restrict__ chunks, int n,
-                                                               long long sadd, long long dadd) {
-  __shared__ alignas(128) unsigned char buf[kBufs][kSeg];
+                                                               long long sadd, long long dadd, int seg) {
+  extern __shared__ __align__(128) unsigned char smem[];  // kBufs * seg bytes
+  const auto buf = [&](long long i) { return smem + (i % kBufs) * seg; };
   const int lane = threadIdx.x & 31;
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
   __shared__ alignas(8) unsigned long long bar[kBufs];
@@ -204,10 +205,12 @@ extern "C" __global__ void __launch_bounds__(32) ce_bytes_bulk(const Chunk* __re
       bytes_one<false>(c, lane);
       continue;
     }
-    const Segs sg{c, (c.width + kSeg - 1) / kSeg};
+    const Segs sg{c, seg, (c.width + seg - 1) / seg};
     const long long count = sg.count();
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-    // Up to kBufs loads in flight; a buffer is reloaded once its store has read it.
+    // Loads run kBufs - 1 segments ahead. The buffer reloaded at step i is
+    // the one stored at step i - 1: waiting until at most one store (step
+    // i's) is still reading shared memory keeps a store in flight.
     if (lane == 0) {
       auto load = [&](long long i) {
         long long s, d;
@@ -215,9 +218,9 @@ extern "C" __global__ void __launch_bounds__(32) ce_bytes_bulk(const Chunk* __re
         sg.at(i, &s, &d, &len);
         const int b = static_cast<int>(i % kBufs);
         mbar_expect(&bar[b], len);
-        tma_load(buf[b], s, len, &bar[b]);
+        tma_load(buf(i), s, len, &bar[b]);
       };
-      for (long long i = 0; i < count && i < kBufs; ++i) load(i);
+      for (long long i = 0; i < count && i < kBufs - 1; ++i) load(i);
       for (long long i = 0; i < count; ++i) {
         const int b = static_cast<int>(i % kBufs);
         mbar_wait(&bar[b], phase[b]);
@@ -225,10 +228,10 @@ extern "C" __global__ void __launch_bounds__(32) ce_bytes_bulk(const Chunk* __re
         long long s, d;
         unsigned len;
         sg.at(i, &s, &d, &len);
-        tma_store(d, buf[b], len);
-        if (i + kBufs < count) {
-          asm volatile("cp.async.bulk.wait_group.read 0;" ::: "memory");  // buffer b read by its store
-          load(i + kBufs);
+        tma_store(d, buf(i), len);
+        if (i + kBufs - 1 < count) {
+          asm volatile("cp.async.bulk.wait_group.read 1;" ::: "memory");  // step i - 1's store has read its buffer
+          load(i + kBufs - 1);
         }
       }
       asm volatile("cp.async.bulk.wait_group.read 0;" ::: "memory");  // buffers free for the next chunk
@@ -239,7 +242,7 @@ extern "C" __global__ void __launch_bounds__(32) ce_bytes_bulk(const Chunk* __re
       long long s, d;
       unsigned len;
       sg.at(i, &s, &d, &len);
-      unsigned char* b = buf[i % kBufs];
+      unsigned char* b = buf(i);
       for (unsigned o = lane * 16u; o < len; o += 512u) async16(b + o, s + o);
     };
     for (long long i = 0; i < kBufs - 1; ++i) {  // kBufs - 1 segments ahead (empty groups past the end)
@@ -254,7 +257,7 @@ extern "C" __global__ void __launch_bounds__(32) ce_bytes_bulk(const Chunk* __re
       long long s, d;
       unsigned len;
       sg.at(i, &s, &d, &len);
-      const unsigned char* b = buf[i % kBufs];
+      const unsigned char* b = buf(i);
       for (unsigned o = lane * 16u; o < len; o += 512u)
         *reinterpret_cast<uint4*>(static_cast<uintptr_t>(d + o)) = *reinterpret_cast<const uint4*>(b + o);
       __syncwarp();
@@ -268,6 +271,7 @@ extern "C" __global__ void __launch_bounds__(32) ce_bytes_bulk(const Chunk* __re
   if (lane == 0) asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");  // stores done before exit
 #endif
   (void)buf;
+  (void)smem;
 }
 
 extern "C" __global__ void ce_bytes(const Chunk* __restrict__ chunks, int n, long long sadd, long long dadd) {

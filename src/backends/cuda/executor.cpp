@@ -569,6 +569,7 @@ class CudaExecutor final : public Executor {
     // Bulk copies through shared memory: "tma" (sm90+), "cp.async" (sm80-89),
     // admitted by a verified test copy; empty: not available (bulk_error says why).
     std::string bulk, bulk_error;
+    int bulk_seg = 8192;  // bytes per segment: kBulkBufs of them per block (shared memory)
     std::unordered_map<std::string, CUfunction> fns;
     CUstream side{};
     CUevent ev_in{}, ev_out{};
@@ -791,6 +792,15 @@ class CudaExecutor final : public Executor {
       return;
     }
     const std::string kind = major >= 9 ? "tma" : "cp.async";
+    // Segments small enough that kBulkBlocksPerSm blocks fit in an SM's
+    // shared memory: under max_sms, the bytes in flight come from the blocks
+    // that fit on the few SMs.
+    int smem = 0;
+    check(d_->cuDeviceGetAttribute(&smem, CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR, s.dev),
+          "cuDeviceGetAttribute");
+    s.bulk_seg = 8192;
+    while (s.bulk_seg > 1024 && (s.bulk_seg * kBulkBufs + 1024) * kBulkBlocksPerSm > smem) s.bulk_seg /= 2;
+    if (const char* e = std::getenv("CE_BULK_SEG")) s.bulk_seg = std::atoi(e);  // diagnostics: sweep on new hardware
     try {  // rows of several segments, 16-byte aligned, with pitches: verified byte for byte
       const size_t rows = 5, width = 3 * 16384 + 4096, spitch = width + 256, dpitch = width + 512;
       const size_t sbytes = rows * spitch, dbytes = rows * dpitch;
@@ -809,8 +819,10 @@ class CudaExecutor final : public Executor {
       CUdeviceptr t = sl.dev.ptr;
       int n = 1;
       long long zero = 0;
-      void* args[] = {&t, &n, &zero, &zero};
-      check(d_->cuLaunchKernel(f, 1, 1, 1, 32, 1, 1, 0, s.side, args, nullptr), "cuLaunchKernel ce_bytes_bulk");
+      int seg = s.bulk_seg;
+      void* args[] = {&t, &n, &zero, &zero, &seg};
+      check(d_->cuLaunchKernel(f, 1, 1, 1, 32, 1, 1, kBulkBufs * seg, s.side, args, nullptr),
+            "cuLaunchKernel ce_bytes_bulk");
       check(d_->cuEventRecord(sl.done, s.side), "cuEventRecord");
       sl.used = true;
       check(d_->cuMemcpyDtoHAsync(out.data(), b, dbytes, s.side), "cuMemcpyDtoHAsync");
@@ -1113,7 +1125,7 @@ class CudaExecutor final : public Executor {
   // never waits), or with the grid capped to that many blocks. All kernels
   // stride over their work, so any grid is correct.
   void run_kernel(Dev& s, CUfunction f, std::array<unsigned, 3> grid, std::array<unsigned, 3> block, void** args,
-                  CUstream st, const char* what) {
+                  CUstream st, const char* what, unsigned smem = 0) {
     CUstream on = st;
     Lane* lane = s.sm_stream ? &lane_for(s, st) : nullptr;
     if (lane) {
@@ -1126,7 +1138,7 @@ class CudaExecutor final : public Executor {
       grid[1] = std::min(grid[1], std::max(1u, cap / grid[2]));
       grid[0] = std::min(grid[0], std::max(1u, cap / (grid[1] * grid[2])));
     }
-    check(d_->cuLaunchKernel(f, grid[0], grid[1], grid[2], block[0], block[1], block[2], 0, on, args, nullptr),
+    check(d_->cuLaunchKernel(f, grid[0], grid[1], grid[2], block[0], block[1], block[2], smem, on, args, nullptr),
           (std::string("cuLaunchKernel ") + what).c_str());
     if (lane) {
       check(d_->cuEventRecord(lane->out, lane->sm), "cuEventRecord");
@@ -1359,6 +1371,8 @@ class CudaExecutor final : public Executor {
   // Pure device copies through shared memory: the chunk table of `kernel`,
   // one warp per block (the shared buffers are per block).
   static constexpr int64_t kBulkMinBytes = 1 << 20;
+  static constexpr int kBulkBufs = 4;          // kernels.cu: kBufs
+  static constexpr int kBulkBlocksPerSm = 4;
   int64_t bulk(Dev& s, const Group& g, CUstream st) {
     auto& slot = g.exec_cache[static_cast<int>(Strategy::bulk)];
     if (!slot) slot = resident(s, chunks_of(g));
@@ -1368,9 +1382,10 @@ class CudaExecutor final : public Executor {
     CUdeviceptr table = t.ptr;
     int n = static_cast<int>(t.count);
     long long zero = 0;
-    void* args[] = {&table, &n, &zero, &zero};
+    int seg = s.bulk_seg;
+    void* args[] = {&table, &n, &zero, &zero, &seg};
     run_kernel(s, f, {static_cast<unsigned>(std::min<size_t>(t.count, 1 << 16)), 1, 1}, {32, 1, 1}, args, st,
-               "ce_bytes_bulk");
+               "ce_bytes_bulk", static_cast<unsigned>(kBulkBufs * seg));
     return 1;
   }
 
@@ -1391,32 +1406,40 @@ class CudaExecutor final : public Executor {
       table = static_cast<DevTable*>(x.table.get())->ptr;
     } else {
       std::vector<unsigned long long> vals;  // host index values first, then the TileKs
+      std::vector<std::pair<size_t, size_t>> at;
+      host_index_values(g, ops, vals, at);
       std::vector<cv::TileK> v;
-      std::vector<std::pair<size_t, size_t>> at;  // per op: offsets of its x / c host tables in vals (npos: none)
-      constexpr size_t kNone = ~size_t{0};
-      for (int k : g.ops) {
-        const Op& op = ops[k];
-        std::pair<size_t, size_t> o{kNone, kNone};
-        for (int w = 0; w < 2; ++w)
-          if (op.tile_index[w]) {
-            (w ? o.second : o.first) = vals.size();
-            for (int64_t i : *op.tile_index[w]) vals.push_back(static_cast<unsigned long long>(i));
-          } else if (op.tile_host_ptr[w]) {  // a plan's parameter buffer: this call's values, checked now
-            (w ? o.second : o.first) = vals.size();
-            const auto* p = reinterpret_cast<const int64_t*>(static_cast<uintptr_t>(w ? op.tile->ci : op.tile->xi));
-            const long long bound = w ? op.tile->cb : op.tile->xb;
-            for (long long r = 0; r < op.tile->rows[0]; ++r) {
-              if (p[r] < 0 || p[r] >= bound) fail(Errc::invalid_argument, "index out of range");
-              vals.push_back(static_cast<unsigned long long>(p[r]));
-            }
-          }
-        at.push_back(o);
-        v.push_back(*op.tile);
-      }
+      for (int k : g.ops) v.push_back(*ops[k].tile);
       table = upload_tiles(s, x, std::move(vals), v, &at, st);
     }
     launch_tiles(s, g, ops, table, st);
     return 1;
+  }
+
+  // The host index values of a group's ops (this call's, for a plan's
+  // parameter buffers, checked now), appended to `vals`; `at` gets each op's
+  // x / c offsets in it (kNoIndex: none, or a GPU table).
+  static constexpr size_t kNoIndex = ~size_t{0};
+  static void host_index_values(const Group& g, const std::vector<Op>& ops, std::vector<unsigned long long>& vals,
+                                std::vector<std::pair<size_t, size_t>>& at) {
+    for (int k : g.ops) {
+      const Op& op = ops[k];
+      std::pair<size_t, size_t> o{kNoIndex, kNoIndex};
+      for (int w = 0; w < 2; ++w)
+        if (op.tile_index[w]) {
+          (w ? o.second : o.first) = vals.size();
+          for (int64_t i : *op.tile_index[w]) vals.push_back(static_cast<unsigned long long>(i));
+        } else if (op.tile_host_ptr[w]) {
+          (w ? o.second : o.first) = vals.size();
+          const auto* p = reinterpret_cast<const int64_t*>(static_cast<uintptr_t>(w ? op.tile->ci : op.tile->xi));
+          const long long bound = w ? op.tile->cb : op.tile->xb;
+          for (long long r = 0; r < op.tile->rows[0]; ++r) {
+            if (p[r] < 0 || p[r] >= bound) fail(Errc::invalid_argument, "index out of range");
+            vals.push_back(static_cast<unsigned long long>(p[r]));
+          }
+        }
+      at.push_back(o);
+    }
   }
 
   // This call's TileKs (after `vals`, host index values they point into:
@@ -1424,7 +1447,7 @@ class CudaExecutor final : public Executor {
   // the group's mirror for this stream; returns the TileK table's address.
   CUdeviceptr upload_tiles(Dev& s, TileExec& x, std::vector<unsigned long long> vals, std::vector<cv::TileK>& v,
                            const std::vector<std::pair<size_t, size_t>>* at, CUstream st) {
-    constexpr size_t kNone = ~size_t{0};
+    constexpr size_t kNone = kNoIndex;
     {
       const size_t tk_words = sizeof(cv::TileK) / 8, words = vals.size() + v.size() * tk_words;
       TileExec::Mirror* m = nullptr;
@@ -1473,18 +1496,25 @@ class CudaExecutor final : public Executor {
   }
 
   // ---- tile ops with host sides: through device staging ----------------------------------
+  //
+  // Host sides are staged in device memory: inputs copied in before the
+  // kernel, outputs copied back after it. A side whose rows a host index
+  // table selects is staged as compact rows (one batched DMA per side and
+  // direction), and the staged TileK drops that index; GPU sides keep theirs.
 
   struct TileSide {
-    long long* field;  // the TileK base it rewrites
+    long long cv::TileK::*field;     // the base it rewrites
+    long long (cv::TileK::*rs)[3];  // its row strides
+    int idx;                         // the index selecting its rows: 0 xi, 1 ci, -1 none
     bool host, input;
-    long long lo, hi, need;  // byte extent, and bytes it holds
+    long long lo, hi;  // byte extent: of the side, or of its row 0 when indexed
   };
 
   // A TileK's four tensors: extent, whether on the host, whether the kernel reads them.
-  static std::vector<TileSide> tile_sides(cv::TileK& t, const Op& op) {
-    auto ext = [&](long long base, const long long r[3], long long count, long long step, long long width) {
+  static std::vector<TileSide> tile_sides(const cv::TileK& t, const Op& op) {
+    auto ext = [&](long long base, const long long r[3], long long count, long long step, long long width, bool ix) {
       long long lo = base, hi = base;
-      for (int k = 0; k < 3; ++k) {
+      for (int k = ix ? 1 : 0; k < 3; ++k) {
         const long long span = (t.rows[k] - 1) * r[k];
         lo += std::min(0LL, span), hi += std::max(0LL, span);
       }
@@ -1493,21 +1523,26 @@ class CudaExecutor final : public Executor {
       return std::pair<long long, long long>{lo, hi + width};
     };
     const bool packed = cv::qfmt_packed(static_cast<cv::QFmt>(t.fmt));
-    const long long rows = t.rows[0] * t.rows[1] * t.rows[2], vals = static_cast<long long>(t.g) * t.upr;
+    const long long vals = static_cast<long long>(t.g) * t.upr;
     const long long xw = static_cast<long long>(cv::dt_size(t.xdt)), sw = t.scale_byte ? 1 : 4;
     const Side& xs = t.quantize ? op.src : op.dst;
     const Side& qs = t.quantize ? op.dst : op.src;
     const bool writes_scale = t.quantize && !t.static_scale;
+    const int xi = t.xi ? 0 : -1, ci = t.ci ? 1 : -1;
     std::vector<TileSide> v;
-    auto add = [&](long long* f, bool host, bool input, std::pair<long long, long long> e, long long need) {
-      v.push_back({f, host, input, e.first, e.second, need});
+    auto add = [&](long long cv::TileK::*f, long long (cv::TileK::*rs)[3], int idx, bool host, bool input,
+                   long long count, long long step, long long width) {
+      const auto e = ext(t.*f, t.*rs, count, step, width, idx >= 0);
+      v.push_back({f, rs, idx, host, input, e.first, e.second});
     };
-    add(&t.x, xs.device.kind == DeviceKind::host, t.quantize != 0, ext(t.x, t.xr, vals, t.xe, xw), rows * vals * xw);
-    const long long qn = packed ? vals / 2 : vals;
-    add(&t.q, qs.device.kind == DeviceKind::host, !t.quantize, ext(t.q, t.qr, qn, t.qe, 1), rows * qn);
-    add(&t.s, op.extras[0].device.kind == DeviceKind::host, !writes_scale, ext(t.s, t.sr, t.upr, t.se, sw), rows * t.upr * sw);
+    add(&cv::TileK::x, &cv::TileK::xr, xi, xs.device.kind == DeviceKind::host, t.quantize != 0, vals, t.xe, xw);
+    add(&cv::TileK::q, &cv::TileK::qr, ci, qs.device.kind == DeviceKind::host, !t.quantize, packed ? vals / 2 : vals,
+        t.qe, 1);
+    add(&cv::TileK::s, &cv::TileK::sr, ci, op.extras[0].device.kind == DeviceKind::host, !writes_scale, t.upr, t.se,
+        sw);
     if (op.extras.size() > 1)
-      add(&t.z, op.extras[1].device.kind == DeviceKind::host, !writes_scale, ext(t.z, t.zr, t.upr, t.ze, 1), rows * t.upr);
+      add(&cv::TileK::z, &cv::TileK::zr, ci, op.extras[1].device.kind == DeviceKind::host, !writes_scale, t.upr, t.ze,
+          1);
     return v;
   }
 
@@ -1516,38 +1551,65 @@ class CudaExecutor final : public Executor {
       CUdeviceptr dev;
       long long host, len;
     };
-    // `v` is filled before taking sides: they point into its elements.
+    std::vector<unsigned long long> vals;
+    std::vector<std::pair<size_t, size_t>> at;
+    host_index_values(g, ops, vals, at);
     std::vector<cv::TileK> v;
-    v.reserve(g.ops.size());
-    for (int k : g.ops) v.push_back(*ops[k].tile);
     std::vector<std::vector<TileSide>> sides;
-    sides.reserve(v.size());
+    const auto width = [](const TileSide& x) { return (static_cast<size_t>(x.hi - x.lo) + 255) & ~size_t{255}; };
     size_t total = 0;
-    for (size_t i = 0; i < v.size(); ++i) {
-      sides.push_back(tile_sides(v[i], ops[g.ops[i]]));
+    for (int k : g.ops) {
+      v.push_back(*ops[k].tile);
+      sides.push_back(tile_sides(v.back(), ops[k]));
       for (const TileSide& x : sides.back())
-        if (x.host) total += (static_cast<size_t>(x.hi - x.lo) + 255) & ~size_t{255};
+        if (x.host) total += width(x) * static_cast<size_t>(x.idx < 0 ? 1 : v.back().rows[0]);
     }
     const CUdeviceptr stg = staging(s, total, st);
     const Side dev_side{{DeviceKind::cuda, s.index}, DType::u8, false}, host_side{{DeviceKind::host, 0}, DType::u8, true};
     std::vector<Back> back;
+    std::vector<Raw> rows_in, rows_out;  // indexed sides, row by row
     size_t off = 0;
     int64_t calls = 1;
-    for (size_t i = 0; i < v.size(); ++i)
+    bool indexed = false;
+    for (size_t i = 0; i < v.size(); ++i) {
+      cv::TileK& t = v[i];
+      bool drop[2] = {false, false};
       for (const TileSide& x : sides[i]) {
         if (!x.host) continue;
         const CUdeviceptr d = stg + off;
-        const size_t len = static_cast<size_t>(x.hi - x.lo);
-        if (x.input) copy1d(host_side, dev_side, static_cast<uintptr_t>(x.lo), d, len, st), ++calls;
-        else back.push_back({d, x.lo, static_cast<long long>(len)});
-        *x.field = static_cast<long long>(d) + (*x.field - x.lo);  // the kernel works on the staged copy
-        off += (len + 255) & ~size_t{255};
+        const long long base = t.*x.field;
+        const size_t len = static_cast<size_t>(x.hi - x.lo), w = width(x);
+        if (x.idx < 0) {
+          if (x.input) copy1d(host_side, dev_side, static_cast<uintptr_t>(x.lo), d, len, st), ++calls;
+          else back.push_back({d, x.lo, static_cast<long long>(len)});
+          off += w;
+        } else {  // host index values (the engine stages no side a GPU table selects)
+          const size_t o = x.idx ? at[i].second : at[i].first;
+          const long long r0 = (t.*x.rs)[0];
+          for (long long r = 0; r < t.rows[0]; ++r) {
+            const uintptr_t h = static_cast<uintptr_t>(x.lo + static_cast<long long>(vals[o + r]) * r0);
+            const uintptr_t dr = static_cast<uintptr_t>(d + r * w);
+            if (x.input) rows_in.push_back({h, dr, len});
+            else rows_out.push_back({dr, h, len});
+          }
+          (t.*x.rs)[0] = static_cast<long long>(w);
+          drop[x.idx] = true;
+          off += w * static_cast<size_t>(t.rows[0]);
+        }
+        t.*x.field = static_cast<long long>(d) + (base - x.lo);  // the kernel works on the staged copy
       }
+      if (drop[0]) t.xi = 0, at[i].first = kNoIndex;
+      if (drop[1]) t.ci = 0, at[i].second = kNoIndex;
+      indexed = indexed || t.xi || t.ci;
+    }
+    if (!rows_in.empty()) copy_raws(s, host_side, dev_side, rows_in, st), ++calls;
     auto& slot = g.exec_cache[static_cast<int>(Strategy::tile_staged)];
     if (!slot) slot = std::make_shared<TileExec>();
-    launch_tiles(s, g, ops, upload_tiles(s, *static_cast<TileExec*>(slot.get()), {}, v, nullptr, st), st);
+    launch_tiles(s, g, ops, upload_tiles(s, *static_cast<TileExec*>(slot.get()), std::move(vals), v,
+                                         indexed ? &at : nullptr, st), st);
     for (const Back& b : back)
       copy1d(dev_side, host_side, b.dev, static_cast<uintptr_t>(b.host), static_cast<size_t>(b.len), st), ++calls;
+    if (!rows_out.empty()) copy_raws(s, dev_side, host_side, rows_out, st), ++calls;
     staging_release(s, st);
     return calls;
   }

@@ -11,7 +11,13 @@ change incompatibly only in a new minor (0.x) or major release.
   copy and chosen by measurement (`stats()["cuda"][i]["bulk"]`).
 - Quantization between a GPU and pinned host memory runs either in place
   (zero-copy) or through device staging (compress then move, move then
-  decompress), chosen by measurement.
+  decompress), chosen by measurement; with indices too (paged offload: GPU
+  pages by `x_index`, host pool slots by `index`, the slots moved by batched
+  DMA).
+- Fixes: explicit quantize calls with host indices planned anew on every
+  call (new index values missed the plan cache), so they were never tuned;
+  device staging of several tile ops in one group could write descriptors
+  through dangling pointers.
 - Quantization while copying (`ce.quantize`, `ce.dequantize`): FP8 (E4M3,
   E5M2), INT8, INT4 (symmetric) and UINT4 (zero points) per group of values,
   MXFP8 with E8M0 scales, NVFP4 with E4M3 scales and a global scale; dynamic

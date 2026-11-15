@@ -737,25 +737,40 @@ struct Engine::Impl {
     op.tile_index[0] = std::move(hx), op.tile_index[1] = std::move(hc);
     op.tile_host_ptr[0] = by_ptr[0], op.tile_host_ptr[1] = by_ptr[1];
     {  // device staging for host sides (Op::tile_staged_ok)
-      const int64_t rows = t.rows[0] * t.rows[1] * t.rows[2];
+      // A host side is staged whole, or row by row where a host index table
+      // selects its rows: an input's extent (per row) holds at most twice the
+      // bytes it reads, an output's exactly the bytes it writes (so copying
+      // it back writes nothing else). An index shared by host and GPU sides,
+      // or a GPU table selecting host rows, keeps the op zero-copy.
       const int64_t xw = static_cast<int64_t>(itemsize(xd)), sw = byte_scale ? 1 : 4;
+      TileSpec t1 = t;  // one row of the first dimension
+      t1.rows[0] = 1;
       struct S {
         const TileSpec::Side& side;
+        const TileSpec::Index& index;
         std::pair<int64_t, int64_t> e;
-        int64_t need;
+        int64_t width, count;  // bytes per value or scale, and how many per row (rows[1], rows[2] aside)
         bool input;
       };
       const bool reads_scale = !t.quantize || t.static_scale;
-      std::vector<S> ss{{t.x, xr, rows * vals * xw, t.quantize}, {t.q, qr, rows * (packed ? vals / 2 : vals), !t.quantize},
-                        {t.scale, sr, rows * t.upr * sw, reads_scale}};
-      if (zero) ss.push_back({t.zero, zr, rows * t.upr, reads_scale});
-      bool host = false, ok = !t.x_index.used() && !t.index.used();
+      std::vector<S> ss{{t.x, t.x_index, xr, xw, vals, t.quantize},
+                        {t.q, t.index, qr, 1, packed ? vals / 2 : vals, !t.quantize},
+                        {t.scale, t.index, sr, sw, t.upr, reads_scale}};
+      if (zero) ss.push_back({t.zero, t.index, zr, 1, t.upr, reads_scale});
+      bool host = false, ok = true, c_host = false, c_dev = false;
       for (const S& s : ss) {
+        if (&s.index == &t.index && s.index.used()) (s.side.ep.device.kind == DeviceKind::host ? c_host : c_dev) = true;
         if (s.side.ep.device.kind != DeviceKind::host) continue;
         host = true;
-        const int64_t span = s.e.second - s.e.first;
-        ok = ok && (s.input ? span <= 2 * s.need : span == s.need);
+        int64_t span = s.e.second - s.e.first, need = t.rows[0] * t.rows[1] * t.rows[2] * s.count * s.width;
+        if (s.index.used()) {
+          ok = ok && !s.index.dev;
+          const auto e1 = tile_extent(t1, s.side, s.count, s.width);
+          span = e1.second - e1.first, need = t.rows[1] * t.rows[2] * s.count * s.width;
+        }
+        ok = ok && (s.input ? span <= 2 * need : span == need);
       }
+      ok = ok && !(c_host && c_dev);
       op.tile_host = host;
       op.tile_staged_ok = host && ok && dev.kind == DeviceKind::cuda;
     }

@@ -76,9 +76,9 @@ Hash128 fingerprint(const Op& op) {
                         t.qr[2], t.sr[0], t.sr[1], t.sr[2], t.zr[0], t.zr[1], t.zr[2], t.xe, t.qe, t.se, t.ze, t.xb, t.cb,
                         static_cast<long long>(t.xi != 0), static_cast<long long>(t.ci != 0)})
       h.add(static_cast<uint64_t>(v));  // field by field: no padding bytes in the hash
-    // Index tables: host values are part of the plan; GPU table pointers are per call.
-    for (const auto& ix : op.tile_index)
-      if (ix) h.add(std::span<const i64>(*ix));
+    // Index tables (host values, GPU pointers) are this call's: footprints
+    // cover the index bounds and executors read the tables from the ops they
+    // run, so new indices hit the same plan.
     for (int v : {t.g, t.upr, t.fmt, t.xdt, t.scale_byte, t.quantize, t.static_scale}) h.add(static_cast<uint64_t>(v));
     h.add(std::bit_cast<uint32_t>(t.eps)), h.add(std::bit_cast<uint32_t>(t.gs));
   }

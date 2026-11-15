@@ -4,6 +4,15 @@ copyengine follows [semantic versioning](https://semver.org). From 0.1.0 on,
 the Python API, the C ABI (`CE_ABI_VERSION`) and the tuning profile format
 change incompatibly only in a new minor (0.x) or major release.
 
+## Unreleased
+
+- Fix: memory copyengine took from torch's allocator (copy tables, staging,
+  upload buffers) was first written on copyengine's own stream without
+  waiting for torch's stream, where a freed tensor's kernels could still be
+  writing the same block: the table could be overwritten and its copies read
+  garbage (wrong data, or an illegal memory access), mostly while exploring.
+  The stream that first uses such memory now waits for its allocation stream.
+
 ## 0.4.1
 
 - Fix: torch 2.13 converts float -> float8_e4m3fn beyond the format

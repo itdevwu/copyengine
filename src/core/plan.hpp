@@ -106,6 +106,11 @@ struct Op {
   // A tile op (quantization while copying): its kernel description, and the
   // footprints beyond src / dst (scale, zero point), each on its device.
   std::shared_ptr<const cv::TileK> tile;
+  // Its host index tables (TileK::xi / ci point into them), and whether it
+  // reads a GPU index table (this call's pointer: the kernel's description is
+  // written per call).
+  std::shared_ptr<const std::vector<int64_t>> tile_index[2];
+  bool tile_dev_index = false;
   struct Extra {
     Device device;
     int64_t lo = 0, hi = 0;  // absolute bytes

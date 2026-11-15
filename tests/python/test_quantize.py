@@ -129,3 +129,54 @@ def test_gpu_strided_and_dequantize(fmt, g):
     got = out.cpu()
     nan = got.isnan()
     assert torch.equal(nan, want.isnan()) and torch.equal(got[~nan], want[~nan])
+
+
+@pytest.mark.parametrize("dev", DEVS)
+@pytest.mark.parametrize("fmt,g", [("fp8_e4m3", 128), ("uint4", 64), ("nvfp4", 16)])
+@pytest.mark.parametrize("gpu_index", [False, True])
+def test_gather_then_quantize_into_cache_blocks(dev, fmt, g, gpu_index):
+    # Pages gathered from a KV cache, quantized, written to other blocks of a
+    # quantized cache: x_index and index, with host or GPU indices.
+    if gpu_index and dev == "cpu":
+        pytest.skip("GPU indices need GPU tensors")
+    blocks, D = 32, 2 * g
+    kv = data((blocks, 4), D, torch.bfloat16, dev, seed=5)          # [blocks, tokens, D]
+    q, scale, zero = outputs(fmt, (blocks, 4), D, g, dev)
+    gs = 0.02 if fmt == "nvfp4" else 1.0
+    for e in engines():
+        for k in range(6):
+            src = torch.randperm(blocks)[:8]
+            dst = torch.randperm(blocks)[:8]
+            si, di = (src.to(dev), dst.to(dev)) if gpu_index else (src.numpy(), dst.tolist())
+            e.quantize(kv, q, scale, zero, fmt=fmt, group=g, global_scale=gs, x_index=si, index=di)
+            if dev == "cuda":
+                torch.cuda.synchronize()
+            check(fmt, g, kv[src], q[dst], scale[dst], None if zero is None else zero[dst], gs)
+            back = torch.zeros(blocks, 4, D, dtype=torch.float32, device=dev)
+            e.dequantize(q, scale, back, zero, fmt=fmt, group=g, global_scale=gs, x_index=si, index=di)
+            if dev == "cuda":
+                torch.cuda.synchronize()
+            codes, s, bits = _quant.quantize(kv[src].cpu(), g, fmt, gs=gs)
+            want = _quant.dequantize(codes, s, bits, g, fmt, gs).view(8, 4, D)
+            got = back[src].cpu()
+            nan = got.isnan()
+            assert torch.equal(nan, want.isnan()) and torch.equal(got[~nan], want[~nan])
+
+
+def test_out_of_range_index_raises():
+    x = torch.randn(4, 4, 128)
+    q, scale, _ = outputs("fp8_e4m3", (4, 4), 128, 128, "cpu")
+    with pytest.raises(ValueError):
+        ce.quantize(x, q, scale, fmt="fp8_e4m3", group=128, index=[0, 1, 9, 2])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_out_of_range_gpu_index_raises_at_synchronize():
+    x = torch.randn(4, 4, 128, device="cuda")
+    q, scale, _ = outputs("fp8_e4m3", (4, 4), 128, 128, "cuda")
+    e = ce.Engine(prior_only=True)
+    e.quantize(x, q, scale, fmt="fp8_e4m3", group=128, index=torch.tensor([0, 1, 9, 2], device="cuda"))
+    with pytest.raises(ValueError, match="out of range"):
+        e.synchronize()
+    e.quantize(x, q, scale, fmt="fp8_e4m3", group=128, index=torch.tensor([0, 1, 3, 2], device="cuda"))
+    e.synchronize()  # cleared

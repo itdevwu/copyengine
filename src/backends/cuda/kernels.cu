@@ -516,6 +516,10 @@ __device__ void tile_unit_warp(const cv::TileK& t, long long u, int lane) {
   using cv::QFmt;
   const QFmt f = static_cast<QFmt>(t.fmt);
   const cv::UnitAt a = cv::unit_at(t, u);
+  if (a.bad) {  // an index out of range: skipped, reported at synchronize()
+    if (lane == 0 && t.err) atomicOr(reinterpret_cast<unsigned long long*>(t.err), 1ull);
+    return;
+  }
   auto xv = [&](int k) { return cv::val_float(cv::load(cv::addr(cv::x_at(t, a, k)), t.xdt)); };
   if (t.quantize) {
     float amax = 0.0f, lo = 0.0f, hi = 0.0f;

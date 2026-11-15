@@ -339,7 +339,10 @@ class CudaExecutor final : public Executor {
       case Strategy::runs: return !g.opaque() && g.pure() && src_ok && dst_ok;  // plain DMA calls
       case Strategy::passthrough: return !g.opaque() && g.pure() && src_ok && dst_ok;
       case Strategy::kernel: return on_device && g.exec_cache[static_cast<int>(Strategy::kernel)] != nullptr;
-      case Strategy::tile: return on_device && g.exec_cache[static_cast<int>(Strategy::tile)] != nullptr;
+      case Strategy::tile: {  // descriptors resident; indexed ones are written per call (allocation): not yet
+        const auto& slot = g.exec_cache[static_cast<int>(Strategy::tile)];
+        return on_device && slot && static_cast<const TileExec*>(slot.get())->table != nullptr;
+      }
       case Strategy::fused: {
         if (!on_device || !devs_[di].kernels) return false;
         if (g.opaque()) fused_plan(g);  // host-only planning: fine under capture
@@ -1271,20 +1274,85 @@ class CudaExecutor final : public Executor {
            });
   }
 
+  static_assert(sizeof(cv::TileK) % 8 == 0, "TileK is written as 8-byte words");
+  struct TileExec {
+    std::shared_ptr<void> table;  // DevTable of TileK: groups without index tables
+    struct Mirror {
+      CUstream stream{};
+      std::shared_ptr<void> table;  // DevTable: this call's host index values, then the TileKs
+      size_t words = 0;
+    };
+    std::vector<Mirror> mirrors;  // groups with index tables, per stream
+  };
+
+  static bool tile_indexed(const Group& g, const std::vector<Op>& ops) {
+    return std::any_of(g.ops.begin(), g.ops.end(), [&](int k) { return ops[k].tile->xi || ops[k].tile->ci; });
+  }
+
   // Tile ops: their descriptors resident with the plan, one launch per group.
+  // With index tables the descriptors carry this call's tables (host values
+  // copied next to them), written in stream order through kernel parameters.
   int64_t tile(Dev& s, const Group& g, const std::vector<Op>& ops, CUstream st) {
     auto& slot = g.exec_cache[static_cast<int>(Strategy::tile)];
+    if (!slot) slot = std::make_shared<TileExec>();
+    auto& x = *static_cast<TileExec*>(slot.get());
     long long most = 0;
-    if (!slot) {
-      std::vector<cv::TileK> v;
-      for (int k : g.ops) v.push_back(*ops[k].tile);
-      slot = resident(s, v);
-    }
     for (int k : g.ops) most = std::max(most, ops[k].tile->units());
-    const auto& t = *static_cast<DevTable*>(slot.get());
+    CUdeviceptr table = 0;
+    if (!tile_indexed(g, ops)) {
+      if (!x.table) {
+        std::vector<cv::TileK> v;
+        for (int k : g.ops) v.push_back(*ops[k].tile);
+        x.table = resident(s, v);
+      }
+      table = static_cast<DevTable*>(x.table.get())->ptr;
+    } else {
+      std::vector<unsigned long long> vals;  // host index values first, then the TileKs
+      std::vector<cv::TileK> v;
+      std::vector<std::pair<size_t, size_t>> at;  // per op: offsets of its x / c host tables in vals (npos: none)
+      constexpr size_t kNone = ~size_t{0};
+      for (int k : g.ops) {
+        const Op& op = ops[k];
+        std::pair<size_t, size_t> o{kNone, kNone};
+        for (int w = 0; w < 2; ++w)
+          if (op.tile_index[w]) {
+            (w ? o.second : o.first) = vals.size();
+            for (int64_t i : *op.tile_index[w]) vals.push_back(static_cast<unsigned long long>(i));
+          }
+        at.push_back(o);
+        v.push_back(*op.tile);
+      }
+      const size_t tk_words = sizeof(cv::TileK) / 8, words = vals.size() + v.size() * tk_words;
+      TileExec::Mirror* m = nullptr;
+      for (auto& y : x.mirrors)
+        if (y.stream == st) m = &y;
+      if (!m) {
+        if (x.mirrors.size() == kLanes) x.mirrors.erase(x.mirrors.begin());  // freed in order after its users
+        m = &x.mirrors.emplace_back();
+        m->stream = st;
+      }
+      if (m->words < words) {
+        auto t = std::make_shared<DevTable>();
+        t->owner = this, t->device = s.index, t->alive = alive_, t->count = words;
+        t->mem = dev_alloc(s, words * 8, "tile descriptors");
+        t->ptr = t->mem.ptr;
+        m->table = t, m->words = words;
+      }
+      const CUdeviceptr base = static_cast<DevTable*>(m->table.get())->ptr;
+      const CUdeviceptr err = error_word(s);
+      for (size_t i = 0; i < v.size(); ++i) {
+        if (at[i].first != kNone) v[i].xi = static_cast<long long>(base + at[i].first * 8);
+        if (at[i].second != kNone) v[i].ci = static_cast<long long>(base + at[i].second * 8);
+        v[i].err = static_cast<long long>(err);
+      }
+      s.err_armed = true;
+      const auto* tw = reinterpret_cast<const unsigned long long*>(v.data());
+      vals.insert(vals.end(), tw, tw + v.size() * tk_words);
+      put_words(s, base, vals.data(), vals.size(), st);
+      table = base + (words - v.size() * tk_words) * 8;
+    }
     CUfunction f = function(s, "ce_tile");
-    CUdeviceptr table = t.ptr;
-    int count = static_cast<int>(t.count);
+    int count = static_cast<int>(g.ops.size());
     void* args[] = {&table, &count};
     const unsigned gx = static_cast<unsigned>(std::min<long long>((most + 7) / 8, 1 << 20));
     const unsigned gy = static_cast<unsigned>(std::min<long long>(count, 65535));

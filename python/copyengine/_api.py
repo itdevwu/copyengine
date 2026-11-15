@@ -394,20 +394,24 @@ class Engine:
     # ---- quantization while copying (docs/design/v0.4.md) ------------------------------
 
     def quantize(self, x, q, scale, zero=None, *, fmt: str, group: Optional[int] = None, eps: float = 1e-12,
-                 global_scale: float = 1.0, ctx: str = "") -> None:
+                 global_scale: float = 1.0, x_index=None, index=None, ctx: str = "") -> None:
         """Quantize `x` per unit of `group` values along its last dimension into
-        `q` and `scale` (and `zero` for uint4), bit for bit as the format's torch
+        `q` and `scale` (and `zero` for uint4), bit for bit as the format's
         recipe (copyengine._quant). Shapes: x [..., D]; q [..., D] (packed
         formats: [..., D / 2], two values per byte); scale and zero [..., D / group].
+        `x_index` gathers the rows of x along its first dimension (pages to
+        quantize); `index` scatters into the rows of q, scale and zero (cache
+        blocks). Index tensors on the GPU stay there.
         """
-        self._tile(True, x, q, scale, zero, fmt, group, eps, global_scale, ctx)
+        self._tile(True, x, q, scale, zero, fmt, group, eps, global_scale, ctx, x_index, index)
 
     def dequantize(self, q, scale, out, zero=None, *, fmt: str, group: Optional[int] = None,
-                   global_scale: float = 1.0, ctx: str = "") -> None:
-        """``out = q * scale`` per unit (the inverse of :meth:`quantize`)."""
-        self._tile(False, out, q, scale, zero, fmt, group, 1e-12, global_scale, ctx)
+                   global_scale: float = 1.0, x_index=None, index=None, ctx: str = "") -> None:
+        """``out = q * scale`` per unit (the inverse of :meth:`quantize`);
+        `index` gathers rows of q / scale / zero, `x_index` scatters into out."""
+        self._tile(False, out, q, scale, zero, fmt, group, 1e-12, global_scale, ctx, x_index, index)
 
-    def _tile(self, quantize, x, q, scale, zero, fmt, group, eps, gs, ctx) -> None:
+    def _tile(self, quantize, x, q, scale, zero, fmt, group, eps, gs, ctx, x_index=None, index=None) -> None:
         from . import _quant
         if fmt not in _quant.FMT:
             raise ValueError(f"unknown format {fmt!r}; one of {sorted(_quant.FMT)}")
@@ -416,19 +420,44 @@ class Engine:
             raise ValueError("uint4 needs a zero-point tensor (`zero`)")
         if not all(is_tensor(t) for t in tensors):
             raise TypeError("quantize / dequantize take torch tensors")
+        def table(ix, base):
+            """(device pointer, host values, bound, the index as passed to torch) for one index."""
+            if ix is None:
+                return None
+            if is_tensor(ix) and ix.is_cuda:
+                t = device_table(ix)
+                if not base.is_cuda or t.device != base.device:
+                    raise ValueError("a GPU index needs its tensors on the same GPU")
+                return t.data_ptr(), [], base.shape[0], t
+            vals = index_array(ix)
+            return 0, vals.tolist(), base.shape[0], torch.from_numpy(vals)
+
+        xt, ct = table(x_index, x), table(index, q)
+        if ct is not None:
+            for t in (scale, zero if fmt == "uint4" else None):
+                if t is not None and t.shape[0] != q.shape[0]:
+                    raise ValueError("an index selects the same rows of q, scale and zero: their first dimensions differ")
         D = x.shape[-1]
         g = _quant.UNIT.get(fmt, group if group is not None else D)
         if group is not None and fmt in _quant.UNIT and group != g:
             raise ValueError(f"{fmt} uses units of {g} values")
         if g <= 0 or D % g:
             raise ValueError(f"the last dimension ({D}) is not a multiple of the unit size ({g})")
-        lead = tuple(x.shape[:-1])
+        # Logical shapes: an indexed first dimension has as many rows as indices.
+        def logical(t, ix):
+            s = tuple(t.shape)
+            return s if ix is None else (len(ix[3]),) + s[1:]
+        lead = logical(x, xt)[:-1]
         packed = fmt in _quant.PACKED
-        if tuple(q.shape) != lead + ((D // 2,) if packed else (D,)):
-            raise ValueError(f"q has shape {tuple(q.shape)}, expected {lead + ((D // 2,) if packed else (D,))}")
+        if xt is not None and ct is not None and len(xt[3]) != len(ct[3]):
+            raise ValueError("x_index and index select different numbers of rows")
+        if logical(q, ct) != lead + ((D // 2,) if packed else (D,)):
+            raise ValueError(f"q has shape {logical(q, ct)}, expected {lead + ((D // 2,) if packed else (D,))}")
         for name, t in (("scale", scale), ("zero", zero if fmt == "uint4" else None)):
-            if t is not None and tuple(t.shape) != lead + (D // g,):
-                raise ValueError(f"{name} has shape {tuple(t.shape)}, expected {lead + (D // g,)}")
+            if t is not None and logical(t, ct) != lead + (D // g,):
+                raise ValueError(f"{name} has shape {logical(t, ct)}, expected {lead + (D // g,)}")
+        if (xt or ct) and not lead:
+            raise ValueError("an index needs a leading dimension")
         if len(lead) > 3:
             raise ValueError("at most three leading dimensions")
 
@@ -450,10 +479,16 @@ class Engine:
         spec.x, spec.q, spec.scale = sides["x"][0], sides["q"][0], sides["scale"][0]
         if "zero" in sides:
             spec.zero = sides["zero"][0]
+        for x_side, ix in ((True, xt), (False, ct)):
+            if ix is not None:
+                spec.set_index(x_side, ix[0], ix[1], ix[2])
+        xi = None if xt is None else xt[3]  # moved to the tensors' device only if the baseline runs
+        ci = None if ct is None else ct[3]
         if quantize:
-            native = (_quant.native_quantize, x, q, scale, zero, fmt, g, eps, gs)
+            native = (_quant.native_quantize, x, q, scale, zero, fmt, g, eps, gs, xi, ci)
         else:
-            native = (_quant.native_dequantize, q, scale, zero, x, fmt, g, gs)
+            native = (_quant.native_dequantize, q, scale, zero, x, fmt, g, gs, xi, ci)
+        tensors += [t[3] for t in (xt, ct) if t is not None]
         with self._lock:
             self._e.tile(spec, ctx=ctx, stream=current_stream(sides["x"][1], sides["q"][1]), native=native)
             self._after(*tensors)

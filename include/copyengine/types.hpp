@@ -99,6 +99,17 @@ struct TileSpec {
   std::array<int64_t, 3> rows{1, 1, 1};
   int64_t upr = 1;          // units per row
   Side x, q, scale, zero;   // zero: uint4 only
+  // Gathers / scatters: the first row dimension of x (x_index), or of q,
+  // scale and zero (index), goes through an index table: int64 values in GPU
+  // memory at `dev`, or given on the host; each below `bound` (the indexed
+  // tensor's first dimension). rows[0] is the number of indices.
+  struct Index {
+    uintptr_t dev = 0;
+    std::vector<int64_t> host;
+    int64_t bound = 0;
+    bool used() const { return dev != 0 || !host.empty(); }
+  };
+  Index x_index, index;
 };
 
 struct Hints {

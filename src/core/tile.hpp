@@ -25,31 +25,49 @@ struct TileK {
   int scale_byte = 0;  // the scale is stored as a byte (MX, NVFP4)
   int quantize = 1;    // else dequantize
   float eps = 1e-12f, gs = 1.0f;
+  // Gathers / scatters: the first row dimension of x (xi), or of the
+  // quantized side q, s, z (ci), read through an int64 index table (0: none),
+  // each index below its bound (xb, cb). A unit with an index out of range is
+  // skipped and sets the word at `err` (device tables; host ones are checked
+  // when queued).
+  long long xi = 0, ci = 0, xb = 0, cb = 0, err = 0;
 
   CE_HD long long units() const { return rows[0] * rows[1] * rows[2] * upr; }
 };
 
-// Byte offsets of unit u's row in each tensor, and its index in the row.
+CE_HD void* addr(long long a) { return reinterpret_cast<void*>(static_cast<uintptr_t>(a)); }
+
+// Byte offsets of unit u's row in each tensor, and its index in the row;
+// `bad`: an index table held an index out of range (the unit is skipped).
 struct UnitAt {
   long long x, q, s, z;
   long long j;
+  bool bad;
 };
 
 CE_HD UnitAt unit_at(const TileK& t, long long u) {
   UnitAt a;
+  a.bad = false;
   a.j = u % t.upr;
   long long r = u / t.upr;
   const long long i2 = r % t.rows[2];
   r /= t.rows[2];
   const long long i1 = r % t.rows[1], i0 = r / t.rows[1];
-  a.x = t.x + i0 * t.xr[0] + i1 * t.xr[1] + i2 * t.xr[2];
-  a.q = t.q + i0 * t.qr[0] + i1 * t.qr[1] + i2 * t.qr[2];
-  a.s = t.s + i0 * t.sr[0] + i1 * t.sr[1] + i2 * t.sr[2] + a.j * t.se;
-  a.z = t.z + i0 * t.zr[0] + i1 * t.zr[1] + i2 * t.zr[2] + a.j * t.ze;
+  long long ix = i0, ic = i0;
+  if (t.xi) {
+    ix = rd<long long>(addr(t.xi + i0 * 8));
+    a.bad = a.bad || ix < 0 || ix >= t.xb;
+  }
+  if (t.ci) {
+    ic = rd<long long>(addr(t.ci + i0 * 8));
+    a.bad = a.bad || ic < 0 || ic >= t.cb;
+  }
+  a.x = t.x + ix * t.xr[0] + i1 * t.xr[1] + i2 * t.xr[2];
+  a.q = t.q + ic * t.qr[0] + i1 * t.qr[1] + i2 * t.qr[2];
+  a.s = t.s + ic * t.sr[0] + i1 * t.sr[1] + i2 * t.sr[2] + a.j * t.se;
+  a.z = t.z + ic * t.zr[0] + i1 * t.zr[1] + i2 * t.zr[2] + a.j * t.ze;
   return a;
 }
-
-CE_HD void* addr(long long a) { return reinterpret_cast<void*>(static_cast<uintptr_t>(a)); }
 
 // Value k of unit `a` in x, and the code byte holding it in q.
 CE_HD long long x_at(const TileK& t, const UnitAt& a, int k) { return a.x + (a.j * t.g + k) * t.xe; }
@@ -62,6 +80,7 @@ CE_HD long long q_at(const TileK& t, const UnitAt& a, int k) {
 CE_HD void tile_unit(const TileK& t, long long u) {
   const QFmt f = static_cast<QFmt>(t.fmt);
   const UnitAt a = unit_at(t, u);
+  if (a.bad) return;  // host tables are checked when queued
   if (t.quantize) {
     float s = 0.0f;
     uint8_t bits = 0;

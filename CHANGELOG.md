@@ -6,6 +6,13 @@ change incompatibly only in a new minor (0.x) or major release.
 
 ## Unreleased
 
+- Fix: memory copyengine took from torch's allocator (copy tables, staging,
+  upload buffers) was first written on copyengine's own stream without
+  waiting for torch's stream, where a freed tensor's kernels could still be
+  writing the same block: the table could be overwritten and its copies read
+  garbage (wrong data, or an illegal memory access), mostly while exploring.
+  The stream that first uses such memory now waits for its allocation stream.
+
 - Inside torch.compile regions copyengine is measured against what
   torch.compile makes of the same operation: per call kind and layout, the
   torch equivalent compiled by Inductor (admitted only with the same bits)

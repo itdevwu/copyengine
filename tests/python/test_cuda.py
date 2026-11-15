@@ -724,3 +724,23 @@ def test_sm_limited_engine_with_staging_tears_down():
             "print('ok', info['sm_limit'], info['allocator'])\n")
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
     assert out.returncode == 0 and out.stdout.startswith("ok"), (out.returncode, out.stdout, out.stderr[-2000:])
+
+
+@pytest.mark.parametrize("offset", [0, 2])  # 16-byte aligned rows, and not (the plain warp path)
+def test_bulk_copies_through_shared_memory(offset):
+    # sm80+: cp.async (sm90+: TMA). Explored like the other strategies; every
+    # round must give the source's bytes.
+    src = torch.randn(64, 8200, device=DEV)
+    dst = torch.zeros(64, 8300, device=DEV)
+    s, d = src[:, offset:offset + 8192], dst[:, 4 + offset:4 + offset + 8192]
+
+    def run(e):
+        dst.zero_()
+        e.copy_(d, s)
+
+    e, seen = explore(run, rounds=12, check=lambda: torch.testing.assert_close(d, s, rtol=0, atol=0))
+    info = e.stats()["cuda"][0]
+    if info["bulk"] in ("tma", "cp.async"):
+        assert "bulk" in seen
+    else:
+        assert "bulk" not in seen

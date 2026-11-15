@@ -298,6 +298,7 @@ class CudaExecutor final : public Executor {
         if (s.batch) c.push_back(Strategy::batch);
         c.push_back(Strategy::runs);
         if (rects <= 2) std::stable_partition(c.begin(), c.end(), [](Strategy x) { return x == Strategy::runs; });
+        if (!s.bulk.empty() && g.bytes() >= kBulkMinBytes) c.push_back(Strategy::bulk);  // measured like the rest
       } else if (src_cuda && dst_cuda) {
         if (s.batch) c.push_back(Strategy::batch);
         c.push_back(Strategy::runs);
@@ -342,6 +343,7 @@ class CudaExecutor final : public Executor {
       case Strategy::runs: return !g.opaque() && g.pure() && src_ok && dst_ok;  // plain DMA calls
       case Strategy::passthrough: return !g.opaque() && g.pure() && src_ok && dst_ok;
       case Strategy::kernel: return on_device && g.exec_cache[static_cast<int>(Strategy::kernel)] != nullptr;
+      case Strategy::bulk: return on_device && g.exec_cache[static_cast<int>(Strategy::bulk)] != nullptr;
       case Strategy::tile: {  // descriptors resident; indexed ones are written per call (allocation): not yet
         const auto& slot = g.exec_cache[static_cast<int>(Strategy::tile)];
         return on_device && slot && static_cast<const TileExec*>(slot.get())->table != nullptr;
@@ -397,6 +399,7 @@ class CudaExecutor final : public Executor {
       case Strategy::paced: return paced(s, g, st);
       case Strategy::lowered: return lowered(s, g, ops, st);
       case Strategy::tile: return tile(s, g, ops, st);
+      case Strategy::bulk: return bulk(s, g, st);
       default: fail(Errc::unsupported, "CUDA backend cannot run strategy " + std::string(strategy_name(strat)));
     }
   }
@@ -495,6 +498,7 @@ class CudaExecutor final : public Executor {
                     .set("kernels", s.kernels ? Json(true) : Json(s.kernel_error))
                     .set("batch", s.batch ? Json(true) : Json(s.batch_error))
                     .set("sm_limit", s.sm_limit)
+                    .set("bulk", s.bulk.empty() ? Json(s.bulk_error) : Json(s.bulk))
                     .set("zero_copy", s.zero_copy < 0 ? Json("unchecked")
                                                       : (s.zero_copy ? Json(true) : Json(s.zero_copy_error)))
                     .set("allocator", device_allocator() ? device_allocator()->name : "cuda")
@@ -554,6 +558,9 @@ class CudaExecutor final : public Executor {
     CUmodule mod{};
     bool kernels = false, batch = false;
     std::string kernel_error = "not built", batch_error;
+    // Bulk copies through shared memory: "tma" (sm90+), "cp.async" (sm80-89),
+    // admitted by a verified test copy; empty: not available (bulk_error says why).
+    std::string bulk, bulk_error;
     std::unordered_map<std::string, CUfunction> fns;
     CUstream side{};
     CUevent ev_in{}, ev_out{};
@@ -715,6 +722,7 @@ class CudaExecutor final : public Executor {
     for (Slot& sl : s.slots) check(d_->cuEventCreate(&sl.done, CU_EVENT_DISABLE_TIMING), "cuEventCreate");
     admit_kernels(s);
     admit_batch(s);
+    admit_bulk(s);
     if (s.kernels) {  // before any capture can need them
       error_word(s);
       s.capture_arena = dev_alloc(s, kCaptureArena, "capture tables");
@@ -761,6 +769,54 @@ class CudaExecutor final : public Executor {
 #else
     s.kernel_error = "built without nvcc: no kernel module";
 #endif
+  }
+
+  void admit_bulk(Dev& s) {
+    if (!s.kernels) {
+      s.bulk_error = "no kernels";
+      return;
+    }
+    int major = 0;
+    check(d_->cuDeviceGetAttribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, s.dev), "cuDeviceGetAttribute");
+    if (major < 8) {
+      s.bulk_error = "needs sm80 or later";
+      return;
+    }
+    const std::string kind = major >= 9 ? "tma" : "cp.async";
+    try {  // rows of several segments, 16-byte aligned, with pitches: verified byte for byte
+      const size_t rows = 5, width = 3 * 16384 + 4096, spitch = width + 256, dpitch = width + 512;
+      const size_t sbytes = rows * spitch, dbytes = rows * dpitch;
+      CUdeviceptr a = 0, b = 0;
+      check(d_->cuMemAlloc(&a, sbytes), "cuMemAlloc");
+      check(d_->cuMemAlloc(&b, dbytes), "cuMemAlloc");
+      std::vector<uint8_t> in(sbytes), out(dbytes, 0);
+      for (size_t i = 0; i < sbytes; ++i) in[i] = static_cast<uint8_t>(i * 131 + 7);
+      check(d_->cuMemcpyHtoDAsync(a, in.data(), sbytes, s.side), "cuMemcpyHtoDAsync");
+      check(d_->cuMemsetD8Async(b, 0, dbytes, s.side), "cuMemsetD8Async");
+      std::vector<Chunk> ch{{static_cast<long long>(a), static_cast<long long>(b), static_cast<long long>(width),
+                             static_cast<long long>(rows), static_cast<long long>(spitch),
+                             static_cast<long long>(dpitch)}};
+      Slot& sl = upload(s, ch.data(), ch.size() * sizeof(Chunk), s.side);
+      CUfunction f = function(s, "ce_bytes_bulk");
+      CUdeviceptr t = sl.dev.ptr;
+      int n = 1;
+      long long zero = 0;
+      void* args[] = {&t, &n, &zero, &zero};
+      check(d_->cuLaunchKernel(f, 1, 1, 1, 32, 1, 1, 0, s.side, args, nullptr), "cuLaunchKernel ce_bytes_bulk");
+      check(d_->cuEventRecord(sl.done, s.side), "cuEventRecord");
+      sl.used = true;
+      check(d_->cuMemcpyDtoHAsync(out.data(), b, dbytes, s.side), "cuMemcpyDtoHAsync");
+      check(d_->cuStreamSynchronize(s.side), "cuStreamSynchronize");
+      d_->cuMemFree(a);
+      d_->cuMemFree(b);
+      bool ok = true;
+      for (size_t r = 0; r < rows && ok; ++r)
+        ok = std::memcmp(out.data() + r * dpitch, in.data() + r * spitch, width) == 0;
+      if (ok) s.bulk = kind;
+      else s.bulk_error = kind + " test copy came back wrong";
+    } catch (const std::exception& e) {
+      s.bulk_error = kind + ": " + e.what();
+    }
   }
 
   void admit_batch(Dev& s) {
@@ -1290,6 +1346,24 @@ class CudaExecutor final : public Executor {
 
   static bool tile_indexed(const Group& g, const std::vector<Op>& ops) {
     return std::any_of(g.ops.begin(), g.ops.end(), [&](int k) { return ops[k].tile->xi || ops[k].tile->ci; });
+  }
+
+  // Pure device copies through shared memory: the chunk table of `kernel`,
+  // one warp per block (the shared buffers are per block).
+  static constexpr int64_t kBulkMinBytes = 1 << 20;
+  int64_t bulk(Dev& s, const Group& g, CUstream st) {
+    auto& slot = g.exec_cache[static_cast<int>(Strategy::bulk)];
+    if (!slot) slot = resident(s, chunks_of(g));
+    const auto& t = *static_cast<DevTable*>(slot.get());
+    if (t.count == 0) return 0;
+    CUfunction f = function(s, "ce_bytes_bulk");
+    CUdeviceptr table = t.ptr;
+    int n = static_cast<int>(t.count);
+    long long zero = 0;
+    void* args[] = {&table, &n, &zero, &zero};
+    run_kernel(s, f, {static_cast<unsigned>(std::min<size_t>(t.count, 1 << 16)), 1, 1}, {32, 1, 1}, args, st,
+               "ce_bytes_bulk");
+    return 1;
   }
 
   // Tile ops: their descriptors resident with the plan, one launch per group.

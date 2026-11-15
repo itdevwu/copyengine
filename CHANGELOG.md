@@ -6,6 +6,9 @@ change incompatibly only in a new minor (0.x) or major release.
 
 ## Unreleased
 
+- `bulk` copies through shared memory for pure copies on one GPU: TMA bulk
+  copies on sm90 and later, `cp.async` on sm80 to sm89, admitted by a test
+  copy and chosen by measurement (`stats()["cuda"][i]["bulk"]`).
 - Quantization while copying (`ce.quantize`, `ce.dequantize`): FP8 (E4M3,
   E5M2), INT8, INT4 (symmetric) and UINT4 (zero points) per group of values,
   MXFP8 with E8M0 scales, NVFP4 with E4M3 scales and a global scale; dynamic

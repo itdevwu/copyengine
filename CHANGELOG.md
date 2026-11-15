@@ -4,7 +4,7 @@ copyengine follows [semantic versioning](https://semver.org). From 0.1.0 on,
 the Python API, the C ABI (`CE_ABI_VERSION`) and the tuning profile format
 change incompatibly only in a new minor (0.x) or major release.
 
-## Unreleased
+## 0.4.1
 
 - Fix: torch 2.13 converts float -> float8_e4m3fn beyond the format
   (|x| > 464, infinities) to +-448 instead of NaN, on the CPU and the GPU.

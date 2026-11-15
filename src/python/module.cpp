@@ -384,7 +384,7 @@ NB_MODULE(_core, m) {
                          float eps, float gs) {
     const auto f = static_cast<ce::cv::QFmt>(fmt);
     const size_t n = x.shape(0), units = n / static_cast<size_t>(group);
-    const size_t per = f == ce::cv::QFmt::nvfp4 ? static_cast<size_t>(group) / 2 : static_cast<size_t>(group);
+    const size_t per = ce::cv::qfmt_packed(f) ? static_cast<size_t>(group) / 2 : static_cast<size_t>(group);
     std::string q(units * per, '\0'), scale(units * 4, '\0'), bits(units, '\0');
     for (size_t u = 0; u < units; ++u) {
       const float* xp = x.data() + u * static_cast<size_t>(group);
@@ -401,7 +401,7 @@ NB_MODULE(_core, m) {
   m.def("_dequant_ref", [](int fmt, nb::bytes q, nb::bytes scale, nb::bytes bits, int group, float gs) {
     const auto f = static_cast<ce::cv::QFmt>(fmt);
     const size_t units = bits.size(), n = units * static_cast<size_t>(group);
-    const size_t per = f == ce::cv::QFmt::nvfp4 ? static_cast<size_t>(group) / 2 : static_cast<size_t>(group);
+    const size_t per = ce::cv::qfmt_packed(f) ? static_cast<size_t>(group) / 2 : static_cast<size_t>(group);
     std::string y(n * 4, '\0');
     const auto* qp = reinterpret_cast<const uint8_t*>(q.c_str());
     for (size_t u = 0; u < units; ++u) {
@@ -409,7 +409,7 @@ NB_MODULE(_core, m) {
       std::memcpy(&s, scale.c_str() + u * 4, 4);
       const float factor = ce::cv::unit_scale(f, s, static_cast<uint8_t>(bits.c_str()[u]), gs);
       for (int i = 0; i < group; ++i) {
-        const float v = ce::cv::dequantize_at(qp + u * per, 1, i, f, factor);
+        const float v = ce::cv::dequantize_at(qp + u * per, 1, i, f, factor, static_cast<uint8_t>(bits.c_str()[u]));
         std::memcpy(y.data() + (u * static_cast<size_t>(group) + static_cast<size_t>(i)) * 4, &v, 4);
       }
     }

@@ -10,7 +10,10 @@
 
 namespace ce::cv {
 
-enum class QFmt : int { fp8_e4m3 = 0, fp8_e5m2, int8, mxfp8_e4m3, mxfp8_e5m2, nvfp4 };
+enum class QFmt : int { fp8_e4m3 = 0, fp8_e5m2, int8, mxfp8_e4m3, mxfp8_e5m2, nvfp4, int4, uint4 };
+
+// Packed formats store two values per byte, element 2i in the low nibble.
+CE_HD bool qfmt_packed(QFmt f) { return f == QFmt::nvfp4 || f == QFmt::int4 || f == QFmt::uint4; }
 
 CE_HD bool qfmt_mx(QFmt f) { return f == QFmt::mxfp8_e4m3 || f == QFmt::mxfp8_e5m2; }
 CE_HD float qmax_of(QFmt f) {
@@ -18,6 +21,8 @@ CE_HD float qmax_of(QFmt f) {
     case QFmt::fp8_e4m3: case QFmt::mxfp8_e4m3: return 448.0f;
     case QFmt::fp8_e5m2: case QFmt::mxfp8_e5m2: return 57344.0f;
     case QFmt::int8: return 127.0f;
+    case QFmt::int4: return 7.0f;
+    case QFmt::uint4: return 15.0f;
     default: return 6.0f;  // nvfp4 (E2M1)
   }
 }
@@ -26,6 +31,8 @@ CE_HD bool is_nan(float x) { return x != x; }
 CE_HD float abs_f(float x) { return u2f(f2u(x) & 0x7FFFFFFFu); }
 // torch.amax: NaN wins.
 CE_HD float amax_step(float m, float v) { return is_nan(m) ? m : is_nan(v) ? v : (v > m ? v : m); }
+// torch.amin: NaN wins.
+CE_HD float amin_step(float m, float v) { return is_nan(m) ? m : is_nan(v) ? v : (v < m ? v : m); }
 // torch.clamp: NaN stays NaN.
 CE_HD float clamp_f(float v, float lo, float hi) { return is_nan(v) ? v : v < lo ? lo : v > hi ? hi : v; }
 
@@ -82,6 +89,41 @@ CE_HD void quantize_unit(In x, long long xs, int g, QFmt f, float eps, float gs,
                          float* scale, uint8_t* scale_bits) {
   float amax = 0.0f;
   for (int i = 0; i < g; ++i) amax = amax_step(amax, abs_f(x(i * xs)));
+  if (f == QFmt::int4) {  // symmetric: round(x / (amax / 7)) in [-8, 7], two's complement nibbles; NaN -> 0
+    const float s = (is_nan(amax) ? amax : (amax < eps ? eps : amax)) / 7.0f;
+    *scale = s;
+    for (int i = 0; i + 1 < g; i += 2) {
+      uint8_t n[2];
+      for (int k = 0; k < 2; ++k) {
+        const float v = x((i + k) * xs) / s;
+        n[k] = is_nan(v) ? 0 : static_cast<uint8_t>(static_cast<int>(clamp_f(rintf(v), -8.0f, 7.0f)) & 0xF);
+      }
+      q[(i / 2) * qs] = static_cast<uint8_t>(n[0] | (n[1] << 4));
+    }
+    return;
+  }
+  if (f == QFmt::uint4) {  // asymmetric with a zero point (torchao affine): scale and zero per unit
+    float lo = 0.0f, hi = 0.0f;  // the range always includes 0
+    for (int i = 0; i < g; ++i) {
+      const float v = x(i * xs);
+      lo = amin_step(lo, v), hi = amax_step(hi, v);
+    }
+    const float span = hi - lo;
+    const float s = (is_nan(span) ? span : (span < eps ? eps : span)) / 15.0f;
+    const float zf = clamp_f(rintf(-lo / s), 0.0f, 15.0f);
+    const uint8_t z = is_nan(zf) ? 0 : static_cast<uint8_t>(zf);
+    *scale = s;
+    *scale_bits = z;
+    for (int i = 0; i + 1 < g; i += 2) {
+      uint8_t n[2];
+      for (int k = 0; k < 2; ++k) {
+        const float v = rintf(x((i + k) * xs) / s) + static_cast<float>(z);
+        n[k] = is_nan(v) ? 0 : static_cast<uint8_t>(clamp_f(v, 0.0f, 15.0f));
+      }
+      q[(i / 2) * qs] = static_cast<uint8_t>(n[0] | (n[1] << 4));
+    }
+    return;
+  }
   if (f == QFmt::fp8_e4m3 || f == QFmt::fp8_e5m2 || f == QFmt::int8) {
     const float s = (is_nan(amax) ? amax : (amax < eps ? eps : amax)) / qmax_of(f);
     *scale = s;
@@ -131,11 +173,15 @@ CE_HD float unit_scale(QFmt f, float scale, uint8_t scale_bits, float gs) {
   return scale;
 }
 
-// Element i of a dequantized unit (`q` as stored: nvfp4 packed).
-CE_HD float dequantize_at(const uint8_t* q, long long qs, int i, QFmt f, float factor) {
-  if (f == QFmt::nvfp4) {
+// Element i of a dequantized unit (`q` as stored: packed formats two per
+// byte); `zero`: uint4's zero point (the unit's scale byte).
+CE_HD float dequantize_at(const uint8_t* q, long long qs, int i, QFmt f, float factor, uint8_t zero = 0) {
+  if (qfmt_packed(f)) {
     const uint8_t b = q[(i / 2) * qs];
-    return e2m1_to_float((i & 1) ? (b >> 4) : (b & 0xFu)) * factor;
+    const uint8_t n = (i & 1) ? static_cast<uint8_t>(b >> 4) : static_cast<uint8_t>(b & 0xFu);
+    if (f == QFmt::nvfp4) return e2m1_to_float(n) * factor;
+    if (f == QFmt::int4) return static_cast<float>(static_cast<int>(n) - ((n & 8u) ? 16 : 0)) * factor;
+    return (static_cast<float>(n) - static_cast<float>(zero)) * factor;  // uint4
   }
   return dequant_scaled(q[i * qs], f) * factor;
 }

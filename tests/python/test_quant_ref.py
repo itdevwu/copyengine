@@ -8,8 +8,9 @@ from copyengine import _core
 
 torch = pytest.importorskip("torch")
 
-FMT = {"fp8_e4m3": 0, "fp8_e5m2": 1, "int8": 2, "mxfp8_e4m3": 3, "mxfp8_e5m2": 4, "nvfp4": 5}
-QMAX = {"fp8_e4m3": 448.0, "fp8_e5m2": 57344.0, "int8": 127.0, "mxfp8_e4m3": 448.0, "mxfp8_e5m2": 57344.0}
+FMT = {"fp8_e4m3": 0, "fp8_e5m2": 1, "int8": 2, "mxfp8_e4m3": 3, "mxfp8_e5m2": 4, "nvfp4": 5, "int4": 6, "uint4": 7}
+QMAX = {"fp8_e4m3": 448.0, "fp8_e5m2": 57344.0, "int8": 127.0, "mxfp8_e4m3": 448.0, "mxfp8_e5m2": 57344.0,
+        "int4": 7.0, "uint4": 15.0}
 FP8 = {"fp8_e4m3": torch.float8_e4m3fn, "fp8_e5m2": torch.float8_e5m2,
        "mxfp8_e4m3": torch.float8_e4m3fn, "mxfp8_e5m2": torch.float8_e5m2}
 EPS = 1e-12
@@ -74,7 +75,36 @@ def recipe_nvfp4(x, g, gs):
     return packed.reshape(-1), None, s.view(torch.uint8).reshape(-1)
 
 
+def pack(n):
+    return n[:, 0::2] | (n[:, 1::2] << 4)
+
+
+def recipe_int4(x, g, eps=EPS):
+    xf = x.view(-1, g)
+    amax = xf.abs().amax(-1, keepdim=True)
+    scale = amax.clamp(min=eps) / 7
+    v = xf / scale
+    n = torch.where(v.isnan(), 0.0, torch.round(v).clamp(-8, 7)).to(torch.int32) & 0xF
+    return pack(n.to(torch.uint8)).reshape(-1), scale.reshape(-1), None
+
+
+def recipe_uint4(x, g, eps=EPS):
+    xf = x.view(-1, g)
+    lo = xf.amin(-1, keepdim=True).clamp(max=0)
+    hi = xf.amax(-1, keepdim=True).clamp(min=0)
+    scale = (hi - lo).clamp(min=eps) / 15
+    zf = torch.round(-lo / scale).clamp(0, 15)
+    z = torch.where(zf.isnan(), 0.0, zf)
+    v = torch.round(xf / scale) + z
+    n = torch.where(v.isnan(), 0.0, v.clamp(0, 15)).to(torch.uint8)
+    return pack(n).reshape(-1), scale.reshape(-1), z.to(torch.uint8).reshape(-1)
+
+
 def recipe(x, g, fmt, gs=1.0):
+    if fmt == "int4":
+        return recipe_int4(x, g)
+    if fmt == "uint4":
+        return recipe_uint4(x, g)
     if fmt in ("fp8_e4m3", "fp8_e5m2", "int8"):
         return recipe_scaled(x, g, fmt)
     if fmt.startswith("mx"):
@@ -83,6 +113,13 @@ def recipe(x, g, fmt, gs=1.0):
 
 
 def recipe_dequant(q, scale, bits, g, fmt, gs=1.0):
+    if fmt in ("int4", "uint4"):
+        n = torch.stack([q & 0xF, q >> 4], -1).reshape(-1, g).to(torch.int32)
+        if fmt == "int4":
+            vals = torch.where(n >= 8, n - 16, n).float()
+        else:
+            vals = n.float() - bits.float().view(-1, 1)
+        return (vals * scale.view(-1, 1)).reshape(-1)
     if fmt == "nvfp4":
         codes = torch.stack([q & 0xF, q >> 4], -1).reshape(-1, g)
         return (e2m1_value(codes) * (bits.view(torch.float8_e4m3fn).float() * gs).view(-1, 1)).reshape(-1)
@@ -130,14 +167,15 @@ def host(fmt, x, g, gs=1.0):
 
 def fp8_nan_positions(q, fmt):
     """fp8 NaN bit patterns differ between torch's CPU and CUDA paths: compare where NaNs are."""
-    if fmt == "int8" or fmt == "nvfp4":
+    if fmt in ("int8", "nvfp4", "int4", "uint4"):
         return q
     v = q.view(FP8[fmt]).float()
     return torch.where(v.isnan(), torch.tensor(0xFF, dtype=torch.uint8), q)
 
 
 @pytest.mark.parametrize("fmt,g", [("fp8_e4m3", 128), ("fp8_e5m2", 64), ("int8", 128), ("fp8_e4m3", 16),
-                                   ("mxfp8_e4m3", 32), ("mxfp8_e5m2", 32), ("nvfp4", 16)])
+                                   ("mxfp8_e4m3", 32), ("mxfp8_e5m2", 32), ("nvfp4", 16), ("int4", 32),
+                                   ("int4", 128), ("uint4", 32), ("uint4", 128)])
 def test_quantize_matches_the_recipe(fmt, g):
     for seed in range(3):
         x = data(g, seed=seed)
@@ -151,7 +189,8 @@ def test_quantize_matches_the_recipe(fmt, g):
             assert same(bits, rbits), (fmt, seed)
 
 
-@pytest.mark.parametrize("fmt,g", [("fp8_e4m3", 128), ("int8", 32), ("mxfp8_e5m2", 32), ("nvfp4", 16)])
+@pytest.mark.parametrize("fmt,g", [("fp8_e4m3", 128), ("int8", 32), ("mxfp8_e5m2", 32), ("nvfp4", 16),
+                                   ("int4", 32), ("uint4", 64)])
 def test_dequantize_matches_the_recipe(fmt, g):
     x = data(g, seed=7)
     gs = 1.0 if fmt != "nvfp4" else 0.01
@@ -165,8 +204,8 @@ def test_dequantize_matches_the_recipe(fmt, g):
 
 def _grid(fmt):
     """The non-negative values of a format, ascending."""
-    if fmt == "int8":
-        return np.arange(128, dtype=np.float32)
+    if fmt in ("int8", "int4"):
+        return np.arange(int(QMAX[fmt]) + 1, dtype=np.float32)
     v = torch.arange(256, dtype=torch.int32).to(torch.uint8).view(FP8[fmt]).float().numpy()
     v = v[np.isfinite(v) & (v >= 0)]
     return np.unique(v[v <= QMAX[fmt]])
@@ -188,7 +227,7 @@ def tie_data(fmt, g, units=400, seed=0):
     return np.concatenate(out)
 
 
-@pytest.mark.parametrize("fmt,g", [("fp8_e4m3", 32), ("fp8_e5m2", 32), ("int8", 32)])
+@pytest.mark.parametrize("fmt,g", [("fp8_e4m3", 32), ("fp8_e5m2", 32), ("int8", 32), ("int4", 32)])
 def test_scaled_ties(fmt, g):
     x = tie_data(fmt, g)
     q, scale, _ = host(fmt, x, g)
@@ -204,3 +243,20 @@ def test_nvfp4_ties():
     q, _, bits = host("nvfp4", x, 16, 1.0)
     rq, _, rbits = recipe(torch.from_numpy(x), 16, "nvfp4", 1.0)
     assert same(q, rq) and same(bits, rbits)
+
+
+def test_uint4_ties():
+    # Units spanning [-a, b]: x / scale + zero lands on half-integers.
+    rng = np.random.default_rng(3)
+    out = []
+    for _ in range(400):
+        a, b = (np.float32(10.0 ** rng.uniform(-3, 3)) for _ in range(2))
+        scale = np.float32((np.float32(b) + np.float32(a)) / np.float32(15.0))
+        k = rng.integers(0, 15, 30) + 0.5
+        z = np.float32(np.round(a / scale))
+        vals = ((k - z) * scale).astype(np.float32)
+        out.append(np.r_[-a, b, vals].astype(np.float32))
+    x = np.concatenate(out)
+    q, scale, bits = host("uint4", x, 32)
+    rq, rscale, rbits = recipe(torch.from_numpy(x), 32, "uint4")
+    assert same(q, rq) and same(scale, rscale) and same(bits, rbits)

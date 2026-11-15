@@ -82,6 +82,10 @@ Read `why` in the decisions:
 ## Resources
 
 - `CE_STAGING_MB` caps device staging (default 256 MB, allocated on demand).
+- Quantization shows strategy `tile` (one kernel; over pinned host memory,
+  zero-copy) or `tile_staged` (through device staging); pure device copies
+  of 1 MB and more may show `bulk`, with `st["cuda"][i]["bulk"]` saying
+  `"tma"`, `"cp.async"`, or why it is unavailable.
 - `Engine(max_sms=N)` / `CE_MAX_SMS`: `st["cuda"][i]["sm_limit"]` says whether
   the limit is hard (green context, verified) or soft (thread-block cap).
 - `scope(bandwidth=...)`: limited groups show strategy `paced` and the

@@ -130,7 +130,8 @@ __device__ __forceinline__ void bytes_one(Chunk c, int lane) {
 // pitches) take the plain warp copy. Other architectures: the plain copy (the
 // executor only offers this kernel where it was admitted).
 
-constexpr int kSeg = 16384;
+constexpr int kSeg = 8192;   // bytes per segment
+constexpr int kBufs = 4;     // segments in flight per block
 
 struct Segs {  // the segments of one chunk
   const Chunk& c;
@@ -185,17 +186,16 @@ __device__ __forceinline__ void async16(void* sm, long long g) {
 
 extern "C" __global__ void __launch_bounds__(32) ce_bytes_bulk(const Chunk* __restrict__ chunks, int n,
                                                                long long sadd, long long dadd) {
-  __shared__ alignas(128) unsigned char buf[2][kSeg];
+  __shared__ alignas(128) unsigned char buf[kBufs][kSeg];
   const int lane = threadIdx.x & 31;
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-  __shared__ alignas(8) unsigned long long bar[2];
-  unsigned phase[2] = {0, 0};
+  __shared__ alignas(8) unsigned long long bar[kBufs];
+  unsigned phase[kBufs] = {0, 0, 0, 0};
   if (lane == 0) {
-    mbar_init(&bar[0]), mbar_init(&bar[1]);
+    for (int b = 0; b < kBufs; ++b) mbar_init(&bar[b]);
     asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
   }
   __syncwarp();
-  unsigned cnt = 0;
 #endif
   for (int w = blockIdx.x; w < n; w += gridDim.x) {
     Chunk c = chunks[w];
@@ -205,47 +205,61 @@ extern "C" __global__ void __launch_bounds__(32) ce_bytes_bulk(const Chunk* __re
       continue;
     }
     const Segs sg{c, (c.width + kSeg - 1) / kSeg};
+    const long long count = sg.count();
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    // Up to kBufs loads in flight; a buffer is reloaded once its store has read it.
     if (lane == 0) {
-      for (long long i = 0; i < sg.count(); ++i, ++cnt) {
+      auto load = [&](long long i) {
         long long s, d;
         unsigned len;
         sg.at(i, &s, &d, &len);
-        const unsigned b = cnt & 1u;
-        asm volatile("cp.async.bulk.wait_group.read 1;" ::: "memory");  // buffer b's last store has read it
+        const int b = static_cast<int>(i % kBufs);
         mbar_expect(&bar[b], len);
         tma_load(buf[b], s, len, &bar[b]);
+      };
+      for (long long i = 0; i < count && i < kBufs; ++i) load(i);
+      for (long long i = 0; i < count; ++i) {
+        const int b = static_cast<int>(i % kBufs);
         mbar_wait(&bar[b], phase[b]);
         phase[b] ^= 1u;
+        long long s, d;
+        unsigned len;
+        sg.at(i, &s, &d, &len);
         tma_store(d, buf[b], len);
+        if (i + kBufs < count) {
+          asm volatile("cp.async.bulk.wait_group.read 0;" ::: "memory");  // buffer b read by its store
+          load(i + kBufs);
+        }
       }
+      asm volatile("cp.async.bulk.wait_group.read 0;" ::: "memory");  // buffers free for the next chunk
     }
+    __syncwarp();
 #elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-    const long long count = sg.count();
-    auto issue = [&](long long i, int b) {
+    auto issue = [&](long long i) {
       long long s, d;
       unsigned len;
       sg.at(i, &s, &d, &len);
-      for (unsigned o = lane * 16u; o < len; o += 512u) async16(buf[b] + o, s + o);
-      asm volatile("cp.async.commit_group;" ::: "memory");
+      unsigned char* b = buf[i % kBufs];
+      for (unsigned o = lane * 16u; o < len; o += 512u) async16(b + o, s + o);
     };
-    if (count > 0) issue(0, 0);
+    for (long long i = 0; i < kBufs - 1; ++i) {  // kBufs - 1 segments ahead (empty groups past the end)
+      if (i < count) issue(i);
+      asm volatile("cp.async.commit_group;" ::: "memory");
+    }
     for (long long i = 0; i < count; ++i) {
-      const int b = static_cast<int>(i & 1);
-      if (i + 1 < count) {
-        issue(i + 1, b ^ 1);
-        asm volatile("cp.async.wait_group 1;" ::: "memory");
-      } else {
-        asm volatile("cp.async.wait_group 0;" ::: "memory");
-      }
+      if (i + kBufs - 1 < count) issue(i + kBufs - 1);
+      asm volatile("cp.async.commit_group;" ::: "memory");
+      asm volatile("cp.async.wait_group %0;" ::"n"(kBufs - 1) : "memory");  // segment i has landed
       __syncwarp();
       long long s, d;
       unsigned len;
       sg.at(i, &s, &d, &len);
+      const unsigned char* b = buf[i % kBufs];
       for (unsigned o = lane * 16u; o < len; o += 512u)
-        *reinterpret_cast<uint4*>(static_cast<uintptr_t>(d + o)) = *reinterpret_cast<const uint4*>(buf[b] + o);
+        *reinterpret_cast<uint4*>(static_cast<uintptr_t>(d + o)) = *reinterpret_cast<const uint4*>(b + o);
       __syncwarp();
     }
+    asm volatile("cp.async.wait_group 0;" ::: "memory");
 #else
     bytes_one<false>(c, lane);
 #endif

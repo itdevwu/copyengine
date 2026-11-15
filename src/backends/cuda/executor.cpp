@@ -298,7 +298,8 @@ class CudaExecutor final : public Executor {
         if (s.batch) c.push_back(Strategy::batch);
         c.push_back(Strategy::runs);
         if (rects <= 2) std::stable_partition(c.begin(), c.end(), [](Strategy x) { return x == Strategy::runs; });
-        if (!s.bulk.empty() && g.bytes() >= kBulkMinBytes) c.push_back(Strategy::bulk);  // measured like the rest
+        // Large groups: first among the candidates, so the shortlist keeps it (measured like the rest).
+        if (!s.bulk.empty() && g.bytes() >= kBulkMinBytes) c.insert(c.begin(), Strategy::bulk);
       } else if (src_cuda && dst_cuda) {
         if (s.batch) c.push_back(Strategy::batch);
         c.push_back(Strategy::runs);

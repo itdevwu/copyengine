@@ -223,7 +223,12 @@ NB_MODULE(_core, m) {
       .def_rw("x", &ce::TileSpec::x)
       .def_rw("q", &ce::TileSpec::q)
       .def_rw("scale", &ce::TileSpec::scale)
-      .def_rw("zero", &ce::TileSpec::zero);
+      .def_rw("zero", &ce::TileSpec::zero)
+      .def("set_index", [](ce::TileSpec& t, bool x_side, uintptr_t dev, const std::vector<int64_t>& host,
+                           int64_t bound) {
+        ce::TileSpec::Index& ix = x_side ? t.x_index : t.index;
+        ix.dev = dev, ix.host = host, ix.bound = bound;
+      }, "x_side"_a, "dev"_a, "host"_a, "bound"_a);
 
   nb::class_<ce::Stmt>(m, "Stmt")
       .def(nb::init<ce::Access, ce::Access>(), "dst"_a, "src"_a)

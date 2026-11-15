@@ -21,7 +21,7 @@ def _cycles():
     t = time.perf_counter()
     torch.cuda._sleep(10_000_000)
     torch.cuda.synchronize()
-    return int(10_000_000 * BUSY_S / max(time.perf_counter() - t, 1e-4))
+    return 2 * int(10_000_000 * BUSY_S / max(time.perf_counter() - t, 1e-4))  # margin: clocks vary
 
 
 CYCLES = None

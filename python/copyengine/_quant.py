@@ -117,20 +117,32 @@ def _scale_out(scale, fmt):
     return scale.view(torch.uint8) if fmt.startswith("mx") or fmt == "nvfp4" else scale
 
 
-def native_quantize(x, q, scale, zero, fmt, g, eps, gs):
-    codes, s, bits = quantize(x, g, fmt, eps, gs)
-    q.view(torch.uint8).copy_(codes.view(q.shape), non_blocking=True)
+def _rows(t, idx):
+    """The rows of `t` an index selects (all of them without one)."""
+    return t if idx is None else t.index_select(0, idx.to(t.device))
+
+
+def _write_rows(t, idx, v):
+    if idx is None:
+        t.copy_(v.view(t.shape).to(t.dtype), non_blocking=True)
+    else:
+        t.index_copy_(0, idx.to(t.device), v.view((len(idx),) + tuple(t.shape[1:])).to(t.device, t.dtype))
+
+
+def native_quantize(x, q, scale, zero, fmt, g, eps, gs, x_index=None, index=None):
+    codes, s, bits = quantize(_rows(x, x_index), g, fmt, eps, gs)
+    _write_rows(q.view(torch.uint8), index, codes)
     if s is not None:
-        scale.copy_(s.view(scale.shape), non_blocking=True)
+        _write_rows(scale, index, s)
     if fmt == "uint4":
-        zero.copy_(bits.view(zero.shape), non_blocking=True)
+        _write_rows(zero, index, bits)
     elif bits is not None:
-        _scale_out(scale, fmt).copy_(bits.view(scale.shape), non_blocking=True)
+        _write_rows(_scale_out(scale, fmt), index, bits)
 
 
-def native_dequantize(q, scale, zero, out, fmt, g, gs):
-    codes = q.view(torch.uint8).reshape(-1)
-    s = scale.reshape(-1) if scale.dtype == torch.float32 else None
-    bits = zero.reshape(-1) if fmt == "uint4" else (None if s is not None else scale.view(torch.uint8).reshape(-1))
-    y = dequantize(codes, s, bits, g, fmt, gs)
-    out.copy_(y.view(out.shape).to(out.dtype), non_blocking=True)
+def native_dequantize(q, scale, zero, out, fmt, g, gs, x_index=None, index=None):
+    codes = _rows(q.view(torch.uint8), index).reshape(-1)
+    sc = _rows(_scale_out(scale, fmt), index)
+    s = sc.reshape(-1) if scale.dtype == torch.float32 else None
+    bits = _rows(zero, index).reshape(-1) if fmt == "uint4" else (None if s is not None else sc.reshape(-1))
+    _write_rows(out, x_index, dequantize(codes, s, bits, g, fmt, gs))

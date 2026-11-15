@@ -642,17 +642,29 @@ struct Engine::Impl {
       if (!(s->ep.device == dev)) fail(Errc::unsupported, "quantization tensors must be on one device");
     if (zero && !(t.zero.ep.device == dev)) fail(Errc::unsupported, "quantization tensors must be on one device");
 
+    for (const TileSpec::Index* ix : {&t.x_index, &t.index}) {
+      if (!ix->used()) continue;
+      if (ix->dev && dev.kind != DeviceKind::cuda) fail(Errc::unsupported, "GPU index tables need GPU tensors");
+      if (!ix->dev && static_cast<int64_t>(ix->host.size()) != t.rows[0])
+        fail(Errc::invalid_argument, "an index table's length is not rows[0]");
+      for (int64_t v : ix->host)
+        if (v < 0 || v >= ix->bound) fail(Errc::invalid_argument, "index out of range");
+    }
     const int64_t vals = t.upr * t.g;
     const auto bound = [](const TileSpec::Side& s, std::pair<int64_t, int64_t> e, const char* what) {
       const int64_t b = static_cast<int64_t>(s.ep.base);
       if (e.first < b || e.second > b + s.ep.nbytes) fail(Errc::invalid_argument, std::string(what) + " out of bounds");
       return e;
     };
-    const auto xr = bound(t.x, tile_extent(t, t.x, vals, static_cast<int64_t>(itemsize(xd))), "x");
-    const auto qr = bound(t.q, tile_extent(t, t.q, packed ? vals / 2 : vals, 1), "q");
-    const auto sr = bound(t.scale, tile_extent(t, t.scale, t.upr, byte_scale ? 1 : 4), "scale");
+    // An indexed side may touch any row its index can reach: its whole bound.
+    TileSpec tx = t, tc = t;
+    if (t.x_index.used()) tx.rows[0] = t.x_index.bound;
+    if (t.index.used()) tc.rows[0] = t.index.bound;
+    const auto xr = bound(t.x, tile_extent(tx, t.x, vals, static_cast<int64_t>(itemsize(xd))), "x");
+    const auto qr = bound(t.q, tile_extent(tc, t.q, packed ? vals / 2 : vals, 1), "q");
+    const auto sr = bound(t.scale, tile_extent(tc, t.scale, t.upr, byte_scale ? 1 : 4), "scale");
     std::pair<int64_t, int64_t> zr{0, 0};
-    if (zero) zr = bound(t.zero, tile_extent(t, t.zero, t.upr, 1), "zero");
+    if (zero) zr = bound(t.zero, tile_extent(tc, t.zero, t.upr, 1), "zero");
 
     auto k = std::make_shared<cv::TileK>();
     auto at = [](const TileSpec::Side& s) { return static_cast<long long>(s.ep.base) + s.offset; };
@@ -665,6 +677,19 @@ struct Engine::Impl {
     k->xe = t.x.step, k->qe = t.q.step, k->se = t.scale.step, k->ze = zero ? t.zero.step : 0;
     k->g = t.g, k->upr = static_cast<int>(t.upr), k->fmt = t.fmt, k->xdt = static_cast<int>(xd);
     k->scale_byte = byte_scale, k->quantize = t.quantize, k->eps = t.eps, k->gs = t.gs;
+    // Index tables: host values live with the op (the executor reads them, or
+    // uploads them for a kernel); GPU ones are this call's pointer.
+    std::shared_ptr<std::vector<int64_t>> hx, hc;
+    if (t.x_index.used()) {
+      k->xb = t.x_index.bound;
+      if (t.x_index.dev) k->xi = static_cast<long long>(t.x_index.dev);
+      else hx = std::make_shared<std::vector<int64_t>>(t.x_index.host), k->xi = reinterpret_cast<long long>(hx->data());
+    }
+    if (t.index.used()) {
+      k->cb = t.index.bound;
+      if (t.index.dev) k->ci = static_cast<long long>(t.index.dev);
+      else hc = std::make_shared<std::vector<int64_t>>(t.index.host), k->ci = reinterpret_cast<long long>(hc->data());
+    }
 
     const Side xs{dev, xd, t.x.ep.pinned}, qs{dev, qd, t.q.ep.pinned};
     exec_for(xs, qs);
@@ -684,6 +709,8 @@ struct Engine::Impl {
     op.extras.push_back({dev, sr.first, sr.second, t.quantize});
     if (zero) op.extras.push_back({dev, zr.first, zr.second, t.quantize});
     op.tile = std::move(k);
+    op.tile_index[0] = std::move(hx), op.tile_index[1] = std::move(hc);
+    op.tile_dev_index = t.x_index.dev || t.index.dev;
     op.opaque = true;
     op.ctx = hints.ctx;
     op.fp = fingerprint(op);

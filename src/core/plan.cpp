@@ -73,8 +73,12 @@ Hash128 fingerprint(const Op& op) {
   if (op.tile) {  // the whole description: tile ops are planned by their layout and addresses
     const cv::TileK& t = *op.tile;
     for (long long v : {t.x, t.q, t.s, t.z, t.rows[0], t.rows[1], t.rows[2], t.xr[0], t.xr[1], t.xr[2], t.qr[0], t.qr[1],
-                        t.qr[2], t.sr[0], t.sr[1], t.sr[2], t.zr[0], t.zr[1], t.zr[2], t.xe, t.qe, t.se, t.ze})
+                        t.qr[2], t.sr[0], t.sr[1], t.sr[2], t.zr[0], t.zr[1], t.zr[2], t.xe, t.qe, t.se, t.ze, t.xb, t.cb,
+                        static_cast<long long>(t.xi != 0), static_cast<long long>(t.ci != 0)})
       h.add(static_cast<uint64_t>(v));  // field by field: no padding bytes in the hash
+    // Index tables: host values are part of the plan; GPU table pointers are per call.
+    for (const auto& ix : op.tile_index)
+      if (ix) h.add(std::span<const i64>(*ix));
     for (int v : {t.g, t.upr, t.fmt, t.xdt, t.scale_byte, t.quantize}) h.add(static_cast<uint64_t>(v));
     h.add(std::bit_cast<uint32_t>(t.eps)), h.add(std::bit_cast<uint32_t>(t.gs));
   }

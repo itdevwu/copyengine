@@ -408,6 +408,9 @@ NB_MODULE(_core, m) {
 
   m.def("hardware_fingerprint", &ce::hardware_fingerprint);
   m.def("host_is_pinned", &ce::host_is_pinned, "ptr"_a);
+  // torch's float8_e4m3fn overflow mode (convert.hpp): set once at import, before any copy.
+  m.def("_set_f8e4m3_saturate", [](bool v) { ce::cv::f8e4m3_saturate = v ? 1 : 0; });
+  m.def("_f8e4m3_saturate", [] { return ce::cv::f8e4m3_saturate != 0; });
   // Address of the FrontendApi table handed to copyengine._torch.
   m.def("_frontend_api", [] { return reinterpret_cast<uintptr_t>(ce::frontend_api()); });
 

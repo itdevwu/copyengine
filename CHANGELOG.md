@@ -6,6 +6,12 @@ change incompatibly only in a new minor (0.x) or major release.
 
 ## Unreleased
 
+- Fix: torch 2.13 converts float -> float8_e4m3fn beyond the format
+  (|x| > 464, infinities) to +-448 instead of NaN, on the CPU and the GPU.
+  copyengine now follows the installed torch (detected at import), so copies
+  into float8_e4m3fn keep matching it bit for bit; with 0.4.0 they returned
+  NaN there under torch 2.13. Quantization is unaffected (its recipes clamp
+  first).
 - Prebuilt interception shims for torch 2.12.0, 2.12.1 and 2.13.0 (with
   2.9.1, 2.10.0 and 2.11.0): those install without a C++ compiler. CI tests
   torch 2.12 and 2.13, and the explicit API's ops built against 2.11 on 2.13.

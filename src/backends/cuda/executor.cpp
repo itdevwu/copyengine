@@ -765,6 +765,14 @@ class CudaExecutor final : public Executor {
     }
     s.kernels = true;  // provisionally, so the verification can launch
     try {
+      {  // the float8_e4m3fn overflow mode of the installed torch (convert.hpp)
+        CUdeviceptr g = 0;
+        size_t sz = 0;
+        check(d_->cuModuleGetGlobal(&g, &sz, s.mod, "ce_f8e4m3_saturate"), "cuModuleGetGlobal");
+        const int sat = cv::f8e4m3_saturate;
+        check(d_->cuMemcpyHtoDAsync(g, &sat, sizeof(sat), s.side), "cuMemcpyHtoDAsync");
+        check(d_->cuStreamSynchronize(s.side), "cuStreamSynchronize");  // admission: `sat` is on the stack
+      }
       const int n = 1000;
       std::vector<float> in(n);
       for (int i = 0; i < n; ++i) in[i] = static_cast<float>(i) * 0.37f - 100.0f;

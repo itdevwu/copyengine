@@ -16,7 +16,20 @@
 #define CE_HD inline
 #endif
 
+// torch's float -> float8_e4m3fn for values beyond the format (|x| >= 464 and
+// infinities): NaN up to torch 2.12, the largest finite value (+-448) from
+// torch 2.13; NaN stays NaN. Copies follow the installed torch: the frontend
+// sets the mode once at import, before any copy, and the CUDA executor writes
+// it into the kernels' module when it loads them.
+#if defined(__CUDACC__)
+extern "C" __device__ int ce_f8e4m3_saturate = 0;
+#endif
+
 namespace ce::cv {
+
+#if !defined(__CUDA_ARCH__)
+extern int f8e4m3_saturate;  // src/core/types.cpp
+#endif
 
 struct half_t { uint16_t bits; };
 struct bf16_t { uint16_t bits; };
@@ -108,7 +121,7 @@ CE_HD uint8_t float_to_f8e4m3(float f) {
   const uint32_t sign = b & 0x80000000u;
   b ^= sign;
   uint8_t r;
-  if (b >= (1087u << 20)) {  // >= 464, inf, NaN
+  if (b >= (1087u << 20)) {  // >= 480, inf, NaN ([464, 480) rounds to 0x7F below)
     r = 0x7F;
   } else if (b < (121u << 23)) {  // below 2^-6: subnormal, rounded by an fp32 add
     const uint32_t denorm = 141u << 23;
@@ -118,6 +131,12 @@ CE_HD uint8_t float_to_f8e4m3(float f) {
     b += (static_cast<uint32_t>(7 - 127) << 23) + 0x7FFFFu + odd;
     r = static_cast<uint8_t>(b >> 20);
   }
+#if defined(__CUDA_ARCH__)
+  const int sat = ce_f8e4m3_saturate;
+#else
+  const int sat = f8e4m3_saturate;
+#endif
+  if (sat && r == 0x7F && (f2u(f) & 0x7FFFFFFFu) <= 0x7F800000u) r = 0x7E;  // beyond the format, not NaN: +-448
   return static_cast<uint8_t>(r | (sign >> 24));
 }
 

@@ -52,6 +52,7 @@ namespace ce::cuda {
   X(cuPointerGetAttribute)      \
   X(cuModuleLoadData)           \
   X(cuModuleGetFunction)        \
+  X(cuModuleGetGlobal)          \
   X(cuLaunchKernel)
 
 // Present only on newer drivers; null when missing.

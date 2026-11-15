@@ -168,9 +168,14 @@ step(caches, pool, block_ids)                  # block_ids: a CUDA int64 tensor,
 
 `ce.plan(step)` (or `eng.plan`) traces `step` per argument layout until the
 engine has settled, then replays its copies without running `step` or
-planning: CUDA int64 index tensors are read anew on every call, and every
-other tensor the copies touch must be an argument and the same buffer (a new
-buffer or shape traces again). Only the copies replay, so a step should only
+planning. Index arguments are read anew on every call: CUDA int64 tensors
+directly, and host indices (numpy arrays, lists of ints, CPU integer tensors)
+when the step passes them straight to `ce.gather`, `ce.scatter_` or
+`ce.lazy(...).index_select` (indices the step computes from them are guarded
+by value instead). For host indices two strategies are measured against each
+other: DMA descriptors built at each call, and the statement kernel reading
+the indices on the GPU. Every other tensor the copies touch must be an
+argument and the same buffer (a new buffer or shape traces again). Only the copies replay, so a step should only
 copy. A replay is kept only where it beats running `step` plainly.
 `eng.freeze()` / `plan.run()` replays the last flush exactly (same buffers,
 same indices).

@@ -224,6 +224,7 @@ NB_MODULE(_core, m) {
       }, "kind"_a, "index"_a, "base"_a, "nbytes"_a, "dtype"_a, "pinned"_a = false)
       .def_prop_ro("base", [](const ce::Endpoint& e) { return e.base; })
       .def_prop_ro("nbytes", [](const ce::Endpoint& e) { return e.nbytes; })
+      .def_prop_ro("pinned", [](const ce::Endpoint& e) { return e.pinned; })
       .def_prop_ro("dtype", [](const ce::Endpoint& e) { return std::string(ce::dtype_name(e.dtype)); });
 
   nb::class_<ce::Elementwise>(m, "Elementwise")

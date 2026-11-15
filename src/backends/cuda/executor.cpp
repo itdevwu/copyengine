@@ -118,6 +118,15 @@ struct FusedBatch {
   // Device index tables: their pointers change per call, so the bases go to
   // the device each call; members[i]: position in the group of bases[i].
   bool device_tables = false;
+  // Tables in host memory (step plan parameters): each call packs their values
+  // into a device mirror (per stream) the kernel reads with step 1.
+  bool stab_host = false, dtab_host = false;
+  struct Mirror {
+    CUstream stream{};
+    std::shared_ptr<void> table;  // DevTable
+    size_t words = 0;
+  };
+  std::vector<Mirror> mirrors;
   std::vector<int> members;
   std::vector<BaseEntry> recent;                // eager: bases of recent pointer sets (see current_bases)
   uint64_t clock = 0;
@@ -255,11 +264,17 @@ class CudaExecutor final : public Executor {
   std::vector<Strategy> candidates(const Group& g) override {
     const int di = device_of(g);
     Dev& s = state(di);
-    if (g.opaque()) {  // device indices: only the statement kernel can run it
-      if (!s.kernels || !fused_plan(g).ok)
-        fail(Errc::unsupported, "copies with device indices need the statement kernel: " +
-                                    (s.kernels ? std::string("this layout is not supported") : s.kernel_error));
-      return {Strategy::fused};
+    if (g.opaque()) {  // indices read at run time: the statement kernel, or (host tables) DMA expanded per run
+      std::vector<Strategy> c;
+      if (g.pure() && host_tables_only(g)) c.push_back(Strategy::lowered);
+      const bool sc = g.src.device.kind == DeviceKind::cuda, dc = g.dst.device.kind == DeviceKind::cuda;
+      const bool host_ok = (sc || g.src.pinned) && (dc || g.dst.pinned);
+      if (s.kernels && fused_plan(g).ok && ((sc && dc) || (host_ok && zero_copy_ok(s)))) c.push_back(Strategy::fused);
+      if (c.empty())
+        fail(Errc::unsupported, "copies with indices read at run time need the statement kernel (" +
+                                    (s.kernels ? std::string("this layout or memory is not supported") : s.kernel_error) +
+                                    ") or, for host index tables, a pure copy");
+      return c;
     }
     const bool src_cuda = g.src.device.kind == DeviceKind::cuda, dst_cuda = g.dst.device.kind == DeviceKind::cuda;
     const bool same_dev = src_cuda && dst_cuda && g.src.device.index == g.dst.device.index;
@@ -328,6 +343,8 @@ class CudaExecutor final : public Executor {
         const auto& P = *static_cast<const FusedPlan*>(slot.get());
         // Resident tables are built on first use (a host wait); device-table
         // bases are written by kernel nodes of the capture itself.
+        if (g.opaque() && std::any_of(g.forms.begin(), g.forms.end(), [](const auto& f) { return f->host_tables(); }))
+          return false;  // host index values would be baked into the graph
         const Dev& s = devs_[di];
         size_t need = 0;
         for (const FusedBatch& b : P.batches)
@@ -367,6 +384,7 @@ class CudaExecutor final : public Executor {
       case Strategy::bounce: return bounce(s, g.src, g.dst, cached_rows(g, Strategy::bounce), st);
       case Strategy::fused: return fused(s, g, ops, st);
       case Strategy::paced: return paced(s, g, st);
+      case Strategy::lowered: return lowered(s, g, ops, st);
       default: fail(Errc::unsupported, "CUDA backend cannot run strategy " + std::string(strategy_name(strat)));
     }
   }
@@ -1178,9 +1196,11 @@ class CudaExecutor final : public Executor {
   // Writes `bases` to device memory at `dst` in stream order, from kernel
   // parameters: no host buffer, no host wait.
   void put(Dev& s, CUdeviceptr dst, const std::vector<Base>& bases, CUstream st) {
-    const size_t words = bases.size() * sizeof(Base) / 8;
+    put_words(s, dst, reinterpret_cast<const unsigned long long*>(bases.data()), bases.size() * sizeof(Base) / 8, st);
+  }
+
+  void put_words(Dev& s, CUdeviceptr dst, const unsigned long long* w, size_t words, CUstream st) {
     CUfunction f = function(s, "ce_put");
-    const auto* w = reinterpret_cast<const unsigned long long*>(bases.data());
     for (size_t at = 0; at < words; at += kPutWords) {
       Put p{};
       p.dst = dst + at * 8;
@@ -1189,6 +1209,76 @@ class CudaExecutor final : public Executor {
       void* args[] = {&p};
       check(d_->cuLaunchKernel(f, 1, 1, 1, 128, 1, 1, 0, st, args, nullptr), "cuLaunchKernel ce_put");
     }
+  }
+
+  // Host index tables of a batch: their current values (checked against the
+  // bounds here) go to the batch's device mirror for this stream through
+  // kernel parameters, read on the host now, so the caller may overwrite its
+  // buffer as soon as the call returns; the bases point into the mirror.
+  void pack_host_tables(Dev& s, FusedBatch& b, const Group& g, const std::vector<Op>& ops, std::vector<Base>& bases,
+                        CUstream st) {
+    const StmtDesc& d = b.desc;
+    const Form& f0 = *g.forms[b.members[0]];
+    const i64 ns = b.stab_host ? f0.shape[f0.stab_dim] : 0, nd = b.dtab_host ? f0.shape[f0.dtab_dim] : 0;
+    std::vector<unsigned long long> w;
+    w.reserve(bases.size() * static_cast<size_t>(ns + nd));
+    auto take = [&](uintptr_t p, i64 n, i64 step, i64 bound) {
+      const auto* v = reinterpret_cast<const int64_t*>(p);
+      for (i64 i = 0; i < n; ++i) {
+        const int64_t x = v[i * step];
+        if (x < 0 || x >= bound) fail(Errc::invalid_argument, "a host index table held an index out of range");
+        w.push_back(static_cast<unsigned long long>(x));
+      }
+    };
+    for (size_t i = 0; i < bases.size(); ++i) {
+      const Op& op = ops[g.ops[b.members[i]]];
+      if (b.stab_host) take(op.stab, ns, op.form->stab_step, d.sbound);
+      if (b.dtab_host) take(op.dtab, nd, op.form->dtab_step, d.dbound);
+    }
+    FusedBatch::Mirror* m = nullptr;
+    for (auto& x : b.mirrors)
+      if (x.stream == st) m = &x;
+    if (!m) {
+      if (b.mirrors.size() == kLanes) b.mirrors.erase(b.mirrors.begin());  // freed in order after its users
+      m = &b.mirrors.emplace_back();
+      m->stream = st;
+    }
+    if (m->words < w.size()) {
+      auto t = std::make_shared<DevTable>();
+      t->owner = this, t->device = s.index, t->alive = alive_, t->count = w.size();
+      t->mem = dev_alloc(s, w.size() * 8, "host index mirror");
+      t->ptr = t->mem.ptr;
+      m->table = t, m->words = w.size();
+    }
+    const CUdeviceptr base = static_cast<DevTable*>(m->table.get())->ptr;
+    put_words(s, base, w.data(), w.size(), st);
+    size_t at = 0;
+    for (Base& x : bases) {
+      if (b.stab_host) x.stab = base + at * 8, at += static_cast<size_t>(ns);
+      if (b.dtab_host) x.dtab = base + at * 8, at += static_cast<size_t>(nd);
+    }
+  }
+
+  static bool host_tables_only(const Group& g) {
+    return !g.forms.empty() && std::all_of(g.forms.begin(), g.forms.end(), [](const auto& f) {
+             return (f->stab_dim < 0 || f->stab_host) && (f->dtab_dim < 0 || f->dtab_host) && f->host_tables();
+           });
+  }
+
+  // Host index tables expanded into copy descriptors now (DMA; pure copies).
+  int64_t lowered(Dev& s, const Group& g, const std::vector<Op>& ops, CUstream st) {
+    const size_t isz = itemsize(g.src.dtype);
+    std::vector<Raw> raws;
+    for (int k : g.ops) {
+      const Op& op = ops[k];
+      const Runs r = lower_form(*op.form, reinterpret_cast<const int64_t*>(op.stab),
+                                reinterpret_cast<const int64_t*>(op.dtab));
+      for (size_t i = 0; i < r.size(); ++i)
+        raws.push_back({static_cast<uintptr_t>(r.src[i]) * isz, static_cast<uintptr_t>(r.dst[i]) * isz,
+                        static_cast<size_t>(r.len[i]) * isz});
+    }
+    copy_raws(s, g.src, g.dst, raws, st);
+    return static_cast<int64_t>(raws.size());
   }
 
   // Eager calls: the bases of the last few pointer sets stay on the device, so
@@ -1349,7 +1439,9 @@ class CudaExecutor final : public Executor {
     if (g.forms.empty()) return P;
     const bool src_cuda = g.src.device.kind == DeviceKind::cuda, dst_cuda = g.dst.device.kind == DeviceKind::cuda;
     if (src_cuda && dst_cuda && g.src.device.index != g.dst.device.index) return P;
-    P.cross = !(src_cuda && dst_cuda);
+    // Copies with host index tables read or write host memory directly
+    // (zero-copy, admitted in candidates()), never through staging.
+    P.cross = !(src_cuda && dst_cuda) && !g.opaque();
     P.h2d = dst_cuda;
     const int mode = g.pure() ? 0 : (g.fn.identity() ? 1 : 2);
     std::vector<const Form*> reps;
@@ -1374,6 +1466,9 @@ class CudaExecutor final : public Executor {
         b.desc.sbound = f.sbound, b.desc.dbound = f.dbound;
         b.desc.err = 0;
         b.device_tables = f.device_tables();
+        b.stab_host = f.stab_dim >= 0 && f.stab_host, b.dtab_host = f.dtab_dim >= 0 && f.dtab_host;
+        if (b.stab_host) b.desc.stab_step = 1;  // packed in the mirror
+        if (b.dtab_host) b.desc.dtab_step = 1;
         if (!b.device_tables) transpose_dims(f, &b.tile_a, &b.tile_b);
         b.desc.vec = 1;
         P.batches.push_back(std::move(b));
@@ -1478,6 +1573,7 @@ class CudaExecutor final : public Executor {
           const Op& op = ops[g.ops[b.members[i]]];
           bases[i].stab = op.stab, bases[i].dtab = op.dtab;
         }
+        if (b.stab_host || b.dtab_host) pack_host_tables(s, const_cast<FusedBatch&>(b), g, ops, bases, st);
         if (capturing(reinterpret_cast<uintptr_t>(st))) {  // the graph owns these bases
           const CUdeviceptr t = captured_bases(s, bases, st);
           launch_stmt(t, bases.size(), b, fn, P.h2d ? add : 0, P.h2d ? 0 : add, s, st);

@@ -405,7 +405,7 @@ Access Access::index_select(int dim, std::span<const i64> index) const {
 Access Access::index_select_device(int dim, uintptr_t ptr, i64 n, int device) const {
   dim = norm_dim(dim, rank());
   const Term& t = terms_[dim];
-  require(n >= 0 && (ptr != 0 || n == 0), "index_select: bad device index table");
+  require(n >= 0 && (ptr != 0 || n == 0) && device >= DeviceTable::kHost, "index_select: bad device index table");
   if (n == 0) {  // no indices: an empty dimension, nothing to read (an empty tensor has no pointer)
     std::vector<Term> terms = terms_;
     terms[dim] = {0, t.stride, nullptr};

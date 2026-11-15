@@ -88,14 +88,17 @@ Rects recover_2d(const Runs& runs, int min_height = 2, std::span<const i64> src_
 
 using Table = std::shared_ptr<const std::vector<i64>>;
 
-// Indices that live in device memory: entry i is the int64 at
-// ptr + i * step * 8 on `device`, valid in [0, bound). Their values are
-// never known on the host: kernels read them.
+// Indices read when the copy runs, not when it is planned: entry i is the
+// int64 at ptr + i * step * 8, valid in [0, bound). On `device` >= 0 they
+// live in that GPU's memory (kernels read them); device == kHost: in host
+// memory (a step plan's index parameter), read by the executor at each run.
 struct DeviceTable {
-  uintptr_t ptr = 0;  // 0: not a device table
+  static constexpr int kHost = -1;
+  uintptr_t ptr = 0;  // 0: not a table
   i64 step = 1;
   i64 bound = 0;
   int device = 0;
+  bool host() const { return device == kHost; }
   bool operator==(const DeviceTable&) const = default;
 };
 
@@ -136,8 +139,9 @@ class Access {
   Access select(int dim, i64 index) const;
   Access flip(int dim) const;
   Access index_select(int dim, std::span<const i64> index) const;
-  // Indices in device memory (n int64 values at `ptr`, contiguous) on `device`.
-  // Only an affine dimension can be selected this way.
+  // Indices read at run time (n int64 values at `ptr`, contiguous) in the
+  // memory of `device` (DeviceTable::kHost: host memory). Only an affine
+  // dimension can be selected this way.
   Access index_select_device(int dim, uintptr_t ptr, i64 n, int device) const;
   Access unsqueeze(int dim) const;
   Access expand(int dim, i64 n) const;           // size-1 dim -> stride 0 (source side only)

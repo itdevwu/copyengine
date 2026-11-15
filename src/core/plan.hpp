@@ -54,16 +54,25 @@ struct Form {
   // pointer is per call: Op::stab / Op::dtab); -1: none.
   int stab_dim = -1, dtab_dim = -1;
   i64 stab_step = 1, dtab_step = 1, sbound = 0, dbound = 0;
+  bool stab_host = false, dtab_host = false;  // the table is in host memory (DeviceTable::kHost)
   bool device_tables() const { return stab_dim >= 0 || dtab_dim >= 0; }
+  bool host_tables() const { return (stab_dim >= 0 && stab_host) || (dtab_dim >= 0 && dtab_host); }
   // Lowest / highest element index touched on each side.
   std::pair<i64, i64> src_extent() const;
   std::pair<i64, i64> dst_extent() const;
   bool same_structure(const Form& o) const {
     return rank == o.rank && shape == o.shape && ss == o.ss && ds == o.ds && sdt == o.sdt && ddt == o.ddt &&
            stab_dim == o.stab_dim && dtab_dim == o.dtab_dim && stab_step == o.stab_step &&
-           dtab_step == o.dtab_step && sbound == o.sbound && dbound == o.dbound;
+           dtab_step == o.dtab_step && sbound == o.sbound && dbound == o.dbound && stab_host == o.stab_host &&
+           dtab_host == o.dtab_host;
   }
 };
+// The runs a form with host tables reads now: `stab` / `dtab` are its tables'
+// host pointers (int64, the form's steps). Absolute element indices; the
+// innermost dimension stays one run where it is contiguous on both sides.
+// An index outside its bound is an error.
+Runs lower_form(const Form& f, const int64_t* stab, const int64_t* dtab);
+
 
 // An op's runs and their lazily computed byte intervals. Shared by every
 // queued copy of a cached statement, so a statement-cache hit copies nothing.

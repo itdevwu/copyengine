@@ -3,10 +3,13 @@
 ``plan = eng.plan(step)``; ``plan(*args)`` runs ``step(*args)``. The first
 calls for a given argument layout run the step with interception on until the
 engine has settled there; then its copies are frozen and later calls replay
-them without running the step's Python or the planner. CUDA int64 index
-tensors are parameters (a replay reads the new ones); every other tensor the
-copies touch must be the same buffer (else the step is traced again). A replay
-is kept only if it beats running the step as plain code (paired, end to end).
+them without running the step's Python or the planner. Index arguments are
+parameters (a replay reads the new ones): CUDA int64 tensors directly, host
+indices (numpy arrays, lists of ints, CPU integer tensors) through a pinned
+buffer the plan refills each call, when the step passes them straight to a ce
+index API. Every other tensor the copies touch must be the same buffer (else
+the step is traced again). A replay is kept only if it beats running the step
+as plain code (paired, end to end).
 """
 
 from __future__ import annotations
@@ -29,6 +32,52 @@ _tracing = threading.local()  # engine the module-level functions use during a t
 
 def tracing_engine():
     return getattr(_tracing, "engine", None)
+
+
+def param_for(obj):
+    """While a step traces: the pinned buffer standing for host index argument `obj`."""
+    params = getattr(_tracing, "params", None)
+    if not params:
+        return None
+    buf = params.get(id(obj))
+    if buf is not None:
+        _tracing.used.add(id(obj))
+    return buf
+
+
+def note_values() -> None:
+    """While a step traces: its copies took index values (not parameters)."""
+    if getattr(_tracing, "params", None) is not None:
+        _tracing.values += 1
+
+
+def _is_host_index(x) -> bool:
+    if isinstance(x, np.ndarray):
+        return x.ndim <= 1 and x.dtype.kind in "iu"
+    if isinstance(x, (list, tuple)):
+        return bool(x) and all(type(v) is int for v in x)
+    return _is_tensor(x) and not x.is_cuda and x.dim() <= 1 and not x.is_floating_point() and x.dtype is not torch.bool
+
+
+def _values(x) -> bytes:
+    if _is_tensor(x):
+        return x.detach().reshape(-1).to(torch.int64).numpy().tobytes()
+    return np.asarray(x, dtype=np.int64).reshape(-1).tobytes()
+
+
+def _fill(buf, x) -> None:
+    if _is_tensor(x):
+        buf.copy_(x.detach().reshape(-1))
+    else:
+        buf.numpy()[:] = np.asarray(x).reshape(-1)
+
+
+def _buffer(x):
+    n = x.numel() if _is_tensor(x) else len(x)
+    pin = torch.cuda.is_available()
+    buf = torch.empty(n, dtype=torch.int64, pin_memory=pin)
+    _fill(buf, x)
+    return buf
 
 
 def _flatten(args, kw) -> list:
@@ -68,9 +117,11 @@ def _describe(x):
     if isinstance(x, _TensorList):
         return ("L", x.n)
     if isinstance(x, np.ndarray):
-        return ("a", x.dtype.str, x.shape, x.tobytes())  # host indices: values select the plan
+        if _is_host_index(x):
+            return ("h", x.dtype.str, x.shape)  # a host index: values are parameters or guarded
+        return ("a", x.dtype.str, x.shape, x.tobytes())
     if isinstance(x, (list, tuple)):
-        return ("l", tuple(x))
+        return ("hl", len(x)) if _is_host_index(x) else ("l", tuple(x))
     if isinstance(x, (int, float, bool, str, type(None))) or isinstance(x, tuple):
         return ("v", x)
     raise TypeError(f"plan arguments must be tensors, lists of tensors, numpy arrays or scalars, "
@@ -80,12 +131,14 @@ def _describe(x):
 class _Trace:
     """One frozen layout: identities it needs, index tensors it rebinds."""
 
-    __slots__ = ("frozen", "ident", "tables", "site", "plain")
+    __slots__ = ("frozen", "ident", "tables", "params", "vguard", "site", "plain")
 
     def __init__(self):
         self.frozen = None
         self.ident: list = []   # (leaf index, storage pointer) that must not change
         self.tables: list = []  # (leaf index, traced pointer, bytes): device index parameters
+        self.params: list = []  # (leaf index, pinned buffer): host index parameters, refilled each call
+        self.vguard: list = []  # (leaf index, values): host indices whose values the plan depends on
         self.site = None        # replay-or-plain decision (a _Site)
         self.plain = None       # why this layout always runs plainly (None: it replays)
 
@@ -135,7 +188,8 @@ class StepPlan:
 
     @staticmethod
     def _matches(tr: _Trace, leaves) -> bool:
-        return all(leaves[i].untyped_storage().data_ptr() == p for i, p in tr.ident)
+        return (all(leaves[i].untyped_storage().data_ptr() == p for i, p in tr.ident)
+                and all(_values(leaves[i]) == v for i, v in tr.vguard))
 
     def _run(self, tr: _Trace, args, kw, leaves) -> None:
         from ._api import _Site  # noqa: F401  (decision logic shared with scope sites)
@@ -148,6 +202,8 @@ class StepPlan:
         if timed:
             ev0, t0 = _start()
         if kind == "replay":
+            for i, buf in tr.params:  # read on the host when the copies are issued: refilled at once
+                _fill(buf, leaves[i])
             stream = torch.cuda.current_stream().cuda_stream if torch is not None and torch.cuda.is_available() else 0
             rebinds = [(p, p + n, leaves[i].data_ptr()) for i, p, n in tr.tables]
             with e._lock:
@@ -170,12 +226,24 @@ class StepPlan:
         f0, r0 = e._e.flushes, e._e.tuning_runs
         prev_force, prev_tracing = e._force, tracing_engine()
         e._force = e._force or ("shim" if _shim.lib is not None else "mode")
+        cands = [i for i, x in enumerate(leaves) if _is_host_index(x)]
+        params = {id(leaves[i]): _buffer(leaves[i]) for i in cands} if torch is not None else {}
         _tracing.engine = e
         e._e.set_recording(True)
         try:
-            with e.scope():
-                self._step(*args, **kw)
+            for attempt in (0, 1):
+                _tracing.params, _tracing.used, _tracing.values = params, set(), 0
+                try:
+                    with e.scope():
+                        self._step(*args, **kw)
+                    break
+                except _core.Unsupported:
+                    if attempt or not params:
+                        raise
+                    params = {}  # host index tables this copy cannot take: index values instead
+            used, values = _tracing.used, _tracing.values
         finally:
+            _tracing.params = None
             e._e.set_recording(False)
             e._force, _tracing.engine = prev_force, prev_tracing
         flushes, quiet = e._e.flushes - f0, e._e.tuning_runs == r0
@@ -188,6 +256,11 @@ class StepPlan:
             if lay["warm"] < _Site.SETTLE:
                 return  # the engine is still tuning this step
             tr.frozen = e._e.freeze(rebindable=True)
+            for i in cands:
+                if id(leaves[i]) in used and not values:
+                    tr.params.append((i, params[id(leaves[i])]))
+                else:  # not a parameter (or the step derived indices from values): guarded by value
+                    tr.vguard.append((i, _values(leaves[i])))
             tr.plain = self._bind(tr, leaves)
             tr.site = _Site("replay")
             tr.site.settled = _Site.SETTLE  # the engine already settled while tracing
@@ -207,11 +280,12 @@ class StepPlan:
                 storages.setdefault((x.device.type == "cuda", x.device.index or 0, s.data_ptr()), (i, s.nbytes()))
         tables = set(tr.frozen.tables)
         for i, x in enumerate(leaves):
-            if _is_tensor(x) and x.is_cuda and x.data_ptr() in tables:
+            if _is_tensor(x) and x.is_cuda and x.data_ptr() in tables and not x.is_floating_point():
                 if x.dtype is not torch.int64 or not x.is_contiguous():
                     return "a CUDA index argument is not a contiguous int64 tensor"
                 tr.tables.append((i, x.data_ptr(), x.numel() * 8))
         table_ranges = [(p, p + n) for _, p, n in tr.tables]
+        table_ranges += [(b.data_ptr(), b.data_ptr() + b.numel() * 8) for _, b in tr.params]
         for p in tables:
             if not any(lo <= p < hi for lo, hi in table_ranges):
                 return "an index tensor the copies read is not an argument (or was converted inside the step)"
@@ -228,7 +302,7 @@ class StepPlan:
 def _same_leaf(a, b) -> bool:
     if isinstance(a, _TensorList):
         return a == b
-    return a is b and not isinstance(a, (np.ndarray, list))
+    return a is b and not isinstance(a, (np.ndarray, list)) and not _is_host_index(a)
 
 
 def _start():

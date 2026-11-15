@@ -6,6 +6,14 @@ change incompatibly only in a new minor (0.x) or major release.
 
 ## Unreleased
 
+- Step plans take host index arguments (numpy arrays, lists of ints, CPU
+  integer tensors) as parameters too: new values each call replay the same
+  plan. Two strategies compete for them in the tuner: `lowered` (DMA
+  descriptors built from the values at each run) and `fused` (values sent to
+  the GPU, host memory read or written directly by the statement kernel).
+- Fix: an engine whose copies all ran as torch's own never waited for them in
+  `synchronize()` (its devices were never set up), so an explicit copy into
+  host memory could return before the data arrived.
 - `ce.copy_many(dsts, srcs)`: a list of copies (one per layer, say) in one
   call into C++, planned together, instead of a Python loop of `copy_`.
 - Fixes: building with CUDA 13 headers (`cuMemcpyBatchAsync` lost a

@@ -1516,12 +1516,15 @@ class CudaExecutor final : public Executor {
       CUdeviceptr dev;
       long long host, len;
     };
+    // `v` is filled before taking sides: they point into its elements.
     std::vector<cv::TileK> v;
+    v.reserve(g.ops.size());
+    for (int k : g.ops) v.push_back(*ops[k].tile);
     std::vector<std::vector<TileSide>> sides;
+    sides.reserve(v.size());
     size_t total = 0;
-    for (int k : g.ops) {
-      v.push_back(*ops[k].tile);
-      sides.push_back(tile_sides(v.back(), ops[k]));
+    for (size_t i = 0; i < v.size(); ++i) {
+      sides.push_back(tile_sides(v[i], ops[g.ops[i]]));
       for (const TileSide& x : sides.back())
         if (x.host) total += (static_cast<size_t>(x.hi - x.lo) + 255) & ~size_t{255};
     }

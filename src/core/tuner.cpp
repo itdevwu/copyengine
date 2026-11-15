@@ -13,7 +13,7 @@ namespace ce {
 namespace {
 constexpr std::string_view kNames[kNumStrategies] = {"passthrough", "runs",  "runs_parallel", "batch", "kernel",
                                                      "staged",      "bounce", "fused",         "native",
-                                                     "paced",       "lowered", "tile"};
+                                                     "paced",       "lowered", "tile",          "bulk"};
 
 double median(std::vector<double> v) {
   if (v.empty()) return 0;

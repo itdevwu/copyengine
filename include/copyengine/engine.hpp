@@ -25,8 +25,9 @@ enum class Strategy : uint8_t {
   paced,          // CUDA: a bandwidth-limited group in chunks, a GPU pacing kernel before each (QoS)
   lowered,        // CUDA: host index tables expanded into DMA descriptors at each run
   tile,           // tile ops (quantization while copying): units of values (host loop, or one warp each)
+  bulk,           // CUDA: pure device copies through shared memory (TMA on sm90+, cp.async on sm80-89)
 };
-inline constexpr int kNumStrategies = 12;
+inline constexpr int kNumStrategies = 13;
 std::string_view strategy_name(Strategy s);
 Strategy parse_strategy(std::string_view name);
 

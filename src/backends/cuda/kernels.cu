@@ -119,6 +119,143 @@ __device__ __forceinline__ void bytes_one(Chunk c, int lane) {
   }
 }
 
+// ---- bulk copies through shared memory (sm80+: cp.async, sm90+: TMA) ------------------
+//
+// One warp per block per chunk; a chunk's rows are cut into segments of at
+// most kSeg bytes, moved global -> shared -> global through two buffers so the
+// next segment loads while the current one stores. On sm90+ one thread drives
+// it with TMA bulk copies (cp.async.bulk + mbarrier): few threads keep many
+// bytes in flight, which matters where copy kernels get few SMs (max_sms). On
+// sm80-89 the warp uses cp.async. Chunks not 16-byte aligned (address, width,
+// pitches) take the plain warp copy. Other architectures: the plain copy (the
+// executor only offers this kernel where it was admitted).
+
+constexpr int kSeg = 16384;
+
+struct Segs {  // the segments of one chunk
+  const Chunk& c;
+  long long per_row;
+  __device__ long long count() const { return c.rows * per_row; }
+  __device__ void at(long long i, long long* s, long long* d, unsigned* n) const {
+    const long long r = i / per_row, o = (i - r * per_row) * kSeg;
+    *s = c.src + r * c.spitch + o, *d = c.dst + r * c.dpitch + o;
+    *n = static_cast<unsigned>(min(static_cast<long long>(kSeg), c.width - o));
+  }
+};
+
+__device__ __forceinline__ unsigned smem_addr(const void* p) {
+  return static_cast<unsigned>(__cvta_generic_to_shared(p));
+}
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+__device__ __forceinline__ void mbar_init(unsigned long long* b) {
+  asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"(smem_addr(b)) : "memory");
+}
+__device__ __forceinline__ void mbar_expect(unsigned long long* b, unsigned bytes) {
+  asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(smem_addr(b)), "r"(bytes) : "memory");
+}
+__device__ __forceinline__ void mbar_wait(unsigned long long* b, unsigned phase) {
+  unsigned done = 0;
+  do {
+    asm volatile(
+        "{\n .reg .pred p;\n mbarrier.try_wait.parity.shared::cta.b64 p, [%1], %2;\n selp.u32 %0, 1, 0, p;\n}"
+        : "=r"(done)
+        : "r"(smem_addr(b)), "r"(phase)
+        : "memory");
+  } while (!done);
+}
+__device__ __forceinline__ void tma_load(void* sm, long long g, unsigned n, unsigned long long* b) {
+  asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];" ::"r"(
+                   smem_addr(sm)),
+               "l"(g), "r"(n), "r"(smem_addr(b))
+               : "memory");
+}
+__device__ __forceinline__ void tma_store(long long g, const void* sm, unsigned n) {
+  asm volatile("cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;" ::"l"(g), "r"(smem_addr(sm)), "r"(n)
+               : "memory");
+  asm volatile("cp.async.bulk.commit_group;" ::: "memory");
+}
+#endif
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+__device__ __forceinline__ void async16(void* sm, long long g) {
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(smem_addr(sm)), "l"(g) : "memory");
+}
+#endif
+
+extern "C" __global__ void __launch_bounds__(32) ce_bytes_bulk(const Chunk* __restrict__ chunks, int n,
+                                                               long long sadd, long long dadd) {
+  __shared__ alignas(128) unsigned char buf[2][kSeg];
+  const int lane = threadIdx.x & 31;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  __shared__ alignas(8) unsigned long long bar[2];
+  unsigned phase[2] = {0, 0};
+  if (lane == 0) {
+    mbar_init(&bar[0]), mbar_init(&bar[1]);
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+  }
+  __syncwarp();
+  unsigned cnt = 0;
+#endif
+  for (int w = blockIdx.x; w < n; w += gridDim.x) {
+    Chunk c = chunks[w];
+    c.src += sadd, c.dst += dadd;
+    if ((c.src | c.dst | c.width | c.spitch | c.dpitch) & 15) {  // not 16-byte aligned: the plain warp copy
+      bytes_one<false>(c, lane);
+      continue;
+    }
+    const Segs sg{c, (c.width + kSeg - 1) / kSeg};
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    if (lane == 0) {
+      for (long long i = 0; i < sg.count(); ++i, ++cnt) {
+        long long s, d;
+        unsigned len;
+        sg.at(i, &s, &d, &len);
+        const unsigned b = cnt & 1u;
+        asm volatile("cp.async.bulk.wait_group.read 1;" ::: "memory");  // buffer b's last store has read it
+        mbar_expect(&bar[b], len);
+        tma_load(buf[b], s, len, &bar[b]);
+        mbar_wait(&bar[b], phase[b]);
+        phase[b] ^= 1u;
+        tma_store(d, buf[b], len);
+      }
+    }
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    const long long count = sg.count();
+    auto issue = [&](long long i, int b) {
+      long long s, d;
+      unsigned len;
+      sg.at(i, &s, &d, &len);
+      for (unsigned o = lane * 16u; o < len; o += 512u) async16(buf[b] + o, s + o);
+      asm volatile("cp.async.commit_group;" ::: "memory");
+    };
+    if (count > 0) issue(0, 0);
+    for (long long i = 0; i < count; ++i) {
+      const int b = static_cast<int>(i & 1);
+      if (i + 1 < count) {
+        issue(i + 1, b ^ 1);
+        asm volatile("cp.async.wait_group 1;" ::: "memory");
+      } else {
+        asm volatile("cp.async.wait_group 0;" ::: "memory");
+      }
+      __syncwarp();
+      long long s, d;
+      unsigned len;
+      sg.at(i, &s, &d, &len);
+      for (unsigned o = lane * 16u; o < len; o += 512u)
+        *reinterpret_cast<uint4*>(static_cast<uintptr_t>(d + o)) = *reinterpret_cast<const uint4*>(buf[b] + o);
+      __syncwarp();
+    }
+#else
+    bytes_one<false>(c, lane);
+#endif
+  }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  if (lane == 0) asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");  // stores done before exit
+#endif
+  (void)buf;
+}
+
 extern "C" __global__ void ce_bytes(const Chunk* __restrict__ chunks, int n, long long sadd, long long dadd) {
   CE_FOR_CHUNKS(chunks, n, sadd, dadd) bytes_one<false>(c, lane);
 }

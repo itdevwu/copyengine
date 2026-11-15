@@ -25,6 +25,10 @@ struct TileK {
   int scale_byte = 0;  // the scale is stored as a byte (MX, NVFP4)
   int quantize = 1;    // else dequantize
   int static_scale = 0;  // quantize with the given scale (and zero point): they are read, not written
+  // Kernels may move 4 consecutive values at a time: x and q contiguous along
+  // the unit, every unit's x (8 / 16 bytes) and q (4 / 2 bytes) aligned, and
+  // g a multiple of 4 (set when queued).
+  int vec = 0;
   float eps = 1e-12f, gs = 1.0f;
   // Gathers / scatters: the first row dimension of x (xi), or of the
   // quantized side q, s, z (ci), read through an int64 index table (0: none),
@@ -49,11 +53,23 @@ struct UnitAt {
 CE_HD UnitAt unit_at(const TileK& t, long long u) {
   UnitAt a;
   a.bad = false;
-  a.j = u % t.upr;
-  long long r = u / t.upr;
-  const long long i2 = r % t.rows[2];
-  r /= t.rows[2];
-  const long long i1 = r % t.rows[1], i0 = r / t.rows[1];
+  long long i0, i1, i2;
+  if (u < 0x7FFFFFFFLL && t.rows[1] * t.rows[2] < 0x7FFFFFFFLL) {  // 32-bit divisions: a few times cheaper
+    const uint32_t uu = static_cast<uint32_t>(u), up = static_cast<uint32_t>(t.upr);
+    const uint32_t r2 = static_cast<uint32_t>(t.rows[2]), r1 = static_cast<uint32_t>(t.rows[1]);
+    uint32_t r = uu / up;
+    a.j = uu - r * up;
+    const uint32_t q2 = r / r2;
+    i2 = r - q2 * r2;
+    const uint32_t q1 = q2 / r1;
+    i1 = q2 - q1 * r1, i0 = q1;
+  } else {
+    a.j = u % t.upr;
+    long long r = u / t.upr;
+    i2 = r % t.rows[2];
+    r /= t.rows[2];
+    i1 = r % t.rows[1], i0 = r / t.rows[1];
+  }
   long long ix = i0, ic = i0;
   if (t.xi) {
     ix = rd<long long>(addr(t.xi + i0 * 8));

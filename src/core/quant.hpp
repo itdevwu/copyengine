@@ -90,10 +90,12 @@ CE_HD uint8_t float_to_e2m1(float v) {
   return static_cast<uint8_t>(s | c);
 }
 
+// The bits of the E2M1 value built directly (no table: kernels would keep it
+// in local memory): 0, 0.5, then (1 + m / 2) * 2^(e - 1) for codes 2..7.
 CE_HD float e2m1_to_float(uint8_t c) {
-  const float mag[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
-  const float m = mag[c & 7u];
-  return (c & 8u) ? -m : m;
+  const uint32_t k = c & 7u;
+  const uint32_t mag = k < 2u ? (k ? 0x3F000000u : 0u) : ((126u + (k >> 1)) << 23) | ((k & 1u) << 22);
+  return u2f(mag | ((static_cast<uint32_t>(c) & 8u) << 28));
 }
 
 // ---- units ----------------------------------------------------------------------

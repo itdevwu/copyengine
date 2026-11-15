@@ -36,6 +36,13 @@
 
 ## Invariants
 
+- Copies are unit maps: `dst_j[D_j(u)] = f_j(src_1[S_1(u)], ...)` over units
+  of consecutive elements (an element copy is a unit of one). A unit is never
+  split by any cut; `f` reads only its own unit (no reduction across units,
+  no output whose size depends on values; tensor-wide quantities are inputs);
+  and `f` comes from a closed catalog, each entry with one implementation
+  shared by host and kernels and a torch recipe it matches bit for bit. What
+  does not fit stays outside copyengine.
 - Ops carry absolute element indices (address / itemsize); pure copies are
   normalized to bytes. Dependencies and merging rely on this.
 - Every Executor strategy must be correct for any group it is offered.

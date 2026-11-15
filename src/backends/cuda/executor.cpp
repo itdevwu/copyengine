@@ -1351,12 +1351,14 @@ class CudaExecutor final : public Executor {
       put_words(s, base, vals.data(), vals.size(), st);
       table = base + (words - v.size() * tk_words) * 8;
     }
-    CUfunction f = function(s, "ce_tile");
+    const cv::TileK& t0 = *ops[g.ops[0]].tile;  // a group shares format and direction
+    const std::string name = std::string(t0.quantize ? "ce_tile_q" : "ce_tile_d") + std::to_string(t0.fmt);
+    CUfunction f = function(s, name);
     int count = static_cast<int>(g.ops.size());
     void* args[] = {&table, &count};
     const unsigned gx = static_cast<unsigned>(std::min<long long>((most + 7) / 8, 1 << 20));
     const unsigned gy = static_cast<unsigned>(std::min<long long>(count, 65535));
-    run_kernel(s, f, {std::max(1u, gx), gy, 1}, {256, 1, 1}, args, st, "ce_tile");
+    run_kernel(s, f, {std::max(1u, gx), gy, 1}, {256, 1, 1}, args, st, name.c_str());
     return 1;
   }
 

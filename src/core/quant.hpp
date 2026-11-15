@@ -13,7 +13,7 @@ namespace ce::cv {
 enum class QFmt : int { fp8_e4m3 = 0, fp8_e5m2, int8, mxfp8_e4m3, mxfp8_e5m2, nvfp4, int4, uint4 };
 
 // Packed formats store two values per byte, element 2i in the low nibble.
-CE_HD bool qfmt_packed(QFmt f) { return f == QFmt::nvfp4 || f == QFmt::int4 || f == QFmt::uint4; }
+constexpr CE_HD bool qfmt_packed(QFmt f) { return f == QFmt::nvfp4 || f == QFmt::int4 || f == QFmt::uint4; }
 
 CE_HD bool qfmt_mx(QFmt f) { return f == QFmt::mxfp8_e4m3 || f == QFmt::mxfp8_e5m2; }
 CE_HD float qmax_of(QFmt f) {

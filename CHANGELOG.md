@@ -4,6 +4,12 @@ copyengine follows [semantic versioning](https://semver.org). From 0.1.0 on,
 the Python API, the C ABI (`CE_ABI_VERSION`) and the tuning profile format
 change incompatibly only in a new minor (0.x) or major release.
 
+## Unreleased
+
+- Prebuilt interception shims for torch 2.12.0, 2.12.1 and 2.13.0 (with
+  2.9.1, 2.10.0 and 2.11.0): those install without a C++ compiler. CI tests
+  torch 2.12 and 2.13, and the explicit API's ops built against 2.11 on 2.13.
+
 ## 0.4.0
 
 - `bulk` copies through shared memory for pure copies on one GPU: TMA bulk

@@ -36,14 +36,16 @@
 
 ## Invariants
 
-- Copies are unit maps: `dst_j[D_j(u)] = f_j(src_1[S_1(u)], ...)` over units
-  of consecutive elements (an element copy is a unit of one). A unit is never
-  split by any cut; `f` reads only its own unit (no reduction across units,
-  no output whose size depends on values; tensor-wide quantities are inputs);
-  and `f` comes from a closed catalog, each entry with one implementation
-  shared by host and kernels and a torch recipe (`copyengine/_quant.py`) it
-  matches bit for bit on every device. What does not fit stays outside
-  copyengine. Copies (moving, converting) match torch itself bit for bit.
+- Copies are unit maps: `dst_j[D_j(u)] = f_j(src_1[S_1(u)], ...)` over
+  units. A unit is a box: rows of consecutive elements at a fixed pitch (an
+  element copy is a 1x1 box; a run of consecutive elements is a 1-row box).
+  A unit is never split by any cut; `f` reads only its own unit (no reduction
+  across units, no output whose size depends on values; tensor-wide
+  quantities are inputs); and `f` comes from a closed catalog, each entry
+  with one implementation shared by host and kernels and a torch recipe
+  (`copyengine/_quant.py`) it matches bit for bit on every device. What does
+  not fit stays outside copyengine. Copies (moving, converting) match torch
+  itself bit for bit.
   Computation (a catalog entry) takes the common optimized forms (a product
   with a reciprocal, not a division per value) and matches its recipe on
   every device; torch's own arithmetic differs across devices and forms.
@@ -59,7 +61,9 @@
   transforms apply directly; a speculative strategy is used only after it wins
   a paired A/B against the baseline that counts host and GPU time. Ties keep
   the baseline. Where no native copy exists there is no original to protect:
-  candidates are explored alike and the fastest locks.
+  candidates are explored alike and the fastest locks. Inside a torch.compile
+  region, the baseline is the code torch.compile generates for the same
+  operation: a copyengine op there must not be slower than it.
 - Measuring must not stall a run: hopeless candidates are dropped after one
   sample, and online re-checks only run finalists within 2x of the locked one.
 - A group touches several allocations; no copy call, 2-D block or staged

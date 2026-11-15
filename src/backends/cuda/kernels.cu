@@ -760,7 +760,9 @@ __device__ __forceinline__ void store4(long long p, int dt, const float v[4]) {
 }
 
 // Threads per unit: 4 values each; a power of two dividing the warp (or the
-// whole warp, looping, for long units). 0: the vector path does not apply.
+// whole warp, looping, for long units). A warp's loads then cover whole
+// units, contiguous (fewer threads per unit would spread a load instruction
+// over many units). 0: the vector path does not apply.
 __device__ __forceinline__ int tile_tpu(const cv::TileK& t) {
   if (!t.vec) return 0;
   const int per = t.g >> 2;
@@ -773,10 +775,12 @@ __device__ void tile_vec(const cv::TileK& t, int lane, long long warp0, long lon
   using cv::QFmt;
   constexpr QFmt f = static_cast<QFmt>(F);
   constexpr bool range = f == QFmt::uint4;
-  // 4-value chunks kept in registers per thread: fewer for the byte formats,
-  // whose kernels trade registers for occupancy (see CE_TILE).
-  constexpr int kC = cv::qfmt_packed(f) ? 4 : 2;
-  const int upw = 32 / tpu, sub = lane & (tpu - 1);
+  constexpr bool packed = cv::qfmt_packed(f);
+  // Chunks per thread kept in registers (unrolled: no local memory; units
+  // up to 256 values). More would cost occupancy, which is what keeps loads
+  // in flight where few SMs run these kernels.
+  constexpr int kC = 2;
+  const int upw = 32 / tpu, sub = lane & (tpu - 1), cpt = (t.g >> 2) / tpu, stride = 4 * tpu;
   const long long units = t.units();
   for (long long w = warp0; w * upw < units; w += warps) {
     const long long u = w * upw + lane / tpu;
@@ -787,33 +791,46 @@ __device__ void tile_vec(const cv::TileK& t, int lane, long long warp0, long lon
       if (a.bad && sub == 0 && t.err) atomicOr(reinterpret_cast<unsigned long long*>(t.err), 1ull);
     }
     const bool ok = u < units && !a.bad;  // the same for a unit's threads: shuffles stay within its group
-    if (!Q) {  // dequantize
+    if (!Q) {  // dequantize: 4 codes per load
       if (!ok) continue;
       const float s = t.scale_byte ? 0.0f : cv::rd<float>(cv::addr(a.s));
       const uint8_t bits =
           t.scale_byte ? cv::rd<uint8_t>(cv::addr(a.s)) : (f == QFmt::uint4 ? cv::rd<uint8_t>(cv::addr(a.z)) : 0);
       const float factor = cv::unit_scale(f, s, bits, t.gs);
-      const uint8_t* q0 = static_cast<const uint8_t*>(cv::addr(cv::q_at(t, a, 0)));
-      for (int base = sub * 4; base < t.g; base += tpu * 4) {
+      for (int j = 0; j < cpt; ++j) {
+        const int base = sub * 4 + j * stride;
+        const uintptr_t qp = static_cast<uintptr_t>(cv::q_at(t, a, base));
+        const uint32_t c4 = packed ? *reinterpret_cast<const uint16_t*>(qp) : *reinterpret_cast<const uint32_t*>(qp);
         float v[4];
 #pragma unroll
-        for (int i = 0; i < 4; ++i) v[i] = cv::dequantize_at(q0, 1, base + i, f, factor, bits);
+        for (int i = 0; i < 4; ++i)
+          v[i] = cv::dequantize_code(f, static_cast<uint8_t>(packed ? (c4 >> (4 * i)) & 0xFu : (c4 >> (8 * i)) & 0xFFu),
+                                     factor, bits);
         store4(cv::x_at(t, a, base), t.xdt, v);
       }
       continue;
     }
     float c[kC][4];
     float amax = 0.0f, lo = 0.0f, hi = 0.0f;
-    int n = 0;
-    for (int base = sub * 4; base < t.g; base += tpu * 4, ++n) {
-      float v[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-      if (ok) load4(cv::x_at(t, a, base), t.xdt, v);
+    auto take = [&](const float v[4]) {
 #pragma unroll
       for (int i = 0; i < 4; ++i) {
-        if (n < kC) c[n][i] = v[i];
         amax = cv::amax_step(amax, cv::abs_f(v[i]));
         if (range) lo = cv::amin_step(lo, v[i]), hi = cv::amax_step(hi, v[i]);
       }
+    };
+#pragma unroll
+    for (int j = 0; j < kC; ++j) {
+      if (j >= cpt) break;
+#pragma unroll
+      for (int i = 0; i < 4; ++i) c[j][i] = 0.0f;
+      if (ok) load4(cv::x_at(t, a, sub * 4 + j * stride), t.xdt, c[j]);
+      take(c[j]);
+    }
+    for (int j = kC; j < cpt; ++j) {  // long units: read again below
+      float v[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+      if (ok) load4(cv::x_at(t, a, sub * 4 + j * stride), t.xdt, v);
+      take(v);
     }
     for (int o = tpu >> 1; o; o >>= 1) {
       amax = cv::amax_step(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, o));
@@ -837,26 +854,27 @@ __device__ void tile_vec(const cv::TileK& t, int lane, long long warp0, long lon
         if (f == QFmt::uint4) cv::wr<uint8_t>(cv::addr(a.z), p.bits);
       }
     }
-    n = 0;
-    for (int base = sub * 4; base < t.g; base += tpu * 4, ++n) {
-      float v[4];
-      if (n < kC) {
-#pragma unroll
-        for (int i = 0; i < 4; ++i) v[i] = c[n][i];
-      } else {
-        load4(cv::x_at(t, a, base), t.xdt, v);
-      }
+    auto put = [&](int base, const float v[4]) {
       uint8_t k[4];
 #pragma unroll
       for (int i = 0; i < 4; ++i) k[i] = cv::quant_elem(f, v[i], p);
-      if constexpr (cv::qfmt_packed(f)) {
-        *reinterpret_cast<uint16_t*>(static_cast<uintptr_t>(cv::q_at(t, a, base))) =
-            static_cast<uint16_t>((k[0] | (k[1] << 4)) | ((k[2] | (k[3] << 4)) << 8));
+      const uintptr_t qp = static_cast<uintptr_t>(cv::q_at(t, a, base));
+      if constexpr (packed) {
+        *reinterpret_cast<uint16_t*>(qp) = static_cast<uint16_t>((k[0] | (k[1] << 4)) | ((k[2] | (k[3] << 4)) << 8));
       } else {
-        *reinterpret_cast<uint32_t*>(static_cast<uintptr_t>(cv::q_at(t, a, base))) =
-            k[0] | (static_cast<uint32_t>(k[1]) << 8) | (static_cast<uint32_t>(k[2]) << 16) |
-            (static_cast<uint32_t>(k[3]) << 24);
+        *reinterpret_cast<uint32_t*>(qp) = k[0] | (static_cast<uint32_t>(k[1]) << 8) |
+                                           (static_cast<uint32_t>(k[2]) << 16) | (static_cast<uint32_t>(k[3]) << 24);
       }
+    };
+#pragma unroll
+    for (int j = 0; j < kC; ++j) {
+      if (j >= cpt) break;
+      put(sub * 4 + j * stride, c[j]);
+    }
+    for (int j = kC; j < cpt; ++j) {
+      float v[4];
+      load4(cv::x_at(t, a, sub * 4 + j * stride), t.xdt, v);
+      put(sub * 4 + j * stride, v);
     }
   }
 }
@@ -869,8 +887,17 @@ __device__ __forceinline__ void tile_kernel(const cv::TileK* __restrict__ tiles,
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, wpb = blockDim.x >> 5;
   const long long warp0 = static_cast<long long>(blockIdx.x) * wpb + warp;
   const long long warps = static_cast<long long>(gridDim.x) * wpb;
+  // The descriptor stays in shared memory (read where used): a copy in
+  // registers would take some 60 of them and push the rest into local memory.
+  __shared__ cv::TileK sh;
+  static_assert(sizeof(cv::TileK) % 8 == 0 && sizeof(cv::TileK) / 8 <= 256);
   for (int op = blockIdx.y; op < count; op += gridDim.y) {
-    const cv::TileK t = tiles[op];
+    __syncthreads();  // the previous op's readers are done
+    if (threadIdx.x < sizeof(cv::TileK) / 8)
+      reinterpret_cast<unsigned long long*>(&sh)[threadIdx.x] =
+          reinterpret_cast<const unsigned long long*>(&tiles[op])[threadIdx.x];
+    __syncthreads();
+    const cv::TileK& t = sh;
     if (const int tpu = tile_tpu(t)) {
       tile_vec<F, Q>(t, lane, warp0, warps, tpu);
       continue;

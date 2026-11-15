@@ -244,17 +244,22 @@ CE_HD float unit_scale(QFmt f, float scale, uint8_t scale_bits, float gs) {
   return scale;
 }
 
-// Element i of a dequantized unit (`q` as stored: packed formats two per
-// byte); `zero`: uint4's zero point (the unit's scale byte).
+// One code's value: a byte, or (packed formats) a nibble; `zero`: uint4's
+// zero point (the unit's scale byte).
+CE_HD float dequantize_code(QFmt f, uint8_t c, float factor, uint8_t zero = 0) {
+  if (f == QFmt::nvfp4) return mul_rn(e2m1_to_float(c), factor);
+  if (f == QFmt::int4) return mul_rn(static_cast<float>(static_cast<int>(c) - ((c & 8u) ? 16 : 0)), factor);
+  if (f == QFmt::uint4) return mul_rn(static_cast<float>(c) - static_cast<float>(zero), factor);
+  return mul_rn(dequant_scaled(c, f), factor);
+}
+
+// Element i of a dequantized unit (`q` as stored: packed formats two per byte).
 CE_HD float dequantize_at(const uint8_t* q, long long qs, int i, QFmt f, float factor, uint8_t zero = 0) {
   if (qfmt_packed(f)) {
     const uint8_t b = q[(i / 2) * qs];
-    const uint8_t n = (i & 1) ? static_cast<uint8_t>(b >> 4) : static_cast<uint8_t>(b & 0xFu);
-    if (f == QFmt::nvfp4) return mul_rn(e2m1_to_float(n), factor);
-    if (f == QFmt::int4) return mul_rn(static_cast<float>(static_cast<int>(n) - ((n & 8u) ? 16 : 0)), factor);
-    return mul_rn(static_cast<float>(n) - static_cast<float>(zero), factor);  // uint4
+    return dequantize_code(f, (i & 1) ? static_cast<uint8_t>(b >> 4) : static_cast<uint8_t>(b & 0xFu), factor, zero);
   }
-  return mul_rn(dequant_scaled(q[i * qs], f), factor);
+  return dequantize_code(f, q[i * qs], factor, zero);
 }
 
 }  // namespace ce::cv

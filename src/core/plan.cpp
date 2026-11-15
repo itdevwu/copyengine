@@ -70,7 +70,15 @@ Hash128 fingerprint(const Op& op) {
   h.add(op.runs().src);
   h.add(op.runs().dst);
   h.add(op.runs().len);
-  if (op.opaque) {  // the structure, not this call's table pointers: new indices hit the same plan
+  if (op.tile) {  // the whole description: tile ops are planned by their layout and addresses
+    const cv::TileK& t = *op.tile;
+    for (long long v : {t.x, t.q, t.s, t.z, t.rows[0], t.rows[1], t.rows[2], t.xr[0], t.xr[1], t.xr[2], t.qr[0], t.qr[1],
+                        t.qr[2], t.sr[0], t.sr[1], t.sr[2], t.zr[0], t.zr[1], t.zr[2], t.xe, t.qe, t.se, t.ze})
+      h.add(static_cast<uint64_t>(v));  // field by field: no padding bytes in the hash
+    for (int v : {t.g, t.upr, t.fmt, t.xdt, t.scale_byte, t.quantize}) h.add(static_cast<uint64_t>(v));
+    h.add(std::bit_cast<uint32_t>(t.eps)), h.add(std::bit_cast<uint32_t>(t.gs));
+  }
+  if (op.opaque && op.form) {  // the structure, not this call's table pointers: new indices hit the same plan
     const Form& f = *op.form;
     h.add(static_cast<uint64_t>(op.dst_lo));
     h.add(static_cast<uint64_t>(op.dst_hi));
@@ -207,6 +215,8 @@ std::vector<int> waves(const std::vector<Op>& ops) {
     auto& w = by_dev[{int(op.dst.device.kind), op.dst.device.index}];
     const Intervals& wr = op.write();
     for (size_t i = 0; i < wr.start.size(); ++i) w.push_back({wr.start[i], wr.end[i], k, true});
+    for (const Op::Extra& x : op.extras)  // a tile op's scale / zero point
+      by_dev[{int(x.device.kind), x.device.index}].push_back({x.lo, x.hi, k, x.write});
   }
   // (pred, succ) pairs with pred < succ, possibly repeated.
   std::vector<std::pair<int, int>> edges;
@@ -256,8 +266,16 @@ Plan build_plan(const std::vector<Op>& ops) {
     for (int k = 0; k < static_cast<int>(ops.size()); ++k) {
       if (level[k] != lv) continue;
       const Op& op = ops[k];
+      auto same_tile = [&](const Group& g) {
+        const cv::TileK* a = g.ops.empty() ? nullptr : ops[g.ops[0]].tile.get();
+        const cv::TileK* b = op.tile.get();
+        if (!a || !b) return a == b;
+        return a->fmt == b->fmt && a->quantize == b->quantize && a->g == b->g && a->xdt == b->xdt &&
+               a->scale_byte == b->scale_byte && a->eps == b->eps && a->gs == b->gs;
+      };
       auto it = std::find_if(groups.begin(), groups.end(), [&](const Group& g) {
-        return g.src == op.src && g.dst == op.dst && g.fn == op.fn && g.ctx == op.ctx && g.bandwidth == op.bandwidth;
+        return g.src == op.src && g.dst == op.dst && g.fn == op.fn && g.ctx == op.ctx && g.bandwidth == op.bandwidth &&
+               same_tile(g);
       });
       if (it == groups.end()) {
         groups.push_back({});
@@ -267,7 +285,8 @@ Plan build_plan(const std::vector<Op>& ops) {
       }
       it->ops.push_back(k);
       it->runs.append(op.runs());
-      if (op.opaque) it->opaque_elems += op.form->numel;
+      if (op.tile) it->opaque_elems += op.tile->units() * op.tile->g, it->tiles = true;
+      else if (op.opaque) it->opaque_elems += op.form->numel;
     }
     for (Group& g : groups) {
       const i64 ss = static_cast<i64>(itemsize(g.src.dtype)), ds = static_cast<i64>(itemsize(g.dst.dtype));

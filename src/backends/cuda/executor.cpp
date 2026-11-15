@@ -264,6 +264,7 @@ class CudaExecutor final : public Executor {
   std::vector<Strategy> candidates(const Group& g) override {
     const int di = device_of(g);
     Dev& s = state(di);
+    if (g.tiles) fail(Errc::unsupported, "quantization on the GPU is not built yet");
     if (g.opaque()) {  // indices read at run time: the statement kernel, or (host tables) DMA expanded per run
       std::vector<Strategy> c;
       if (g.pure() && host_tables_only(g)) c.push_back(Strategy::lowered);

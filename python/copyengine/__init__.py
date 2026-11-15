@@ -14,9 +14,11 @@ from ._api import (
     copy_,
     copy_many,
     default_engine,
+    dequantize,
     gather,
     indices,
     plan,
+    quantize,
     scatter_,
     scope,
     segments,
@@ -41,7 +43,7 @@ from ._core import (
 __all__ = [
     "ABI_VERSION", "Access", "BackendError", "CopyEngineError", "Elementwise", "Engine", "FrozenPlan", "Pending",
     "NeedsMaterialize", "Rects", "Runs", "Stmt", "Unsupported", "UnsafeCopy", "__version__", "barrier",
-    "copy_", "copy_many", "default_engine", "gather", "hardware_fingerprint", "indices", "lazy", "Lazy", "lower", "plan", "probe", "scatter_",
+    "copy_", "copy_many", "default_engine", "dequantize", "quantize", "gather", "hardware_fingerprint", "indices", "lazy", "Lazy", "lower", "plan", "probe", "scatter_",
     "scope", "segments", "stats",
 ]
 

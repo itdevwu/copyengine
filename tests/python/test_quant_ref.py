@@ -20,118 +20,14 @@ def _bits_f32(b):
     return torch.tensor(b, dtype=torch.int32).view(torch.float32)
 
 
-# ---- torch recipes (the design document's, written once) ----------------------------
-
-def recipe_scaled(x, g, fmt, eps=EPS):
-    xf = x.view(-1, g)
-    amax = xf.abs().amax(-1, keepdim=True)
-    scale = amax.clamp(min=eps) / QMAX[fmt]
-    v = xf / scale
-    if fmt == "int8":
-        q = torch.where(v.isnan(), 0.0, torch.round(v).clamp(-127, 127)).to(torch.int8).view(torch.uint8)
-    else:
-        q = v.clamp(-QMAX[fmt], QMAX[fmt]).to(FP8[fmt]).view(torch.uint8)
-    return q.reshape(-1), scale.reshape(-1), None
-
-
-def recipe_mx(x, g, fmt):
-    emax = 8 if fmt == "mxfp8_e4m3" else 15
-    xf = x.view(-1, g)
-    amax = xf.abs().amax(-1, keepdim=True)
-    _, e = torch.frexp(amax)
-    shared = (e - 1 - emax).clamp(-127, 127)
-    shared = torch.where(amax == 0, -127, shared)
-    finite = amax.isfinite()
-    sf = torch.where(shared >= -126, ((shared + 127).to(torch.int32) << 23).view(torch.float32),
-                     _bits_f32(0x00400000))
-    sf = torch.where(finite, sf, float("nan"))
-    q = (xf / sf).clamp(-QMAX[fmt], QMAX[fmt]).to(FP8[fmt]).view(torch.uint8)
-    bits = torch.where(finite, shared + 127, 255).to(torch.uint8)
-    return q.reshape(-1), None, bits.reshape(-1)
-
-
-def e2m1(v):
-    m = v.abs()
-    code = sum((m > 0.25, m >= 0.75, m > 1.25, m >= 1.75, m > 2.5, m >= 3.5, m > 5.0), torch.zeros_like(m)).to(
-        torch.uint8)
-    code = code | (torch.signbit(v).to(torch.uint8) << 3)
-    return torch.where(v.isnan(), 0, code).to(torch.uint8)
-
-
-def e2m1_value(code):
-    mag = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])[(code & 7).long()]
-    return torch.where((code & 8) != 0, -mag, mag)
-
-
-def recipe_nvfp4(x, g, gs):
-    xf = x.view(-1, g)
-    amax = xf.abs().amax(-1, keepdim=True)
-    sv = (amax / 6 / gs).clamp(max=448)
-    s = sv.to(torch.float8_e4m3fn)
-    sf = s.float()
-    v = (xf / (sf * gs)).clamp(-6, 6)
-    code = torch.where(sf == 0, 0, e2m1(v)).to(torch.uint8)
-    packed = code[:, 0::2] | (code[:, 1::2] << 4)
-    return packed.reshape(-1), None, s.view(torch.uint8).reshape(-1)
-
-
-def pack(n):
-    return n[:, 0::2] | (n[:, 1::2] << 4)
-
-
-def recipe_int4(x, g, eps=EPS):
-    xf = x.view(-1, g)
-    amax = xf.abs().amax(-1, keepdim=True)
-    scale = amax.clamp(min=eps) / 7
-    v = xf / scale
-    n = torch.where(v.isnan(), 0.0, torch.round(v).clamp(-8, 7)).to(torch.int32) & 0xF
-    return pack(n.to(torch.uint8)).reshape(-1), scale.reshape(-1), None
-
-
-def recipe_uint4(x, g, eps=EPS):
-    xf = x.view(-1, g)
-    lo = xf.amin(-1, keepdim=True).clamp(max=0)
-    hi = xf.amax(-1, keepdim=True).clamp(min=0)
-    scale = (hi - lo).clamp(min=eps) / 15
-    zf = torch.round(-lo / scale).clamp(0, 15)
-    z = torch.where(zf.isnan(), 0.0, zf)
-    v = torch.round(xf / scale) + z
-    n = torch.where(v.isnan(), 0.0, v.clamp(0, 15)).to(torch.uint8)
-    return pack(n).reshape(-1), scale.reshape(-1), z.to(torch.uint8).reshape(-1)
-
+# ---- the torch recipes (copyengine._quant: the one copy of each) ---------------------
 
 def recipe(x, g, fmt, gs=1.0):
-    if fmt == "int4":
-        return recipe_int4(x, g)
-    if fmt == "uint4":
-        return recipe_uint4(x, g)
-    if fmt in ("fp8_e4m3", "fp8_e5m2", "int8"):
-        return recipe_scaled(x, g, fmt)
-    if fmt.startswith("mx"):
-        return recipe_mx(x, g, fmt)
-    return recipe_nvfp4(x, g, gs)
+    return _quant.quantize(x, g, fmt, EPS, gs)
 
 
 def recipe_dequant(q, scale, bits, g, fmt, gs=1.0):
-    if fmt in ("int4", "uint4"):
-        n = torch.stack([q & 0xF, q >> 4], -1).reshape(-1, g).to(torch.int32)
-        if fmt == "int4":
-            vals = torch.where(n >= 8, n - 16, n).float()
-        else:
-            vals = n.float() - bits.float().view(-1, 1)
-        return (vals * scale.view(-1, 1)).reshape(-1)
-    if fmt == "nvfp4":
-        codes = torch.stack([q & 0xF, q >> 4], -1).reshape(-1, g)
-        return (e2m1_value(codes) * (bits.view(torch.float8_e4m3fn).float() * gs).view(-1, 1)).reshape(-1)
-    if fmt == "int8":
-        vals = q.view(torch.int8).float()
-    else:
-        vals = q.view(FP8[fmt]).float()
-    if fmt.startswith("mx"):
-        factor = bits.view(torch.float8_e8m0fnu).float()
-    else:
-        factor = scale
-    return (vals.view(-1, g) * factor.view(-1, 1)).reshape(-1)
+    return _quant.dequantize(q, scale, bits, g, fmt, gs)
 
 
 # ---- data ----------------------------------------------------------------------
@@ -221,7 +117,7 @@ def tie_data(fmt, g, units=400, seed=0):
     out = []
     for _ in range(units):
         amax = np.float32(10.0 ** rng.uniform(-3, 3))
-        scale = np.float32(max(amax, np.float32(EPS)) / np.float32(QMAX[fmt]))
+        scale = np.float32(max(amax, np.float32(EPS)) * np.float32(1 / QMAX[fmt]))
         m = rng.choice(mids, g - 1) * rng.choice([-1, 1], g - 1)
         out.append(np.r_[amax, (m * scale).astype(np.float32)].astype(np.float32))
     return np.concatenate(out)
@@ -251,7 +147,7 @@ def test_uint4_ties():
     out = []
     for _ in range(400):
         a, b = (np.float32(10.0 ** rng.uniform(-3, 3)) for _ in range(2))
-        scale = np.float32((np.float32(b) + np.float32(a)) / np.float32(15.0))
+        scale = np.float32((np.float32(b) + np.float32(a)) * np.float32(1 / 15))
         k = rng.integers(0, 15, 30) + 0.5
         z = np.float32(np.round(a / scale))
         vals = ((k - z) * scale).astype(np.float32)
@@ -260,3 +156,18 @@ def test_uint4_ties():
     q, scale, bits = host("uint4", x, 32)
     rq, rscale, rbits = recipe(torch.from_numpy(x), 32, "uint4")
     assert same(q, rq) and same(scale, rscale) and same(bits, rbits)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("fmt,g", [("fp8_e4m3", 128), ("int8", 32), ("int4", 32), ("uint4", 32),
+                                   ("mxfp8_e4m3", 32), ("nvfp4", 16)])
+def test_recipes_agree_across_devices(fmt, g):
+    # The recipe is the torch baseline on the GPU too: it must give the same
+    # bits there (torch divides by a scalar differently on the GPU).
+    x = data(g, seed=11)
+    gs = 0.01 if fmt == "nvfp4" else 1.0
+    cpu = recipe(torch.from_numpy(x), g, fmt, gs)
+    gpu = [None if t is None else t.cpu() for t in recipe(torch.from_numpy(x).cuda(), g, fmt, gs)]
+    assert same(fp8_nan_positions(cpu[0], fmt), fp8_nan_positions(gpu[0], fmt))
+    for a, b in zip(cpu[1:], gpu[1:]):
+        assert (a is None) == (b is None) and (a is None or same(a, b))

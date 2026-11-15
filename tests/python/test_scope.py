@@ -229,8 +229,10 @@ def test_scope_site_without_copies_stops_intercepting():
             dst.index_copy_(0, idx, src)
             return dst.sum()
 
-    for _ in range(_Site_entries()):
+    for _ in range(400):  # until the site decided (timing samples complete asynchronously)
         body()
+        if next(iter(e._sites.values())).decided is not None:
+            break
     site = next(iter(e._sites.values()))
     assert site.decided is False
     assert e.stats()["scopes"] == [{"site": site_name(body), "intercept": False}]

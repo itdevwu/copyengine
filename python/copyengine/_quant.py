@@ -42,6 +42,10 @@ def e2m1_value(code):
     return torch.where((code & 8) != 0, -mag, mag)
 
 
+# Divisions by constants are written as products with their reciprocal
+# (rounded to float32 by torch): torch computes tensor / scalar that way on
+# the GPU but divides on the CPU, so `amax / 448` would differ between devices.
+
 def quantize(x, g, fmt, eps=EPS, gs=1.0):
     """Codes (uint8; packed formats two per byte), float32 scales or scale
     bytes, and uint4's zero points, per unit of `g` values of `x`."""
@@ -49,21 +53,21 @@ def quantize(x, g, fmt, eps=EPS, gs=1.0):
     amax = xf.abs().amax(-1, keepdim=True)
     scale = bits = None
     if fmt in ("fp8_e4m3", "fp8_e5m2", "int8"):
-        scale = amax.clamp(min=eps) / QMAX[fmt]
+        scale = amax.clamp(min=eps) * (1 / QMAX[fmt])
         v = xf / scale
         if fmt == "int8":
             q = torch.where(v.isnan(), 0.0, torch.round(v).clamp(-127, 127)).to(torch.int8).view(torch.uint8)
         else:
             q = v.clamp(-QMAX[fmt], QMAX[fmt]).to(_fp8(fmt)).view(torch.uint8)
     elif fmt == "int4":
-        scale = amax.clamp(min=eps) / 7
+        scale = amax.clamp(min=eps) * (1 / 7)
         v = xf / scale
         n = torch.where(v.isnan(), 0.0, torch.round(v).clamp(-8, 7)).to(torch.int32) & 0xF
         q = _pack(n.to(torch.uint8))
     elif fmt == "uint4":
         lo = xf.amin(-1, keepdim=True).clamp(max=0)
         hi = xf.amax(-1, keepdim=True).clamp(min=0)
-        scale = (hi - lo).clamp(min=eps) / 15
+        scale = (hi - lo).clamp(min=eps) * (1 / 15)
         zf = torch.round(-lo / scale).clamp(0, 15)
         z = torch.where(zf.isnan(), 0.0, zf)
         v = torch.round(xf / scale) + z
@@ -81,7 +85,7 @@ def quantize(x, g, fmt, eps=EPS, gs=1.0):
         q = (xf / sf).clamp(-QMAX[fmt], QMAX[fmt]).to(_fp8(fmt)).view(torch.uint8)
         bits = torch.where(finite, shared + 127, 255).to(torch.uint8)
     elif fmt == "nvfp4":
-        sv = (amax / 6 / gs).clamp(max=448)
+        sv = (amax * (1 / 6) * (1 / gs)).clamp(max=448)
         s = sv.to(torch.float8_e4m3fn)
         sf = s.float()
         v = (xf / (sf * gs)).clamp(-6, 6)

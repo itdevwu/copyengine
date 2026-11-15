@@ -250,8 +250,14 @@ class CudaExecutor final : public Executor {
         if (b.done) d_->cuEventDestroy(b.done);
       }
       if (s.ev_free) d_->cuEventDestroy(s.ev_free);
-      for (Staging& g : s.stagings)
+      for (Staging& g : s.stagings) {
         if (g.done) d_->cuEventDestroy(g.done);
+        if (g.aux) {
+          d_->cuStreamSynchronize(g.aux);
+          d_->cuStreamDestroy(g.aux);
+          for (CUevent e : {g.fork, g.join, g.in, g.kern, g.out[0], g.out[1]}) d_->cuEventDestroy(e);
+        }
+      }
       for (CUevent e : {s.ev_in, s.ev_out})
         if (e) d_->cuEventDestroy(e);
       if (s.side) d_->cuStreamDestroy(s.side);
@@ -556,6 +562,10 @@ class CudaExecutor final : public Executor {
     CUevent done{};
     bool used = false;
     uint64_t last = 0;
+    // Chunked tile staging: DMA on `aux` while kernels run on the caller's
+    // stream (joined back before the call returns). Created on first use.
+    CUstream aux{};
+    CUevent fork{}, join{}, in{}, kern{}, out[2]{};
   };
 
   struct Dev {
@@ -648,7 +658,10 @@ class CudaExecutor final : public Executor {
         std::vector<uintptr_t> all = s.streams;
         all.push_back(reinterpret_cast<uintptr_t>(s.side));
         for (const Lane& l : s.lanes) all.push_back(reinterpret_cast<uintptr_t>(l.sm));
-        for (const Staging& g : s.stagings) all.push_back(reinterpret_cast<uintptr_t>(g.caller));
+        for (const Staging& g : s.stagings) {
+          all.push_back(reinterpret_cast<uintptr_t>(g.caller));
+          if (g.aux) all.push_back(reinterpret_cast<uintptr_t>(g.aux));
+        }
         for (uintptr_t x : all) {
           if (x == m.stream || !s.ev_free) continue;
           d_->cuEventRecord(s.ev_free, reinterpret_cast<CUstream>(x));
@@ -1372,7 +1385,7 @@ class CudaExecutor final : public Executor {
   // one warp per block (the shared buffers are per block).
   static constexpr int64_t kBulkMinBytes = 1 << 20;
   static constexpr int kBulkBufs = 4;          // kernels.cu: kBufs
-  static constexpr int kBulkBlocksPerSm = 4;
+  static constexpr int kBulkBlocksPerSm = 8;
   int64_t bulk(Dev& s, const Group& g, CUstream st) {
     auto& slot = g.exec_cache[static_cast<int>(Strategy::bulk)];
     if (!slot) slot = resident(s, chunks_of(g));
@@ -1485,10 +1498,13 @@ class CudaExecutor final : public Executor {
   void launch_tiles(Dev& s, const Group& g, const std::vector<Op>& ops, CUdeviceptr table, CUstream st) {
     long long most = 0;
     for (int k : g.ops) most = std::max(most, ops[k].tile->units());
-    const cv::TileK& t0 = *ops[g.ops[0]].tile;  // a group shares format and direction
+    launch_tiles(s, *ops[g.ops[0]].tile, table, static_cast<int>(g.ops.size()), most, st);
+  }
+
+  // `count` TileKs at `table`, of t0's format and direction (a group shares them).
+  void launch_tiles(Dev& s, const cv::TileK& t0, CUdeviceptr table, int count, long long most, CUstream st) {
     const std::string name = std::string(t0.quantize ? "ce_tile_q" : "ce_tile_d") + std::to_string(t0.fmt);
     CUfunction f = function(s, name);
-    int count = static_cast<int>(g.ops.size());
     void* args[] = {&table, &count};
     const unsigned gx = static_cast<unsigned>(std::min<long long>((most + 7) / 8, 1 << 20));
     const unsigned gy = static_cast<unsigned>(std::min<long long>(count, 65535));
@@ -1507,14 +1523,14 @@ class CudaExecutor final : public Executor {
     long long (cv::TileK::*rs)[3];  // its row strides
     int idx;                         // the index selecting its rows: 0 xi, 1 ci, -1 none
     bool host, input;
-    long long lo, hi;  // byte extent: of the side, or of its row 0 when indexed
+    long long lo, hi;  // byte extent of one row of the first dimension, from the base
   };
 
   // A TileK's four tensors: extent, whether on the host, whether the kernel reads them.
   static std::vector<TileSide> tile_sides(const cv::TileK& t, const Op& op) {
-    auto ext = [&](long long base, const long long r[3], long long count, long long step, long long width, bool ix) {
-      long long lo = base, hi = base;
-      for (int k = ix ? 1 : 0; k < 3; ++k) {
+    auto ext = [&](const long long r[3], long long count, long long step, long long width) {
+      long long lo = 0, hi = 0;
+      for (int k = 1; k < 3; ++k) {
         const long long span = (t.rows[k] - 1) * r[k];
         lo += std::min(0LL, span), hi += std::max(0LL, span);
       }
@@ -1532,7 +1548,7 @@ class CudaExecutor final : public Executor {
     std::vector<TileSide> v;
     auto add = [&](long long cv::TileK::*f, long long (cv::TileK::*rs)[3], int idx, bool host, bool input,
                    long long count, long long step, long long width) {
-      const auto e = ext(t.*f, t.*rs, count, step, width, idx >= 0);
+      const auto e = ext(t.*rs, count, step, width);
       v.push_back({f, rs, idx, host, input, e.first, e.second});
     };
     add(&cv::TileK::x, &cv::TileK::xr, xi, xs.device.kind == DeviceKind::host, t.quantize != 0, vals, t.xe, xw);
@@ -1546,72 +1562,207 @@ class CudaExecutor final : public Executor {
     return v;
   }
 
+  static size_t align256(long long n) { return (static_cast<size_t>(n) + 255) & ~size_t{255}; }
+
+  // Rows [a, b) of the first dimension of a host side: the bytes they span
+  // (unindexed: one interval; indexed: one staged row each).
+  static std::pair<long long, long long> rows_extent(const cv::TileK& t, const TileSide& x, long long a, long long b) {
+    const long long base = t.*x.field, r0 = (t.*x.rs)[0];
+    return {base + std::min(a * r0, (b - 1) * r0) + x.lo, base + std::max(a * r0, (b - 1) * r0) + x.hi};
+  }
+  static size_t rows_staged(const cv::TileK& t, const TileSide& x, long long a, long long b) {
+    if (x.idx >= 0) return static_cast<size_t>(b - a) * align256(x.hi - x.lo);
+    const auto e = rows_extent(t, x, a, b);
+    return align256(e.second - e.first);
+  }
+
+  // Tile ops with host sides through device staging, in chunks of rows of
+  // their first dimension: a chunk's inputs move in on the aux stream while
+  // the previous chunk's kernel runs, and its outputs move out while the next
+  // one's does. Chunks alternate between two halves of the staging buffer.
+  // A host side is staged as rows [a, b) (one DMA; or, selected by host index
+  // values, one DMA per row, batched), and the chunk's TileK works on it.
+  static constexpr size_t kStageOneShot = 2 << 20;  // below: one chunk, everything on the caller's stream
+  static constexpr int kStageChunks = 4;
+
   int64_t tile_staged(Dev& s, const Group& g, const std::vector<Op>& ops, CUstream st) {
-    struct Back {
-      CUdeviceptr dev;
-      long long host, len;
-    };
     std::vector<unsigned long long> vals;
     std::vector<std::pair<size_t, size_t>> at;
     host_index_values(g, ops, vals, at);
-    std::vector<cv::TileK> v;
-    std::vector<std::vector<TileSide>> sides;
-    const auto width = [](const TileSide& x) { return (static_cast<size_t>(x.hi - x.lo) + 255) & ~size_t{255}; };
+    const size_t n = g.ops.size();
+    std::vector<std::vector<TileSide>> sides(n);
+    std::vector<size_t> whole(n);
+    std::vector<bool> split(n);
     size_t total = 0;
-    for (int k : g.ops) {
-      v.push_back(*ops[k].tile);
-      sides.push_back(tile_sides(v.back(), ops[k]));
-      for (const TileSide& x : sides.back())
-        if (x.host) total += width(x) * static_cast<size_t>(x.idx < 0 ? 1 : v.back().rows[0]);
-    }
-    const CUdeviceptr stg = staging(s, total, st);
-    const Side dev_side{{DeviceKind::cuda, s.index}, DType::u8, false}, host_side{{DeviceKind::host, 0}, DType::u8, true};
-    std::vector<Back> back;
-    std::vector<Raw> rows_in, rows_out;  // indexed sides, row by row
-    size_t off = 0;
-    int64_t calls = 1;
-    bool indexed = false;
-    for (size_t i = 0; i < v.size(); ++i) {
-      cv::TileK& t = v[i];
-      bool drop[2] = {false, false};
+    for (size_t i = 0; i < n; ++i) {
+      const Op& op = ops[g.ops[i]];
+      const cv::TileK& t = *op.tile;
+      sides[i] = tile_sides(t, op);
+      bool sp = t.rows[0] > 1;
       for (const TileSide& x : sides[i]) {
         if (!x.host) continue;
-        const CUdeviceptr d = stg + off;
-        const long long base = t.*x.field;
-        const size_t len = static_cast<size_t>(x.hi - x.lo), w = width(x);
-        if (x.idx < 0) {
-          if (x.input) copy1d(host_side, dev_side, static_cast<uintptr_t>(x.lo), d, len, st), ++calls;
-          else back.push_back({d, x.lo, static_cast<long long>(len)});
-          off += w;
-        } else {  // host index values (the engine stages no side a GPU table selects)
-          const size_t o = x.idx ? at[i].second : at[i].first;
-          const long long r0 = (t.*x.rs)[0];
-          for (long long r = 0; r < t.rows[0]; ++r) {
-            const uintptr_t h = static_cast<uintptr_t>(x.lo + static_cast<long long>(vals[o + r]) * r0);
-            const uintptr_t dr = static_cast<uintptr_t>(d + r * w);
-            if (x.input) rows_in.push_back({h, dr, len});
-            else rows_out.push_back({dr, h, len});
-          }
-          (t.*x.rs)[0] = static_cast<long long>(w);
-          drop[x.idx] = true;
-          off += w * static_cast<size_t>(t.rows[0]);
-        }
-        t.*x.field = static_cast<long long>(d) + (base - x.lo);  // the kernel works on the staged copy
+        whole[i] += rows_staged(t, x, 0, t.rows[0]);
+        if (x.idx < 0) sp = sp && std::llabs((t.*x.rs)[0]) >= x.hi - x.lo;  // rows' extents do not interleave
       }
-      if (drop[0]) t.xi = 0, at[i].first = kNoIndex;
-      if (drop[1]) t.ci = 0, at[i].second = kNoIndex;
-      indexed = indexed || t.xi || t.ci;
+      split[i] = sp;
+      total += whole[i];
     }
-    if (!rows_in.empty()) copy_raws(s, host_side, dev_side, rows_in, st), ++calls;
+    // Pieces (rows [a, b) of op i) of about `target` bytes, packed into chunks.
+    const size_t half = static_cast<size_t>(std::max<int64_t>(opt_.staging_budget, 2 << 20)) / 2;
+    const size_t target =
+        total <= kStageOneShot ? total : std::clamp(total / kStageChunks, size_t{1} << 20, std::max(half, size_t{1}));
+    struct Piece {
+      size_t i;
+      long long a, b;
+      size_t bytes;
+    };
+    auto piece_bytes = [&](size_t i, long long a, long long b) {
+      size_t sum = 0;
+      for (const TileSide& x : sides[i])
+        if (x.host) sum += rows_staged(*ops[g.ops[i]].tile, x, a, b);
+      return sum;
+    };
+    std::vector<std::vector<Piece>> chunks(1);
+    size_t fill = 0, most = 0;
+    for (size_t i = 0; i < n; ++i) {
+      const long long rows = ops[g.ops[i]].tile->rows[0];
+      long long step = rows;
+      if (split[i] && whole[i] > target)
+        step = std::max<long long>(1, static_cast<long long>(static_cast<double>(rows) * target / whole[i]));
+      for (long long a = 0; a < rows; a += step) {
+        const long long b = std::min(rows, a + step);
+        const size_t by = whole[i] && step == rows ? whole[i] : piece_bytes(i, a, b);
+        if (fill > 0 && fill + by > target) chunks.emplace_back(), fill = 0;
+        chunks.back().push_back({i, a, b, by});
+        fill += by;
+        most = std::max(most, fill);
+      }
+    }
+    const size_t nch = chunks.size();
+    if (nch > 1 && most > half) chunks = {[&] {  // a piece too large to double-buffer: one round
+      std::vector<Piece> all;
+      for (auto& c : chunks) all.insert(all.end(), c.begin(), c.end());
+      return all;
+    }()};
+    const bool piped = chunks.size() > 1;
+    const size_t H = piped ? most : total;
+    const CUdeviceptr stg = staging(s, piped ? 2 * H : H, st);
+    const Side dev_side{{DeviceKind::cuda, s.index}, DType::u8, false}, host_side{{DeviceKind::host, 0}, DType::u8, true};
+
+    // The chunks' TileKs (one table) and DMA.
+    std::vector<cv::TileK> v;
+    std::vector<std::pair<size_t, size_t>> vat;
+    struct Round {
+      size_t first, count;
+      long long units;
+      std::vector<Raw> in, out;
+    };
+    std::vector<Round> rounds;
+    bool indexed = false;
+    for (size_t c = 0; c < chunks.size(); ++c) {
+      Round r{v.size(), chunks[c].size(), 0, {}, {}};
+      const CUdeviceptr d0 = stg + (c % 2) * H;
+      size_t off = 0;
+      for (const Piece& p : chunks[c]) {
+        const cv::TileK& t0 = *ops[g.ops[p.i]].tile;
+        cv::TileK t = t0;
+        std::pair<size_t, size_t> o = at[p.i];
+        bool drop[2] = {false, false};
+        for (const TileSide& x : sides[p.i]) {
+          const long long base = t0.*x.field, r0 = (t0.*x.rs)[0];
+          if (!x.host) {
+            if (x.idx < 0) t.*x.field = base + p.a * r0;
+            continue;
+          }
+          const CUdeviceptr d = d0 + off;
+          if (x.idx < 0) {
+            const auto e = rows_extent(t0, x, p.a, p.b);
+            const size_t len = static_cast<size_t>(e.second - e.first);
+            const Raw raw = x.input ? Raw{static_cast<uintptr_t>(e.first), static_cast<uintptr_t>(d), len}
+                                    : Raw{static_cast<uintptr_t>(d), static_cast<uintptr_t>(e.first), len};
+            (x.input ? r.in : r.out).push_back(raw);
+            t.*x.field = static_cast<long long>(d) + (base + p.a * r0 - e.first);
+            off += align256(static_cast<long long>(len));
+          } else {  // host index values (the engine stages no host side a GPU table selects)
+            const size_t w = align256(x.hi - x.lo), len = static_cast<size_t>(x.hi - x.lo);
+            const size_t vo = x.idx ? at[p.i].second : at[p.i].first;
+            for (long long k = p.a; k < p.b; ++k) {
+              const uintptr_t h = static_cast<uintptr_t>(base + static_cast<long long>(vals[vo + k]) * r0 + x.lo);
+              const uintptr_t dr = static_cast<uintptr_t>(d + (k - p.a) * w);
+              (x.input ? r.in : r.out).push_back(x.input ? Raw{h, dr, len} : Raw{dr, h, len});
+            }
+            t.*x.field = static_cast<long long>(d) - x.lo;
+            (t.*x.rs)[0] = static_cast<long long>(w);
+            drop[x.idx] = true;
+            off += w * static_cast<size_t>(p.b - p.a);
+          }
+        }
+        t.rows[0] = p.b - p.a;
+        for (int w = 0; w < 2; ++w) {
+          long long& tab = w ? t.ci : t.xi;
+          size_t& slot = w ? o.second : o.first;
+          if (!tab) continue;
+          if (drop[w]) tab = 0, slot = kNoIndex;
+          else if (slot != kNoIndex) slot += static_cast<size_t>(p.a);  // host values: from row a on
+          else tab += p.a * 8;                                          // a GPU table
+        }
+        r.units = std::max(r.units, t.units());
+        v.push_back(t);
+        vat.push_back(o);
+      }
+      rounds.push_back(std::move(r));
+    }
+    for (size_t k = 0; k < v.size(); ++k) indexed = indexed || v[k].xi || v[k].ci;
     auto& slot = g.exec_cache[static_cast<int>(Strategy::tile_staged)];
     if (!slot) slot = std::make_shared<TileExec>();
-    launch_tiles(s, g, ops, upload_tiles(s, *static_cast<TileExec*>(slot.get()), std::move(vals), v,
-                                         indexed ? &at : nullptr, st), st);
-    for (const Back& b : back)
-      copy1d(dev_side, host_side, b.dev, static_cast<uintptr_t>(b.host), static_cast<size_t>(b.len), st), ++calls;
-    if (!rows_out.empty()) copy_raws(s, dev_side, host_side, rows_out, st), ++calls;
+    const CUdeviceptr table =
+        upload_tiles(s, *static_cast<TileExec*>(slot.get()), std::move(vals), v, indexed ? &vat : nullptr, st);
+    const cv::TileK& t0 = *ops[g.ops[0]].tile;
+    auto launch = [&](const Round& r) {
+      launch_tiles(s, t0, table + r.first * sizeof(cv::TileK), static_cast<int>(r.count), r.units, st);
+    };
+    int64_t calls = 0;
+    auto dma = [&](const std::vector<Raw>& raws, bool in, CUstream on) {
+      if (raws.empty()) return;
+      copy_raws(s, in ? host_side : dev_side, in ? dev_side : host_side, raws, on);
+      calls += raws.size() > 2 && s.batch ? 1 : static_cast<int64_t>(raws.size());
+    };
+    if (!piped) {
+      dma(rounds[0].in, true, st);
+      launch(rounds[0]);
+      dma(rounds[0].out, false, st);
+    } else {
+      Staging& sg = staging_of(s, st);
+      if (!sg.aux) {
+        check(d_->cuStreamCreate(&sg.aux, CU_STREAM_NON_BLOCKING), "cuStreamCreate");
+        for (CUevent* e : {&sg.fork, &sg.join, &sg.in, &sg.kern, &sg.out[0], &sg.out[1]})
+          check(d_->cuEventCreate(e, CU_EVENT_DISABLE_TIMING), "cuEventCreate");
+      }
+      auto rec = [&](CUevent e, CUstream on) { check(d_->cuEventRecord(e, on), "cuEventRecord"); };
+      auto wait = [&](CUstream on, CUevent e) { check(d_->cuStreamWaitEvent(on, e, 0), "cuStreamWaitEvent"); };
+      // aux: in_0, then per chunk c: in_{c+1}, [kernel c], out_c. A half is
+      // refilled (in_{c+2}) after kernel c and out_c, both earlier on aux;
+      // kernel c writes its half after out_{c-2} has read it.
+      rec(sg.fork, st), wait(sg.aux, sg.fork);
+      dma(rounds[0].in, true, sg.aux);
+      rec(sg.in, sg.aux);
+      for (size_t c = 0; c < rounds.size(); ++c) {
+        wait(st, sg.in);
+        if (c >= 2) wait(st, sg.out[c % 2]);
+        launch(rounds[c]);
+        rec(sg.kern, st);
+        if (c + 1 < rounds.size()) {
+          dma(rounds[c + 1].in, true, sg.aux);
+          rec(sg.in, sg.aux);
+        }
+        wait(sg.aux, sg.kern);
+        dma(rounds[c].out, false, sg.aux);
+        rec(sg.out[c % 2], sg.aux);
+      }
+      rec(sg.join, sg.aux), wait(st, sg.join);
+    }
     staging_release(s, st);
-    return calls;
+    return calls + static_cast<int64_t>(rounds.size());
   }
 
   // Host index tables expanded into copy descriptors now (DMA; pure copies).

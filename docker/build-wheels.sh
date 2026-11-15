@@ -23,7 +23,7 @@ case "$ARCH" in
 esac
 PYTHONS=${CE_WHEEL_PYTHONS:-"cp310 cp311 cp312"}
 TORCH_BUILD=${CE_WHEEL_TORCH:-2.11.0}                    # built against: stable ops, its own shim
-TORCH_SHIMS=${CE_WHEEL_SHIM_TORCH:-"2.9.1 2.10.0"}       # further releases with a prebuilt shim
+TORCH_SHIMS=${CE_WHEEL_SHIM_TORCH:-"2.9.1 2.10.0 2.12.0 2.12.1 2.13.0"}  # further releases with a prebuilt shim
 INDEX=https://download.pytorch.org/whl/cpu
 OUT=$(realpath -m "${CE_WHEEL_OUT:-dist}")
 WORK=$(mktemp -d)

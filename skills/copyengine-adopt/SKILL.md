@@ -23,7 +23,7 @@ python -c "import copyengine as ce; print('shim:', ce._shim.lib is not None, ce.
 `shim: False` means scopes intercept in Python: same results, slower. It
 usually needs a C++ compiler for the installed torch; read the
 copyengine-diagnose Skill if the user wants it fixed. `ops: False` on torch
-2.9 is expected (2.10+ compiles the explicit API). Linux x86_64 only.
+2.9 is expected (2.10+ compiles the explicit API). Linux x86_64 and aarch64.
 
 ## Find what to hand over
 

@@ -68,7 +68,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        torch: ["2.9.1", "2.10.0", "2.11.0"]
+        torch: ["2.9.1", "2.10.0", "2.11.0", "2.12.1", "2.13.0"]
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
@@ -94,7 +94,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        torch: ["2.9.1", "2.11.0"]
+        torch: ["2.9.1", "2.13.0"]
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
@@ -127,6 +127,12 @@ jobs:
       - name: On torch older than the ops' stable ABI, the ops stay off and the shim still loads
         working-directory: /tmp
         run: python -c "import copyengine as ce; assert ce._torch_ops.copy_ is None; assert ce._shim.lib is not None, ce._shim.error; print(ce._torch_ops.error); print(ce._shim.lib._name)"
+      - run: pytest -q
+      # And newer than the build: the ops (stable ABI) load as built; the shim compiles on import.
+      - run: pip install "torch==2.13.0" --index-url "$TORCH_CPU_INDEX"
+      - name: On torch newer than the build, the ops load and the shim compiles
+        working-directory: /tmp
+        run: python -c "import copyengine as ce; assert ce._torch_ops.copy_ is not None, ce._torch_ops.error; assert ce._shim.lib is not None, ce._shim.error; print(ce._shim.lib._name)"
       - run: pytest -q
 
   # Release wheels and sdist (docker/build-wheels.sh, which also runs locally):

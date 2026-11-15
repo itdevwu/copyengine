@@ -59,8 +59,7 @@ def case_offload(q):
     L, blocks, tok, hd, n = (8 if q else 24), 256, 64, 1024, 64
     kv = [torch.randn(blocks, tok, hd, device=DEV).bfloat16() for _ in range(L)]
     host = [torch.empty(n, tok, hd, dtype=torch.bfloat16).pin_memory() for _ in range(L)]
-    hidx = torch.randperm(blocks)[:n]  # block ids from the scheduler (host); torch indexes with a GPU copy
-    idx = hidx.to(DEV)
+    idx = torch.randperm(blocks, device=DEV)[:n]  # block ids on the GPU, for both
 
     def eager():
         for l in range(L):
@@ -69,7 +68,7 @@ def case_offload(q):
     def ce_fn(e):
         with e.scope():
             for l in range(L):
-                e.copy_(host[l], ce.lazy(kv[l]).index_select(0, hidx))
+                e.copy_(host[l], ce.lazy(kv[l]).index_select(0, idx))
 
     def check():
         return all(torch.equal(host[l], kv[l].index_select(0, idx).cpu()) for l in range(L))
@@ -82,8 +81,7 @@ def case_onload(q):
     L, blocks, tok, hd, n = (8 if q else 24), 256, 64, 1024, 64
     kv = [torch.zeros(blocks, tok, hd, device=DEV, dtype=torch.bfloat16) for _ in range(L)]
     host = [torch.randn(n, tok, hd).bfloat16().pin_memory() for _ in range(L)]
-    hidx = torch.randperm(blocks)[:n]
-    idx = hidx.to(DEV)
+    idx = torch.randperm(blocks, device=DEV)[:n]
 
     def eager():
         for l in range(L):
@@ -92,7 +90,7 @@ def case_onload(q):
     def ce_fn(e):
         with e.scope():
             for l in range(L):
-                e.copy_(ce.lazy(kv[l]).index_select(0, hidx), host[l])
+                e.copy_(ce.lazy(kv[l]).index_select(0, idx), host[l])
 
     def check():
         return all(torch.equal(kv[l].index_select(0, idx).cpu(), host[l]) for l in range(L))

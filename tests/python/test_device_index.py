@@ -143,3 +143,42 @@ def test_gathers_into_disjoint_slices_are_one_launch():
     assert last["waves"] == 1 and last["groups"] == 1 and last["calls"] == 1, last
     torch.cuda.synchronize()
     assert torch.equal(pool, torch.stack([c[ids] for c in caches]))
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_device_indices_with_pinned_host_side(dtype):
+    # Pages of a GPU cache by GPU block ids into pinned host buffers (offload),
+    # and back into scattered GPU blocks (load): the indices never leave the GPU.
+    blocks, tok, hd, n = 32, 16, 64, 8
+    kv = torch.randn(blocks, tok, hd, device=DEV).to(dtype)
+    host = torch.zeros(n, tok, hd, dtype=dtype).pin_memory()
+    back = torch.zeros(blocks, tok, hd, device=DEV, dtype=dtype)
+    e = ce.Engine(tune_trials=1, tune_topk=4)
+    seen = set()
+    for k in range(10):
+        idx = torch.randperm(blocks, device=DEV)[:n]
+        host.zero_()
+        e.copy_(host, ce.lazy(kv).index_select(0, idx))
+        e.synchronize()
+        seen.update(e.stats()["last"]["strategies"])
+        assert torch.equal(host, kv.index_select(0, idx).cpu())
+        back.zero_()
+        e.copy_(ce.lazy(back).index_select(0, idx), host)
+        e.synchronize()
+        seen.update(e.stats()["last"]["strategies"])
+        assert torch.equal(back.index_select(0, idx), kv.index_select(0, idx))
+        assert int((back != 0).any(-1).any(-1).sum()) <= n  # nothing outside the selected blocks
+        g = e.gather(kv, idx, 0, out=torch.empty(n, tok, hd, dtype=dtype).pin_memory())
+        e.synchronize()
+        assert torch.equal(g, kv.index_select(0, idx).cpu())
+        dst = torch.zeros(blocks, tok, hd, device=DEV, dtype=dtype)
+        e.scatter_(dst, idx, host, 0)
+        e.synchronize()
+        assert torch.equal(dst.index_select(0, idx), host.to(DEV))
+    assert seen - {"native"}, seen  # copyengine's own strategies were explored
+
+
+def test_device_indices_refuse_pageable_host_memory():
+    idx = torch.arange(4, device=DEV)
+    with pytest.raises(ce.Unsupported):
+        ce.Engine(prior_only=True).copy_(torch.zeros(4, 8), ce.lazy(torch.randn(8, 8, device=DEV)).index_select(0, idx))

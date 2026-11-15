@@ -4,6 +4,13 @@ copyengine follows [semantic versioning](https://semver.org). From 0.1.0 on,
 the Python API, the C ABI (`CE_ABI_VERSION`) and the tuning profile format
 change incompatibly only in a new minor (0.x) or major release.
 
+## Unreleased
+
+- Explicit copies with GPU indices may have their other side in pinned host
+  memory (paged offload by GPU block ids: `ce.copy_(host, ce.lazy(kv).index_select(0, gpu_ids))`,
+  and the load back): the statement kernel reads the indices and reaches the
+  host side directly; the indices never leave the GPU.
+
 ## 0.4.2
 
 - Fix: memory copyengine took from torch's allocator (copy tables, staging,

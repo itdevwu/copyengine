@@ -557,11 +557,17 @@ struct Engine::Impl {
         if (t.dev.ptr) (t.dev.host() ? on_host : on_gpu) = true;
     const bool scuda = src.device.kind == DeviceKind::cuda, dcuda = dst.device.kind == DeviceKind::cuda;
     if (on_gpu) {
-      if (!scuda || !(src.device == dst.device))
-        fail(Errc::unsupported, "device indices need both tensors on the GPU that holds the indices");
+      // The GPU's tensors and the tables on one GPU; the other side may be
+      // pinned host memory (the statement kernel reaches it zero-copy).
+      if (!scuda && !dcuda) fail(Errc::unsupported, "device indices need a tensor on the GPU that holds them");
+      if (scuda && dcuda && !(src.device == dst.device))
+        fail(Errc::unsupported, "device indices with tensors on two GPUs");
+      if ((!scuda && !src.pinned) || (!dcuda && !dst.pinned))
+        fail(Errc::unsupported, "device indices with pageable host memory (pin it)");
+      const int gpu = scuda ? src.device.index : dst.device.index;
       for (const Access* a : {&stmt.src, &stmt.dst})
         for (const Term& t : a->terms())
-          if (t.dev.ptr && !t.dev.host() && t.dev.device != src.device.index)
+          if (t.dev.ptr && !t.dev.host() && t.dev.device != gpu)
             fail(Errc::unsupported, "device indices on another GPU than the tensors");
     }
     if (on_host && !scuda && !dcuda) fail(Errc::unsupported, "host index tables need a GPU on one side");

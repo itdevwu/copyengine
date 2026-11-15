@@ -6,7 +6,7 @@ description: Diagnose copyengine in a PyTorch program - why copies did not get f
 # Diagnose copyengine
 
 Diagnose from copyengine's own evidence before changing code. This Skill
-supports copyengine `0.2.x`; check `copyengine.__version__` first.
+supports copyengine `0.3.x`; check `copyengine.__version__` first.
 
 ## First look
 
@@ -48,9 +48,8 @@ Read `why` in the decisions:
   Fix the shim (below) for loops of many small copies.
 - Host overhead dominates tiny copies (a few us each): batch them in one scope,
   or `freeze()` a fixed set and `plan.run()` it.
-- An index given as a CUDA tensor costs a device sync per call before 0.3;
-  from 0.3 it stays on the GPU (a `ValueError` at `synchronize()` means one
-  was out of range).
+- A CUDA index tensor stays on the GPU (no sync); a `ValueError` at
+  `synchronize()` means one of its indices was out of range.
 
 ## Errors
 
@@ -85,7 +84,7 @@ Read `why` in the decisions:
 - `CE_STAGING_MB` caps device staging (default 256 MB, allocated on demand).
 - `Engine(max_sms=N)` / `CE_MAX_SMS`: `st["cuda"][i]["sm_limit"]` says whether
   the limit is hard (green context, verified) or soft (thread-block cap).
-- `scope(bandwidth=...)` (0.3+): limited groups show strategy `paced` and the
+- `scope(bandwidth=...)`: limited groups show strategy `paced` and the
   decision "bandwidth limit"; `st["cuda"][i]["zero_copy"]` says whether
   small rows may use kernels over pinned host memory. A limited copy inside
   a CUDA graph capture must run once before capturing.

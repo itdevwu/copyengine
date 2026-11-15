@@ -12,11 +12,11 @@ bits, faster) on the user's machine. Never claim a speedup you did not measure.
 
 ## Check the installation
 
-This Skill supports copyengine `0.2.x`:
+This Skill supports copyengine `0.3.x`:
 
 ```bash
 python -c "import copyengine as ce, torch; print(ce.__version__, torch.__version__)"
-python -m pip install 'copyengine~=0.2.0'   # if missing or another series
+python -m pip install 'copyengine~=0.3.0'   # if missing or another series
 python -c "import copyengine as ce; print('shim:', ce._shim.lib is not None, ce._shim.error); print('ops:', ce._torch_ops.copy_ is not None, ce._torch_ops.error)"
 ```
 
@@ -51,16 +51,16 @@ Read [patterns](references/patterns.md) for code. In short:
 | Gather / permute / slice / cast torch can't express as one view | `ce.copy_(out, ce.lazy(src).index_select(...).permute(...))` |
 | Quantize / dequantize while copying | `ce.copy_(dst, src, fn=ce.Elementwise(scale=..., clamp=(lo, hi)))` |
 | Ragged / CSR segments | `ce.segments(src, dst, src_off, dst_off, length)` |
-| One copy per layer from Python lists of tensors (0.3+) | `ce.copy_many(dsts, srcs)` instead of a `copy_` loop |
+| One copy per layer from Python lists of tensors | `ce.copy_many(dsts, srcs)` instead of a `copy_` loop |
 | The same copies every step, same buffers | `plan = eng.freeze()` once, then `plan.run()` (also inside `torch.cuda.graph`) |
-| The same step every iteration, new index tensors or host index arrays (0.3+) | `step = ce.plan(fn)` once, then `step(*args)`; all buffers are arguments |
+| The same step every iteration, new index tensors or host index arrays | `step = ce.plan(fn)` once, then `step(*args)`; all buffers are arguments |
 | Copies should overlap compute | `with ce.scope(stream="copy") as h:` ... `h.wait()` before use |
 | Copies must not take SMs from compute | `ce.Engine(max_sms=N)` |
-| Background offload must leave PCIe / memory bandwidth to other work (0.3+) | `with ce.scope(stream="copy", bandwidth=8e9) as h:` |
+| Background offload must leave PCIe / memory bandwidth to other work | `with ce.scope(stream="copy", bandwidth=8e9) as h:` |
 
 Use one `ce.Engine()` per thread (the module-level functions already do).
-Keep index lists on the host on hot paths: before 0.3 a CUDA index tensor
-costs a sync (from 0.3 it stays on the GPU).
+Index tensors may stay on the GPU (no sync): `ce.gather`, `ce.scatter_` and
+`ce.lazy(...).index_select` read them there.
 
 ## Warm up, then serve without exploring
 

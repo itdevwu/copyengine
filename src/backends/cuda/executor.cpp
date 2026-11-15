@@ -264,8 +264,11 @@ class CudaExecutor final : public Executor {
   std::vector<Strategy> candidates(const Group& g) override {
     const int di = device_of(g);
     Dev& s = state(di);
-    if (g.tiles) {  // quantization while copying: the tile kernel, all tensors on this GPU
+    if (g.tiles) {  // quantization while copying: the tile kernel on this GPU
       if (!s.kernels) fail(Errc::unsupported, "quantization on the GPU needs the copy kernels: " + s.kernel_error);
+      const bool host_side = g.src.device.kind != DeviceKind::cuda || g.dst.device.kind != DeviceKind::cuda;
+      if (host_side && !zero_copy_ok(s))  // pinned host memory read / written by the kernel
+        fail(Errc::unsupported, "quantizing to or from host memory needs zero-copy kernels: " + s.zero_copy_error);
       return {Strategy::tile};
     }
     if (g.opaque()) {  // indices read at run time: the statement kernel, or (host tables) DMA expanded per run

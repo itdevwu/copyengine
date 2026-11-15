@@ -223,3 +223,50 @@ def test_static_scale(dev, fmt, g):
         got = q2.cpu().view(torch.uint8).reshape(-1)
         nan = got.view(torch.uint8) == 0x7F if fmt == "fp8_e4m3" else torch.zeros_like(got, dtype=torch.bool)
         assert torch.equal(got[~nan], want[~nan])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("fmt,g", [("fp8_e4m3", 128), ("nvfp4", 16), ("uint4", 64)])
+def test_across_gpu_and_pinned_host(fmt, g):
+    # Offload: quantize GPU pages straight into pinned host buffers, and load
+    # them back (dequantize from pinned host into the GPU), in one pass each.
+    blocks, D = 16, 2 * g
+    gs = 0.02 if fmt == "nvfp4" else 1.0
+    kv = data((blocks, 4), D, torch.bfloat16, "cuda", seed=9)
+    q, scale, zero = (None if t is None else t.pin_memory() for t in outputs(fmt, (blocks, 4), D, g, "cpu"))
+    for e in engines():
+        e.quantize(kv, q, scale, zero, fmt=fmt, group=g, global_scale=gs)
+        e.synchronize()
+        check(fmt, g, kv, q, scale, zero, gs)
+        back = torch.zeros(blocks, 4, D, device="cuda")
+        e.dequantize(q, scale, back, zero, fmt=fmt, group=g, global_scale=gs)
+        torch.cuda.synchronize()
+        codes, s, bits = _quant.quantize(kv.cpu(), g, fmt, gs=gs)
+        want = _quant.dequantize(codes, s, bits, g, fmt, gs).view(back.shape)
+        got = back.cpu()
+        nan = got.isnan()
+        assert torch.equal(nan, want.isnan()) and torch.equal(got[~nan], want[~nan])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_step_plan_quantizes_with_new_gpu_indices():
+    blocks, D, g = 32, 256, 128
+    kv = data((blocks, 4), D, torch.float32, "cuda", seed=3)
+    q, scale, _ = outputs("fp8_e4m3", (blocks, 4), D, g, "cuda")
+
+    def offload(kv, q, scale, pages, slots):
+        ce.quantize(kv, q, scale, fmt="fp8_e4m3", group=g, x_index=pages, index=slots)
+
+    p = ce.Engine().plan(offload)
+    replayed = False
+    for k in range(200):
+        pages, slots = torch.randperm(blocks, device="cuda")[:8], torch.randperm(blocks, device="cuda")[:8]
+        p(kv, q, scale, pages, slots)
+        torch.cuda.synchronize()
+        check("fp8_e4m3", g, kv[pages], rows(q, slots), rows(scale, slots), None)
+        tr = next(iter(p._layouts.values()))["traces"]
+        if tr and tr[-1].site is not None and tr[-1].site.decided is not None:
+            replayed = True
+            if k > 80:
+                break
+    assert replayed and tr[-1].plain is None

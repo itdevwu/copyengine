@@ -108,6 +108,10 @@ ce.dequantize(q_cache, scales, kv, fmt="fp8_e4m3", group=128, index=slots, x_ind
 ce.quantize(v.transpose(-1, -2), qv.transpose(-1, -2), sv, fmt="int8", group=16)
 ```
 
+The cache may be in pinned host memory: the kernel then writes it directly
+(zero-copy) or through device staging in chunks (DMA overlapping the
+kernels), whichever measures faster; host `index=` values select pool slots.
+
 Only quantize tokens that hold data (pass their rows with `index=`); keep an
 incomplete group in full precision until it fills. Results follow the
 recipes in `copyengine/_quant.py` on every device; torch code computing the

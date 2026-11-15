@@ -637,10 +637,23 @@ struct Engine::Impl {
                                               : "the scale must be float32");
     const bool zero = f == QFmt::uint4;
     if (zero && itemsize(t.zero.ep.dtype) != 1) fail(Errc::invalid_argument, "the zero point must be uint8");
-    const Device dev = t.x.ep.device;
-    for (const TileSpec::Side* s : {&t.q, &t.scale})
-      if (!(s->ep.device == dev)) fail(Errc::unsupported, "quantization tensors must be on one device");
-    if (zero && !(t.zero.ep.device == dev)) fail(Errc::unsupported, "quantization tensors must be on one device");
+    // All on the host, or on one GPU with the rest in pinned host memory (the
+    // kernel reads and writes it directly: quantize and move in one pass).
+    std::vector<const TileSpec::Side*> sides{&t.x, &t.q, &t.scale};
+    if (zero) sides.push_back(&t.zero);
+    Device dev{DeviceKind::host, 0};
+    for (const auto* s : sides)
+      if (s->ep.device.kind == DeviceKind::cuda) {
+        if (dev.kind == DeviceKind::cuda && !(s->ep.device == dev))
+          fail(Errc::unsupported, "quantization tensors on two GPUs");
+        dev = s->ep.device;
+      }
+    if (dev.kind == DeviceKind::cuda && t.x.ep.device.kind != DeviceKind::cuda && t.q.ep.device.kind != DeviceKind::cuda)
+      fail(Errc::unsupported, "quantization with only the scale on a GPU");
+    if (dev.kind == DeviceKind::cuda)
+      for (const auto* s : sides)
+        if (s->ep.device.kind == DeviceKind::host && !s->ep.pinned)
+          fail(Errc::unsupported, "quantization between a GPU and pageable host memory (pin it)");
 
     for (const TileSpec::Index* ix : {&t.x_index, &t.index}) {
       if (!ix->used()) continue;
@@ -692,7 +705,7 @@ struct Engine::Impl {
       else hc = std::make_shared<std::vector<int64_t>>(t.index.host), k->ci = reinterpret_cast<long long>(hc->data());
     }
 
-    const Side xs{dev, xd, t.x.ep.pinned}, qs{dev, qd, t.q.ep.pinned};
+    const Side xs{t.x.ep.device, xd, t.x.ep.pinned}, qs{t.q.ep.device, qd, t.q.ep.pinned};
     exec_for(xs, qs);
     Op op;
     op.src = t.quantize ? xs : qs;
@@ -708,8 +721,8 @@ struct Engine::Impl {
     body->wr->start.push_back(wr.first), body->wr->end.push_back(wr.second);
     op.body = std::move(body);
     const bool writes_scale = t.quantize && !t.static_scale;
-    op.extras.push_back({dev, sr.first, sr.second, writes_scale});
-    if (zero) op.extras.push_back({dev, zr.first, zr.second, writes_scale});
+    op.extras.push_back({t.scale.ep.device, sr.first, sr.second, writes_scale});
+    if (zero) op.extras.push_back({t.zero.ep.device, zr.first, zr.second, writes_scale});
     op.tile = std::move(k);
     op.tile_index[0] = std::move(hx), op.tile_index[1] = std::move(hc);
     op.tile_dev_index = t.x_index.dev || t.index.dev;
@@ -1275,8 +1288,16 @@ class FrozenImpl final : public Frozen {
           if (p >= r.lo && p < r.hi) return r.to + (p - r.lo);
         return p;
       };
-      for (size_t k = 0; k < work_.size(); ++k)
-        if ((*ops_)[k].opaque) work_[k].stab = remap((*ops_)[k].stab), work_[k].dtab = remap((*ops_)[k].dtab);
+      for (size_t k = 0; k < work_.size(); ++k) {
+        const Op& op = (*ops_)[k];
+        if (op.opaque) work_[k].stab = remap(op.stab), work_[k].dtab = remap(op.dtab);
+        if (op.tile && op.tile_dev_index) {  // a tile op's GPU index tables
+          auto t = std::make_shared<cv::TileK>(*op.tile);
+          if (t->xi && !op.tile_index[0]) t->xi = static_cast<long long>(remap(static_cast<uintptr_t>(t->xi)));
+          if (t->ci && !op.tile_index[1]) t->ci = static_cast<long long>(remap(static_cast<uintptr_t>(t->ci)));
+          work_[k].tile = std::move(t);
+        }
+      }
       ops = &work_;
     }
     const Engine::Impl::Capture cap(*eng_, stream);
@@ -1292,6 +1313,10 @@ class FrozenImpl final : public Frozen {
     for (const Op& op : *ops_) {
       if (op.stab) t.push_back(op.stab);
       if (op.dtab) t.push_back(op.dtab);
+      if (op.tile && op.tile_dev_index) {  // GPU index tables of tile ops (host ones are values in the plan)
+        if (op.tile->xi && !op.tile_index[0]) t.push_back(static_cast<uintptr_t>(op.tile->xi));
+        if (op.tile->ci && !op.tile_index[1]) t.push_back(static_cast<uintptr_t>(op.tile->ci));
+      }
     }
     return t;
   }

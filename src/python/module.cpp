@@ -206,6 +206,25 @@ NB_MODULE(_core, m) {
       .def("offsets", [](const ce::Access& a) { return to_numpy(a.offsets()); })
       .def("extent", &ce::Access::extent);
 
+  nb::class_<ce::TileSpec::Side>(m, "TileSide")
+      .def("__init__", [](ce::TileSpec::Side* s, const ce::Endpoint& ep, int64_t offset,
+                          const std::array<int64_t, 3>& row_stride, int64_t step) {
+        new (s) ce::TileSpec::Side{ep, offset, row_stride, step};
+      }, "ep"_a, "offset"_a, "row_stride"_a, "step"_a);
+  nb::class_<ce::TileSpec>(m, "TileSpec")
+      .def(nb::init<>())
+      .def_rw("fmt", &ce::TileSpec::fmt)
+      .def_rw("quantize", &ce::TileSpec::quantize)
+      .def_rw("g", &ce::TileSpec::g)
+      .def_rw("eps", &ce::TileSpec::eps)
+      .def_rw("gs", &ce::TileSpec::gs)
+      .def_rw("rows", &ce::TileSpec::rows)
+      .def_rw("upr", &ce::TileSpec::upr)
+      .def_rw("x", &ce::TileSpec::x)
+      .def_rw("q", &ce::TileSpec::q)
+      .def_rw("scale", &ce::TileSpec::scale)
+      .def_rw("zero", &ce::TileSpec::zero);
+
   nb::class_<ce::Stmt>(m, "Stmt")
       .def(nb::init<ce::Access, ce::Access>(), "dst"_a, "src"_a)
       .def_ro("dst", &ce::Stmt::dst)
@@ -327,6 +346,14 @@ NB_MODULE(_core, m) {
         e.copy(src, dst, stmt, fn, h, stream);
       }, "src"_a, "dst"_a, "stmt"_a, "fn"_a, "valid_start"_a = nb::none(), "valid_len"_a = nb::none(),
          "ctx"_a = "", "stream"_a = 0, "native"_a = nb::none())
+      .def("tile", [](ce::Engine& e, const ce::TileSpec& spec, const std::string& ctx, uintptr_t stream,
+                      nb::handle native) {
+        ce::Hints h;
+        h.ctx = ctx;
+        h.native = py_payload(native);
+        nb::gil_scoped_release release;
+        e.tile(spec, h, stream);
+      }, "spec"_a, "ctx"_a = "", "stream"_a = 0, "native"_a = nb::none())
       .def("copy_strided", [](ce::Engine& e, const ce::Endpoint& src, const ce::Endpoint& dst,
                               const std::vector<i64>& s_shape, const std::vector<i64>& s_strides, i64 s_off,
                               const std::vector<i64>& d_shape, const std::vector<i64>& d_strides, i64 d_off,

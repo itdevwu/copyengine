@@ -391,6 +391,73 @@ class Engine:
                 if self._opts.allow_async:
                     self._retire(held)
 
+    # ---- quantization while copying (docs/design/v0.4.md) ------------------------------
+
+    def quantize(self, x, q, scale, zero=None, *, fmt: str, group: Optional[int] = None, eps: float = 1e-12,
+                 global_scale: float = 1.0, ctx: str = "") -> None:
+        """Quantize `x` per unit of `group` values along its last dimension into
+        `q` and `scale` (and `zero` for uint4), bit for bit as the format's torch
+        recipe (copyengine._quant). Shapes: x [..., D]; q [..., D] (packed
+        formats: [..., D / 2], two values per byte); scale and zero [..., D / group].
+        """
+        self._tile(True, x, q, scale, zero, fmt, group, eps, global_scale, ctx)
+
+    def dequantize(self, q, scale, out, zero=None, *, fmt: str, group: Optional[int] = None,
+                   global_scale: float = 1.0, ctx: str = "") -> None:
+        """``out = q * scale`` per unit (the inverse of :meth:`quantize`)."""
+        self._tile(False, out, q, scale, zero, fmt, group, 1e-12, global_scale, ctx)
+
+    def _tile(self, quantize, x, q, scale, zero, fmt, group, eps, gs, ctx) -> None:
+        from . import _quant
+        if fmt not in _quant.FMT:
+            raise ValueError(f"unknown format {fmt!r}; one of {sorted(_quant.FMT)}")
+        tensors = [x, q, scale] + ([zero] if fmt == "uint4" else [])
+        if fmt == "uint4" and zero is None:
+            raise ValueError("uint4 needs a zero-point tensor (`zero`)")
+        if not all(is_tensor(t) for t in tensors):
+            raise TypeError("quantize / dequantize take torch tensors")
+        D = x.shape[-1]
+        g = _quant.UNIT.get(fmt, group if group is not None else D)
+        if group is not None and fmt in _quant.UNIT and group != g:
+            raise ValueError(f"{fmt} uses units of {g} values")
+        if g <= 0 or D % g:
+            raise ValueError(f"the last dimension ({D}) is not a multiple of the unit size ({g})")
+        lead = tuple(x.shape[:-1])
+        packed = fmt in _quant.PACKED
+        if tuple(q.shape) != lead + ((D // 2,) if packed else (D,)):
+            raise ValueError(f"q has shape {tuple(q.shape)}, expected {lead + ((D // 2,) if packed else (D,))}")
+        for name, t in (("scale", scale), ("zero", zero if fmt == "uint4" else None)):
+            if t is not None and tuple(t.shape) != lead + (D // g,):
+                raise ValueError(f"{name} has shape {tuple(t.shape)}, expected {lead + (D // g,)}")
+        if len(lead) > 3:
+            raise ValueError("at most three leading dimensions")
+
+        def side(t):
+            v = view(t)
+            isz = t.element_size()
+            rs = [s * isz for s in t.stride()[:-1]]
+            rs = rs + [0] * (3 - len(rs))
+            return _core.TileSide(v.endpoint, t.storage_offset() * isz, rs, t.stride(-1) * isz), v
+
+        spec = _core.TileSpec()
+        spec.fmt, spec.quantize, spec.g, spec.eps, spec.gs = _quant.FMT[fmt], quantize, g, float(eps), float(gs)
+        spec.rows = list(lead) + [1] * (3 - len(lead))
+        spec.upr = D // g
+        sides = {}
+        for name, t in (("x", x), ("q", q), ("scale", scale), ("zero", zero if fmt == "uint4" else None)):
+            if t is not None:
+                sides[name] = side(t)
+        spec.x, spec.q, spec.scale = sides["x"][0], sides["q"][0], sides["scale"][0]
+        if "zero" in sides:
+            spec.zero = sides["zero"][0]
+        if quantize:
+            native = (_quant.native_quantize, x, q, scale, zero, fmt, g, eps, gs)
+        else:
+            native = (_quant.native_dequantize, q, scale, zero, x, fmt, g, gs)
+        with self._lock:
+            self._e.tile(spec, ctx=ctx, stream=current_stream(sides["x"][1], sides["q"][1]), native=native)
+            self._after(*tensors)
+
     def segments(self, src, dst, src_off, dst_off, length, *, fn: Optional[Elementwise] = None,
                  valid_src: Optional[tuple] = None, ctx: str = "") -> None:
         """Copy runs ``dst.flat[d:d+n] = fn(src.flat[s:s+n])`` (element offsets).
@@ -845,6 +912,14 @@ def scope(stream=None, *, bandwidth: Optional[float] = None):
 
 def copy_(dst, src, **kw):
     return default_engine().copy_(dst, src, **kw)
+
+
+def quantize(x, q, scale, zero=None, **kw):
+    return default_engine().quantize(x, q, scale, zero, **kw)
+
+
+def dequantize(q, scale, out, zero=None, **kw):
+    return default_engine().dequantize(q, scale, out, zero, **kw)
 
 
 def copy_many(dsts, srcs, **kw):

@@ -446,8 +446,8 @@ struct Engine::Impl {
 
   // torch's own copy keeps its buffers safe itself (it records events on pinned memory).
   void run_native_now(Op& op, uintptr_t strm) {
-    if (!queue.empty() && (strm != stream || conflicts(op.src.device, op.src_lo, op.src_hi, op.dst.device, op.dst_lo,
-                                                      op.dst_hi)))
+    if (!queue.empty() && (strm != stream || !op.extras.empty() ||
+                           conflicts(op.src.device, op.src_lo, op.src_hi, op.dst.device, op.dst_lo, op.dst_hi)))
       flush();
     const bool host_only = op.src.device.kind == DeviceKind::host && op.dst.device.kind == DeviceKind::host;
     if (host_only && host_pending && !capturing) synchronize();  // host work may touch what CUDA work still uses
@@ -491,6 +491,7 @@ struct Engine::Impl {
     stream = strm;
     add_alloc(q_reads, op.src.device, op.src_lo, op.src_hi);
     add_alloc(q_writes, op.dst.device, op.dst_lo, op.dst_hi);
+    for (const Op::Extra& x : op.extras) add_alloc(x.write ? q_writes : q_reads, x.device, x.lo, x.hi);
     queue.push_back(std::move(op));
     if (depth == 0) {
       flush();
@@ -591,6 +592,106 @@ struct Engine::Impl {
     kh.add(fingerprint_sides(op));
     kh.add(uint64_t{0x0DE7});
     kh.add(static_cast<uint64_t>(lg2(op.form->numel * ss)));
+    op.key = kh.done();
+    op.native = hints.native;
+    op.host_async = hints.host_async;
+    op.enqueue_us = us_since(t0);
+    push(std::move(op), strm);
+  }
+
+  // Byte range [lo, hi) a tile tensor's layout touches: rows, then `count`
+  // steps of `step` bytes, each `width` bytes wide.
+  static std::pair<int64_t, int64_t> tile_extent(const TileSpec& t, const TileSpec::Side& s, int64_t count,
+                                                 int64_t width) {
+    int64_t lo = static_cast<int64_t>(s.ep.base) + s.offset, hi = lo;
+    for (int k = 0; k < 3; ++k) {
+      const int64_t span = (t.rows[k] - 1) * s.row_stride[k];
+      lo += std::min<int64_t>(0, span), hi += std::max<int64_t>(0, span);
+    }
+    const int64_t span = (count - 1) * s.step;
+    lo += std::min<int64_t>(0, span), hi += std::max<int64_t>(0, span);
+    return {lo, hi + width};
+  }
+
+  void enqueue_tile(const TileSpec& t, const Hints& hints, uintptr_t strm, Clock::time_point t0) {
+    using cv::QFmt;
+    const auto f = static_cast<QFmt>(t.fmt);
+    if (t.fmt < 0 || t.fmt > static_cast<int>(QFmt::uint4)) fail(Errc::invalid_argument, "unknown quantization format");
+    const bool packed = cv::qfmt_packed(f), mx = cv::qfmt_mx(f), byte_scale = mx || f == QFmt::nvfp4;
+    if (t.g <= 0 || (packed && t.g % 2) || t.upr <= 0) fail(Errc::invalid_argument, "bad unit size");
+    if (mx && t.g != 32) fail(Errc::invalid_argument, "MX formats use units of 32 values");
+    if (f == QFmt::nvfp4 && t.g != 16) fail(Errc::invalid_argument, "NVFP4 uses units of 16 values");
+    const DType xd = t.x.ep.dtype;
+    if (xd != DType::f32 && xd != DType::f16 && xd != DType::bf16)
+      fail(Errc::invalid_argument, "the full-precision tensor must be float32, float16 or bfloat16");
+    const DType want_q = f == QFmt::fp8_e4m3 || f == QFmt::mxfp8_e4m3 ? DType::f8e4m3
+                         : f == QFmt::fp8_e5m2 || f == QFmt::mxfp8_e5m2 ? DType::f8e5m2
+                         : f == QFmt::int8                               ? DType::i8
+                                                                         : DType::u8;
+    const DType qd = t.q.ep.dtype;
+    if (!(qd == want_q || (packed && (qd == DType::u8 || qd == DType::i8 || qd == DType::f4x2))))
+      fail(Errc::invalid_argument, "the quantized tensor's dtype does not match the format");
+    const DType sd = t.scale.ep.dtype;
+    if (byte_scale ? itemsize(sd) != 1 : sd != DType::f32)
+      fail(Errc::invalid_argument, byte_scale ? "the scale must be a one-byte tensor (E8M0 for MX, E4M3 for NVFP4)"
+                                              : "the scale must be float32");
+    const bool zero = f == QFmt::uint4;
+    if (zero && itemsize(t.zero.ep.dtype) != 1) fail(Errc::invalid_argument, "the zero point must be uint8");
+    const Device dev = t.x.ep.device;
+    for (const TileSpec::Side* s : {&t.q, &t.scale})
+      if (!(s->ep.device == dev)) fail(Errc::unsupported, "quantization tensors must be on one device");
+    if (zero && !(t.zero.ep.device == dev)) fail(Errc::unsupported, "quantization tensors must be on one device");
+
+    const int64_t vals = t.upr * t.g;
+    const auto bound = [](const TileSpec::Side& s, std::pair<int64_t, int64_t> e, const char* what) {
+      const int64_t b = static_cast<int64_t>(s.ep.base);
+      if (e.first < b || e.second > b + s.ep.nbytes) fail(Errc::invalid_argument, std::string(what) + " out of bounds");
+      return e;
+    };
+    const auto xr = bound(t.x, tile_extent(t, t.x, vals, static_cast<int64_t>(itemsize(xd))), "x");
+    const auto qr = bound(t.q, tile_extent(t, t.q, packed ? vals / 2 : vals, 1), "q");
+    const auto sr = bound(t.scale, tile_extent(t, t.scale, t.upr, byte_scale ? 1 : 4), "scale");
+    std::pair<int64_t, int64_t> zr{0, 0};
+    if (zero) zr = bound(t.zero, tile_extent(t, t.zero, t.upr, 1), "zero");
+
+    auto k = std::make_shared<cv::TileK>();
+    auto at = [](const TileSpec::Side& s) { return static_cast<long long>(s.ep.base) + s.offset; };
+    k->x = at(t.x), k->q = at(t.q), k->s = at(t.scale), k->z = zero ? at(t.zero) : 0;
+    for (int i = 0; i < 3; ++i) {
+      k->rows[i] = t.rows[i];
+      k->xr[i] = t.x.row_stride[i], k->qr[i] = t.q.row_stride[i], k->sr[i] = t.scale.row_stride[i];
+      k->zr[i] = zero ? t.zero.row_stride[i] : 0;
+    }
+    k->xe = t.x.step, k->qe = t.q.step, k->se = t.scale.step, k->ze = zero ? t.zero.step : 0;
+    k->g = t.g, k->upr = static_cast<int>(t.upr), k->fmt = t.fmt, k->xdt = static_cast<int>(xd);
+    k->scale_byte = byte_scale, k->quantize = t.quantize, k->eps = t.eps, k->gs = t.gs;
+
+    const Side xs{dev, xd, t.x.ep.pinned}, qs{dev, qd, t.q.ep.pinned};
+    exec_for(xs, qs);
+    Op op;
+    op.src = t.quantize ? xs : qs;
+    op.dst = t.quantize ? qs : xs;
+    const auto& src_ep = t.quantize ? t.x.ep : t.q.ep;
+    const auto& dst_ep = t.quantize ? t.q.ep : t.x.ep;
+    op.src_lo = static_cast<int64_t>(src_ep.base), op.src_hi = op.src_lo + src_ep.nbytes;
+    op.dst_lo = static_cast<int64_t>(dst_ep.base), op.dst_hi = op.dst_lo + dst_ep.nbytes;
+    auto body = std::make_shared<OpBody>();
+    const auto rd = t.quantize ? xr : qr, wr = t.quantize ? qr : xr;
+    body->rd = std::make_unique<Intervals>(), body->wr = std::make_unique<Intervals>();
+    body->rd->start.push_back(rd.first), body->rd->end.push_back(rd.second);
+    body->wr->start.push_back(wr.first), body->wr->end.push_back(wr.second);
+    op.body = std::move(body);
+    op.extras.push_back({dev, sr.first, sr.second, t.quantize});
+    if (zero) op.extras.push_back({dev, zr.first, zr.second, t.quantize});
+    op.tile = std::move(k);
+    op.opaque = true;
+    op.ctx = hints.ctx;
+    op.fp = fingerprint(op);
+    Hasher kh;
+    kh.add(fingerprint_sides(op));
+    kh.add(uint64_t{0x711E});
+    kh.add(static_cast<uint64_t>(t.fmt) | (uint64_t{t.quantize} << 8));
+    kh.add(static_cast<uint64_t>(lg2(op.tile->units() * t.g)));
     op.key = kh.done();
     op.native = hints.native;
     op.host_async = hints.host_async;
@@ -942,6 +1043,13 @@ void Engine::copy(const Endpoint& src, const Endpoint& dst, const Stmt& stmt, co
   Locked lk(*impl_);
   impl_->check_thread();
   impl_->enqueue_stmt(src, dst, stmt, fn, hints, stream, t0);
+}
+
+void Engine::tile(const TileSpec& spec, const Hints& hints, uintptr_t stream) {
+  const auto t0 = Clock::now();
+  Locked lk(*impl_);
+  impl_->check_thread();
+  impl_->enqueue_tile(spec, hints, stream, t0);
 }
 
 void Engine::fence(std::span<const Range> reads, std::span<const Range> writes) {

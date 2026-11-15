@@ -174,6 +174,7 @@ void copy_rows(const Group& g, size_t r, i64 row_begin, i64 row_end) {
 HostExecutor::HostExecutor(int threads) : pool_(std::max(1, threads)) {}
 
 std::vector<Strategy> HostExecutor::candidates(const Group& g) {
+  if (!g.ops.empty() && g.tiles) return {Strategy::tile};
   if (pool_.size() > 1 && g.bytes() >= kParallelMinBytes) return {Strategy::runs_parallel, Strategy::runs};
   return {Strategy::runs};
 }
@@ -225,6 +226,18 @@ int64_t HostExecutor::run(Strategy s, const Group& g, const std::vector<Op>& ops
         }
       });
       return static_cast<int64_t>(tasks.size());
+    }
+    case Strategy::tile: {  // units in parallel: each touches only its own values, scale and zero point
+      std::vector<std::pair<const cv::TileK*, long long>> parts;  // (op, first unit) in chunks
+      constexpr long long kUnits = 256;
+      for (int k : g.ops)
+        for (long long u = 0; u < ops[k].tile->units(); u += kUnits) parts.emplace_back(ops[k].tile.get(), u);
+      pool_.parallel_for(static_cast<int64_t>(parts.size()), [&](int64_t i) {
+        const auto [t, u0] = parts[i];
+        const long long u1 = std::min(t->units(), u0 + kUnits);
+        for (long long u = u0; u < u1; ++u) cv::tile_unit(*t, u);
+      });
+      return static_cast<int64_t>(parts.size());
     }
     default:
       fail(Errc::unsupported, "host backend cannot run strategy " + std::string(strategy_name(s)));

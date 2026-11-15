@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <array>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -76,6 +77,28 @@ class NativeOp {
     (void)host_async;
     run(stream);
   }
+};
+
+// A tile op (quantization while copying, docs/design/v0.4.md): rows of `upr`
+// units of `g` values along the innermost dimension of x. Each tensor is an
+// endpoint plus its layout in bytes from the endpoint's base: `offset` of the
+// first unit, `row_stride` of up to three row dimensions, `step` between
+// consecutive values (x, q; packed formats: between bytes of two values) or
+// units (scale, zero).
+struct TileSpec {
+  struct Side {
+    Endpoint ep;
+    int64_t offset = 0;
+    std::array<int64_t, 3> row_stride{0, 0, 0};
+    int64_t step = 0;
+  };
+  int fmt = 0;              // ce::cv::QFmt
+  bool quantize = true;     // else dequantize
+  int g = 1;                // values per unit
+  float eps = 1e-12f, gs = 1.0f;
+  std::array<int64_t, 3> rows{1, 1, 1};
+  int64_t upr = 1;          // units per row
+  Side x, q, scale, zero;   // zero: uint4 only
 };
 
 struct Hints {

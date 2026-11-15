@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 
+#include "core/tile.hpp"
 #include "copyengine/engine.hpp"
 #include "copyengine/ir.hpp"
 #include "copyengine/types.hpp"
@@ -102,6 +103,15 @@ struct Op {
   bool opaque = false;
   double bandwidth = 0;            // bytes/s limit of its scope (0: none), mixed into fp
   std::shared_ptr<const Form> form;  // null when the statement has tables or came in as runs
+  // A tile op (quantization while copying): its kernel description, and the
+  // footprints beyond src / dst (scale, zero point), each on its device.
+  std::shared_ptr<const cv::TileK> tile;
+  struct Extra {
+    Device device;
+    int64_t lo = 0, hi = 0;  // absolute bytes
+    bool write = false;
+  };
+  std::vector<Extra> extras;
   Hash128 fp;  // content fingerprint
   // byte-interval read / write sets (absolute addresses), computed lazily
   const Intervals& read() const;
@@ -127,6 +137,7 @@ struct Group {
   int64_t op_runs = 0;   // runs of the ops as submitted: what passthrough issues
   int64_t opaque_elems = 0;  // elements of ops without runs (device tables): only their forms can run them
   bool opaque() const { return opaque_elems > 0; }
+  bool tiles = false;  // tile ops (quantization while copying): only the tile strategy runs them
   Rects rects;           // structure recovered from runs
   // Allocation boundaries on each side, in run units: one copy call never
   // crosses them (separate allocations, even adjacent ones, are not one range

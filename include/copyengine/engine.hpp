@@ -24,8 +24,9 @@ enum class Strategy : uint8_t {
   native,         // each op through the frontend's own implementation (torch's copy_): the baseline
   paced,          // CUDA: a bandwidth-limited group in chunks, a GPU pacing kernel before each (QoS)
   lowered,        // CUDA: host index tables expanded into DMA descriptors at each run
+  tile,           // tile ops (quantization while copying): units of values (host loop, or one warp each)
 };
-inline constexpr int kNumStrategies = 11;
+inline constexpr int kNumStrategies = 12;
 std::string_view strategy_name(Strategy s);
 Strategy parse_strategy(std::string_view name);
 
@@ -98,6 +99,10 @@ class Engine {
   // L3 entry: structured statement; offsets relative to the endpoints' bases.
   void copy(const Endpoint& src, const Endpoint& dst, const Stmt& stmt, const Elementwise& fn = {},
             const Hints& hints = {}, uintptr_t stream = 0);
+
+  // Quantization / dequantization while copying (TileSpec). All tensors on one
+  // device (a GPU, or the host).
+  void tile(const TileSpec& spec, const Hints& hints = {}, uintptr_t stream = 0);
 
   // Before other work reads `reads` and writes `writes` (whole allocations):
   // issues queued copies that conflict with them. Free when nothing is queued.

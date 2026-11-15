@@ -4,7 +4,7 @@ the torch recipes of docs/design/v0.4.md, bit for bit (NaN for NaN)."""
 import numpy as np
 import pytest
 
-from copyengine import _core
+from copyengine import _core, _quant
 
 torch = pytest.importorskip("torch")
 

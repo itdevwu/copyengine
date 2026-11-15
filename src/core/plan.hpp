@@ -114,6 +114,10 @@ struct Op {
   // Host index tables read when the op runs (TileK::xi / ci point at a step
   // plan's parameter buffer): their values are checked then, not when queued.
   bool tile_host_ptr[2] = {false, false};
+  // Its host tensors are compact enough for device staging: what the kernel
+  // reads spans at most twice the bytes it holds, what it writes is dense,
+  // and no index tables (rows could be anywhere). Set when queued.
+  bool tile_host = false, tile_staged_ok = false;
   struct Extra {
     Device device;
     int64_t lo = 0, hi = 0;  // absolute bytes
@@ -145,7 +149,9 @@ struct Group {
   int64_t op_runs = 0;   // runs of the ops as submitted: what passthrough issues
   int64_t opaque_elems = 0;  // elements of ops without runs (device tables): only their forms can run them
   bool opaque() const { return opaque_elems > 0; }
-  bool tiles = false;  // tile ops (quantization while copying): only the tile strategy runs them
+  bool tiles = false;  // tile ops (quantization while copying): only the tile strategies run them
+  bool tile_host_sides = false;  // some tensor of its tile ops is in host memory
+  bool tile_staged_ok = false;   // ... and every op can go through device staging (Op::tile_staged_ok)
   Rects rects;           // structure recovered from runs
   // Allocation boundaries on each side, in run units: one copy call never
   // crosses them (separate allocations, even adjacent ones, are not one range

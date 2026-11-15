@@ -234,18 +234,26 @@ def test_across_gpu_and_pinned_host(fmt, g):
     gs = 0.02 if fmt == "nvfp4" else 1.0
     kv = data((blocks, 4), D, torch.bfloat16, "cuda", seed=9)
     q, scale, zero = (None if t is None else t.pin_memory() for t in outputs(fmt, (blocks, 4), D, g, "cpu"))
+    seen = set()
     for e in engines():
-        e.quantize(kv, q, scale, zero, fmt=fmt, group=g, global_scale=gs)
-        e.synchronize()
-        check(fmt, g, kv, q, scale, zero, gs)
-        back = torch.zeros(blocks, 4, D, device="cuda")
-        e.dequantize(q, scale, back, zero, fmt=fmt, group=g, global_scale=gs)
-        torch.cuda.synchronize()
-        codes, s, bits = _quant.quantize(kv.cpu(), g, fmt, gs=gs)
-        want = _quant.dequantize(codes, s, bits, g, fmt, gs).view(back.shape)
-        got = back.cpu()
-        nan = got.isnan()
-        assert torch.equal(nan, want.isnan()) and torch.equal(got[~nan], want[~nan])
+        for _ in range(8):  # explore: zero-copy kernel, device staging, torch's recipe
+            for t in (q, scale, zero):
+                if t is not None:
+                    t.zero_()
+            e.quantize(kv, q, scale, zero, fmt=fmt, group=g, global_scale=gs)
+            e.synchronize()
+            seen.update(e.stats()["last"]["strategies"])
+            check(fmt, g, kv, q, scale, zero, gs)
+            back = torch.zeros(blocks, 4, D, device="cuda")
+            e.dequantize(q, scale, back, zero, fmt=fmt, group=g, global_scale=gs)
+            torch.cuda.synchronize()
+            seen.update(e.stats()["last"]["strategies"])
+            codes, s, bits = _quant.quantize(kv.cpu(), g, fmt, gs=gs)
+            want = _quant.dequantize(codes, s, bits, g, fmt, gs).view(back.shape)
+            got = back.cpu()
+            nan = got.isnan()
+            assert torch.equal(nan, want.isnan()) and torch.equal(got[~nan], want[~nan])
+    assert "tile_staged" in seen
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")

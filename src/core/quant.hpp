@@ -27,6 +27,19 @@ CE_HD float qmax_of(QFmt f) {
   }
 }
 
+// 1 / qmax as float32, folded at compile time (a constant expression is
+// rounded to nearest, as div_rn is; the intrinsic is not folded).
+CE_HD float inv_qmax_of(QFmt f) {
+  switch (f) {
+    case QFmt::fp8_e4m3: case QFmt::mxfp8_e4m3: { constexpr float r = 1.0f / 448.0f; return r; }
+    case QFmt::fp8_e5m2: case QFmt::mxfp8_e5m2: { constexpr float r = 1.0f / 57344.0f; return r; }
+    case QFmt::int8: { constexpr float r = 1.0f / 127.0f; return r; }
+    case QFmt::int4: { constexpr float r = 1.0f / 7.0f; return r; }
+    case QFmt::uint4: { constexpr float r = 1.0f / 15.0f; return r; }
+    default: { constexpr float r = 1.0f / 6.0f; return r; }
+  }
+}
+
 CE_HD bool is_nan(float x) { return x != x; }
 
 // IEEE float32 product and quotient, round to nearest: on the GPU through
@@ -74,20 +87,13 @@ CE_HD float dequant_scaled(uint8_t q, QFmt f) {
 // ---- E2M1 (NVFP4 elements) ----------------------------------------------------------
 
 // Nearest even on the E2M1 grid {0, .5, 1, 1.5, 2, 3, 4, 6}; NaN -> +0.
+// The code counts the grid's midpoints below |v| (ties to the even code):
+// the recipe's formula, without branches.
 CE_HD uint8_t float_to_e2m1(float v) {
-  if (is_nan(v)) return 0;
-  const uint8_t s = (f2u(v) >> 28) & 0x8u;
   const float m = abs_f(v);
-  uint8_t c;
-  if (m <= 0.25f) c = 0;
-  else if (m < 0.75f) c = 1;
-  else if (m <= 1.25f) c = 2;
-  else if (m < 1.75f) c = 3;
-  else if (m <= 2.5f) c = 4;
-  else if (m < 3.5f) c = 5;
-  else if (m <= 5.0f) c = 6;
-  else c = 7;
-  return static_cast<uint8_t>(s | c);
+  const uint32_t c = (m > 0.25f) + (m >= 0.75f) + (m > 1.25f) + (m >= 1.75f) + (m > 2.5f) + (m >= 3.5f) + (m > 5.0f);
+  const uint32_t s = (f2u(v) >> 28) & 0x8u;
+  return is_nan(v) ? 0 : static_cast<uint8_t>(s | c);
 }
 
 // The bits of the E2M1 value built directly (no table: kernels would keep it
@@ -115,17 +121,18 @@ struct UnitQ {
 
 CE_HD bool qfmt_needs_range(QFmt f) { return f == QFmt::uint4; }
 
-CE_HD UnitQ unit_params_div(QFmt f, float amax, float lo, float hi, float eps, float gs) {
+// `igs`: 1 / gs (NVFP4's global scale), computed once by the caller.
+CE_HD UnitQ unit_params_div(QFmt f, float amax, float lo, float hi, float eps, float gs, float igs) {
   UnitQ u;
   auto floor_eps = [&](float v) { return is_nan(v) ? v : (v < eps ? eps : v); };
   switch (f) {
     // Constants divide as products with their float32 reciprocal: what torch
     // computes for tensor / scalar on the GPU, and the same on every device.
     case QFmt::fp8_e4m3: case QFmt::fp8_e5m2: case QFmt::int8: case QFmt::int4:
-      u.scale = u.div = mul_rn(floor_eps(amax), div_rn(1.0f, qmax_of(f)));
+      u.scale = u.div = mul_rn(floor_eps(amax), inv_qmax_of(f));
       return u;
     case QFmt::uint4: {
-      u.scale = u.div = mul_rn(floor_eps(hi - lo), div_rn(1.0f, 15.0f));
+      u.scale = u.div = mul_rn(floor_eps(hi - lo), inv_qmax_of(f));
       u.inv = div_rn(1.0f, u.div);
       const float zf = clamp_f(rintf(mul_rn(-lo, u.inv)), 0.0f, 15.0f);
       u.bits = is_nan(zf) ? 0 : static_cast<uint8_t>(zf);
@@ -152,7 +159,7 @@ CE_HD UnitQ unit_params_div(QFmt f, float amax, float lo, float hi, float eps, f
       return u;
     }
     case QFmt::nvfp4: {
-      float sv = mul_rn(mul_rn(amax, div_rn(1.0f, 6.0f)), div_rn(1.0f, gs));  // .clamp(max=448)
+      float sv = mul_rn(mul_rn(amax, inv_qmax_of(f)), igs);  // .clamp(max=448)
       if (!is_nan(sv) && sv > 448.0f) sv = 448.0f;
       u.bits = float_to_f8e4m3(sv);
       const float sf = f8e4m3_to_float(u.bits);
@@ -167,10 +174,21 @@ CE_HD UnitQ unit_params_div(QFmt f, float amax, float lo, float hi, float eps, f
 // The values are multiplied by 1 / div, computed once per unit: the common
 // optimized form (one division per unit, not per value). For MX the divisor
 // is a power of two, so the product equals the division exactly.
-CE_HD UnitQ unit_params(QFmt f, float amax, float lo, float hi, float eps, float gs) {
-  UnitQ u = unit_params_div(f, amax, lo, hi, eps, gs);
-  u.inv = div_rn(1.0f, u.div);
+// MX divisors are powers of two (or NaN): the reciprocal from the bits.
+CE_HD float pow2_recip(uint8_t e8m0) {
+  if (e8m0 == 0xFF) return u2f(0x7FC00000u);
+  const int s = static_cast<int>(e8m0) - 127;  // div = 2^s (s = -127: 2^-127, subnormal)
+  const int e = 127 - s;                        // 1 / div = 2^-s
+  return e >= 1 ? u2f(static_cast<uint32_t>(e) << 23) : u2f(0x00400000u);
+}
+
+CE_HD UnitQ unit_params(QFmt f, float amax, float lo, float hi, float eps, float gs, float igs) {
+  UnitQ u = unit_params_div(f, amax, lo, hi, eps, gs, igs);
+  u.inv = qfmt_mx(f) ? pow2_recip(u.bits) : div_rn(1.0f, u.div);
   return u;
+}
+CE_HD UnitQ unit_params(QFmt f, float amax, float lo, float hi, float eps, float gs) {
+  return unit_params(f, amax, lo, hi, eps, gs, div_rn(1.0f, gs));
 }
 
 // Static quantization: the unit's parameters from a given scale (float32;

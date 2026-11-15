@@ -449,3 +449,32 @@ def test_step_plan_quantizes_with_new_host_indices(dev):
     assert len(p._layouts) == 1 and len(lay["traces"]) == 1, "new host indices traced again"
     tr = lay["traces"][0]
     assert tr.plain is None and len(tr.params) == 2 and not tr.vguard
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("fmt", ["fp8_e4m3", "int8", "int4", "uint4"])
+@pytest.mark.parametrize("g", [8, 32, 64, 128, 256, 512, 1024])
+def test_gpu_vector_widths(dtype, fmt, g):
+    # Contiguous tensors take the vector path: 4 or 8 values per thread, units
+    # in registers or (long ones) read again; dynamic and static scales.
+    if fmt in ("int4", "uint4") and g % 2:
+        pytest.skip("packed formats need even units")
+    x = data((8, 3), 2 * g, dtype, "cuda", seed=g)
+    q, scale, zero = outputs(fmt, (8, 3), 2 * g, g, "cuda")
+    e = ce.Engine(prior_only=True)
+    e.quantize(x, q, scale, zero, fmt=fmt, group=g)
+    torch.cuda.synchronize()
+    check(fmt, g, x, q, scale, zero)
+    back = torch.zeros(8, 3, 2 * g, dtype=dtype, device="cuda")
+    e.dequantize(q, scale, back, zero, fmt=fmt, group=g)
+    torch.cuda.synchronize()
+    codes, s, bits = _quant.quantize(x.cpu(), g, fmt)
+    want = _quant.dequantize(codes, s, bits, g, fmt).to(dtype).view(back.shape)
+    got = back.cpu()
+    nan = got.isnan()
+    assert torch.equal(nan, want.isnan()) and torch.equal(got[~nan], want[~nan])
+    q2 = torch.zeros_like(q)
+    e.quantize(x, q2, scale, zero, fmt=fmt, group=g, static=True)
+    torch.cuda.synchronize()
+    assert torch.equal(q2.view(torch.uint8).cpu(), q.view(torch.uint8).cpu())

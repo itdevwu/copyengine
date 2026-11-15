@@ -49,7 +49,8 @@ Read [patterns](references/patterns.md) for code. In short:
 |---|---|
 | Loop of `copy_` calls, code must stay as is | `with ce.scope():` around the loop |
 | Gather / permute / slice / cast torch can't express as one view | `ce.copy_(out, ce.lazy(src).index_select(...).permute(...))` |
-| Quantize / dequantize while copying | `ce.copy_(dst, src, fn=ce.Elementwise(scale=..., clamp=(lo, hi)))` |
+| Quantize / dequantize while copying, one scale | `ce.copy_(dst, src, fn=ce.Elementwise(scale=..., clamp=(lo, hi)))` |
+| Quantize per group (FP8 / INT8 / INT4 / MXFP8 / NVFP4), scales computed or given | `ce.quantize(x, q, scale, fmt=..., group=...)`, `ce.dequantize(q, scale, out, ...)`; `x_index=` / `index=` gather pages and write cache blocks |
 | Ragged / CSR segments | `ce.segments(src, dst, src_off, dst_off, length)` |
 | One copy per layer from Python lists of tensors | `ce.copy_many(dsts, srcs)` instead of a `copy_` loop |
 | The same copies every step, same buffers | `plan = eng.freeze()` once, then `plan.run()` (also inside `torch.cuda.graph`) |

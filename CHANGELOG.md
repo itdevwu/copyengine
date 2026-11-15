@@ -4,6 +4,18 @@ copyengine follows [semantic versioning](https://semver.org). From 0.1.0 on,
 the Python API, the C ABI (`CE_ABI_VERSION`) and the tuning profile format
 change incompatibly only in a new minor (0.x) or major release.
 
+## Unreleased
+
+- Quantization while copying (`ce.quantize`, `ce.dequantize`): FP8 (E4M3,
+  E5M2), INT8, INT4 (symmetric) and UINT4 (zero points) per group of values,
+  MXFP8 with E8M0 scales, NVFP4 with E4M3 scales and a global scale; dynamic
+  or static scales; gathers and scatters by index (host or GPU indices);
+  tensors on one GPU and in pinned host memory (quantize and move in one
+  pass); inside scopes and step plans. Each format's result is defined by
+  its torch recipe in `copyengine/_quant.py`, with the same bits on the host
+  and every GPU. Copies keep matching torch itself bit for bit; computation
+  matches its recipe (torch's own arithmetic differs across devices).
+
 ## 0.3.0
 
 - Step plans take host index arguments (numpy arrays, lists of ints, CPU

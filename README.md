@@ -154,17 +154,20 @@ ce.copy_(out_fp16, src)
 # 3. Quantize / dequantize on the way.
 ce.copy_(q_int8, x, fn=ce.Elementwise(scale=1 / qs, round=True, clamp=(-127, 127)))
 
-# 4. Ragged or CSR layouts: many segments in one call.
+# 4. Quantize while copying: FP8 / INT8 / INT4 / MXFP8 / NVFP4 per group of values.
+ce.quantize(kv, q_cache, scales, fmt="fp8_e4m3", group=128, x_index=pages, index=slots)
+
+# 5. Ragged or CSR layouts: many segments in one call.
 ce.segments(src, dst, src_off, dst_off, length)
 
-# 5. Overlap copies with compute: run them on a copy stream, the host never waits.
+# 6. Overlap copies with compute: run them on a copy stream, the host never waits.
 with ce.scope(stream="copy") as h:      # or stream=<a torch.cuda.Stream>
     for l in range(num_layers):
         next_kv[l].copy_(host_kv[l, ids])
 ...                                     # compute keeps running on the current stream
 h.wait()                                # the current stream waits for the copies (GPU side)
 
-# 6. A step that runs every iteration with new indices: plan it once.
+# 7. A step that runs every iteration with new indices: plan it once.
 def load_blocks(caches, pool, block_ids):      # caches: one tensor per layer
     for l, cache in enumerate(caches):
         ce.gather(cache, block_ids, 0, out=pool[l])

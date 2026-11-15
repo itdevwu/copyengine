@@ -658,7 +658,7 @@ struct Engine::Impl {
     for (const TileSpec::Index* ix : {&t.x_index, &t.index}) {
       if (!ix->used()) continue;
       if (ix->dev && dev.kind != DeviceKind::cuda) fail(Errc::unsupported, "GPU index tables need GPU tensors");
-      if (!ix->dev && static_cast<int64_t>(ix->host.size()) != t.rows[0])
+      if (!ix->dev && !ix->host_ptr && static_cast<int64_t>(ix->host.size()) != t.rows[0])
         fail(Errc::invalid_argument, "an index table's length is not rows[0]");
       for (int64_t v : ix->host)
         if (v < 0 || v >= ix->bound) fail(Errc::invalid_argument, "index out of range");
@@ -701,14 +701,17 @@ struct Engine::Impl {
     // Index tables: host values live with the op (the executor reads them, or
     // uploads them for a kernel); GPU ones are this call's pointer.
     std::shared_ptr<std::vector<int64_t>> hx, hc;
+    bool by_ptr[2] = {false, false};
     if (t.x_index.used()) {
       k->xb = t.x_index.bound;
       if (t.x_index.dev) k->xi = static_cast<long long>(t.x_index.dev);
+      else if (t.x_index.host_ptr) k->xi = static_cast<long long>(t.x_index.host_ptr), by_ptr[0] = true;
       else hx = std::make_shared<std::vector<int64_t>>(t.x_index.host), k->xi = reinterpret_cast<long long>(hx->data());
     }
     if (t.index.used()) {
       k->cb = t.index.bound;
       if (t.index.dev) k->ci = static_cast<long long>(t.index.dev);
+      else if (t.index.host_ptr) k->ci = static_cast<long long>(t.index.host_ptr), by_ptr[1] = true;
       else hc = std::make_shared<std::vector<int64_t>>(t.index.host), k->ci = reinterpret_cast<long long>(hc->data());
     }
 
@@ -732,6 +735,7 @@ struct Engine::Impl {
     if (zero) op.extras.push_back({t.zero.ep.device, zr.first, zr.second, writes_scale});
     op.tile = std::move(k);
     op.tile_index[0] = std::move(hx), op.tile_index[1] = std::move(hc);
+    op.tile_host_ptr[0] = by_ptr[0], op.tile_host_ptr[1] = by_ptr[1];
     op.tile_dev_index = t.x_index.dev || t.index.dev;
     op.opaque = true;
     op.ctx = hints.ctx;
@@ -1300,8 +1304,10 @@ class FrozenImpl final : public Frozen {
         if (op.opaque) work_[k].stab = remap(op.stab), work_[k].dtab = remap(op.dtab);
         if (op.tile && op.tile_dev_index) {  // a tile op's GPU index tables
           auto t = std::make_shared<cv::TileK>(*op.tile);
-          if (t->xi && !op.tile_index[0]) t->xi = static_cast<long long>(remap(static_cast<uintptr_t>(t->xi)));
-          if (t->ci && !op.tile_index[1]) t->ci = static_cast<long long>(remap(static_cast<uintptr_t>(t->ci)));
+          if (t->xi && !op.tile_index[0] && !op.tile_host_ptr[0])
+            t->xi = static_cast<long long>(remap(static_cast<uintptr_t>(t->xi)));
+          if (t->ci && !op.tile_index[1] && !op.tile_host_ptr[1])
+            t->ci = static_cast<long long>(remap(static_cast<uintptr_t>(t->ci)));
           work_[k].tile = std::move(t);
         }
       }
@@ -1321,8 +1327,8 @@ class FrozenImpl final : public Frozen {
       if (op.stab) t.push_back(op.stab);
       if (op.dtab) t.push_back(op.dtab);
       if (op.tile && op.tile_dev_index) {  // GPU index tables of tile ops (host ones are values in the plan)
-        if (op.tile->xi && !op.tile_index[0]) t.push_back(static_cast<uintptr_t>(op.tile->xi));
-        if (op.tile->ci && !op.tile_index[1]) t.push_back(static_cast<uintptr_t>(op.tile->ci));
+        if (op.tile->xi && !op.tile_index[0] && !op.tile_host_ptr[0]) t.push_back(static_cast<uintptr_t>(op.tile->xi));
+        if (op.tile->ci && !op.tile_index[1] && !op.tile_host_ptr[1]) t.push_back(static_cast<uintptr_t>(op.tile->ci));
       }
     }
     return t;

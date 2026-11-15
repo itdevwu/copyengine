@@ -270,3 +270,27 @@ def test_step_plan_quantizes_with_new_gpu_indices():
             if k > 80:
                 break
     assert replayed and tr[-1].plain is None
+
+
+@pytest.mark.parametrize("dev", DEVS)
+def test_step_plan_quantizes_with_new_host_indices(dev):
+    # Host block ids (a list, new each step) are plan parameters: no new trace.
+    blocks, D, g = 32, 256, 128
+    kv = data((blocks, 4), D, torch.float32, dev, seed=4)
+    q, scale, _ = outputs("fp8_e4m3", (blocks, 4), D, g, dev)
+
+    def offload(kv, q, scale, pages, slots):
+        ce.quantize(kv, q, scale, fmt="fp8_e4m3", group=g, x_index=pages, index=slots)
+
+    p = ce.Engine().plan(offload)
+    for k in range(150):
+        pages, slots = torch.randperm(blocks)[:8].tolist(), torch.randperm(blocks)[:8].numpy()
+        p(kv, q, scale, pages, slots)
+        if dev == "cuda":
+            torch.cuda.synchronize()
+        check("fp8_e4m3", g, kv[torch.tensor(pages)], rows(q, torch.from_numpy(slots)),
+              rows(scale, torch.from_numpy(slots)), None)
+    lay = next(iter(p._layouts.values()))
+    assert len(p._layouts) == 1 and len(lay["traces"]) == 1, "new host indices traced again"
+    tr = lay["traces"][0]
+    assert tr.plain is None and len(tr.params) == 2 and not tr.vguard

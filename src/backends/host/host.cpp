@@ -228,6 +228,14 @@ int64_t HostExecutor::run(Strategy s, const Group& g, const std::vector<Op>& ops
       return static_cast<int64_t>(tasks.size());
     }
     case Strategy::tile: {  // units in parallel: each touches only its own values, scale and zero point
+      for (int k : g.ops)  // a plan's host index parameters: this call's values
+        for (int w = 0; w < 2; ++w)
+          if (ops[k].tile_host_ptr[w]) {
+            const cv::TileK& t = *ops[k].tile;
+            const auto* p = reinterpret_cast<const int64_t*>(static_cast<uintptr_t>(w ? t.ci : t.xi));
+            for (long long r = 0; r < t.rows[0]; ++r)
+              if (p[r] < 0 || p[r] >= (w ? t.cb : t.xb)) fail(Errc::invalid_argument, "index out of range");
+          }
       std::vector<std::pair<const cv::TileK*, long long>> parts;  // (op, first unit) in chunks
       constexpr long long kUnits = 256;
       for (int k : g.ops)

@@ -365,27 +365,30 @@ class Engine:
         if len(dsts) != len(srcs):
             raise ValueError(f"copy_many: {len(dsts)} destinations, {len(srcs)} sources")
         op = _torch_ops.copy_many_
-        fast = op is not None and not ctx and all(
-            type(t) is _Tensor and t.layout is _STRIDED and t.dtype not in _NOT_STABLE
-            for t in itertools.chain(dsts, srcs))
+
+        def stable(t):
+            return type(t) is _Tensor and t.layout is _STRIDED and t.dtype not in _NOT_STABLE
+
+        # Pairs the C++ op takes go in one call; the rest pair by pair (same scope, one plan).
+        fast = [] if op is None or ctx else [i for i in range(len(dsts)) if stable(dsts[i]) and stable(srcs[i])]
+        rest = sorted(set(range(len(dsts))) - set(fast))
         with self._lock:
             self._e.begin_scope()
             self._set_depth(self._depth + 1)
             try:
                 if fast:
                     try:
-                        op(list(dsts), list(srcs), self._handle)
+                        op([dsts[i] for i in fast], [srcs[i] for i in fast], self._handle)
                     except RuntimeError as e:
                         raise _torch_ops.translate(e) from None
-                else:
-                    for d, s in zip(dsts, srcs):
-                        self.copy_(d, s, ctx=ctx)
+                for i in rest:
+                    self.copy_(dsts[i], srcs[i], ctx=ctx)
             finally:
                 self._set_depth(self._depth - 1)
                 self._e.end_scope()
-            if fast:
-                self._held.extend(dsts)
-                self._held.extend(srcs)
+            for i in fast:
+                self._held.append(dsts[i])
+                self._held.append(srcs[i])
             if self._depth == 0:  # like a scope's exit: keep buffers only while copies may be pending
                 held, self._held = self._held, []
                 if self._opts.allow_async:
@@ -431,9 +434,12 @@ class Engine:
                 t = device_table(ix)
                 if not base.is_cuda or t.device != base.device:
                     raise ValueError("a GPU index needs its tensors on the same GPU")
-                return t.data_ptr(), [], base.shape[0], t
+                return t.data_ptr(), [], base.shape[0], t, 0
+            p = device_table(ix, host_ok=True)  # a step plan's host index parameter: read when the copy runs
+            if p is not None and not p.is_cuda:
+                return 0, [], base.shape[0], p, p.data_ptr()
             vals = index_array(ix)
-            return 0, vals.tolist(), base.shape[0], torch.from_numpy(vals)
+            return 0, vals.tolist(), base.shape[0], torch.from_numpy(vals), 0
 
         xt, ct = table(x_index, x), table(index, q)
         if ct is not None:
@@ -485,7 +491,7 @@ class Engine:
             spec.zero = sides["zero"][0]
         for x_side, ix in ((True, xt), (False, ct)):
             if ix is not None:
-                spec.set_index(x_side, ix[0], ix[1], ix[2])
+                spec.set_index(x_side, ix[0], ix[1], ix[2], ix[4])
         xi = None if xt is None else xt[3]  # moved to the tensors' device only if the baseline runs
         ci = None if ct is None else ct[3]
         if quantize and static:

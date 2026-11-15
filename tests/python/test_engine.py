@@ -460,9 +460,9 @@ def test_online_sampling_moves_to_native_when_it_gets_fast():
     e = _online_engine()
     t = _copy_seconds(dst, src)
 
-    def slower(d, s):  # ~1.6x ce's copy: loses clearly (noisy runners), but within 2x, so it keeps being re-checked
-        np.copyto(d, s)
-        deadline = time.perf_counter() + 0.6 * t  # sleep() is too coarse at this scale
+    def slower(d, s):  # ~1.7x ce's copy with the call's overhead: loses clearly, but stays within 2x,
+        np.copyto(d, s)      # so it keeps being re-checked online
+        deadline = time.perf_counter() + 0.35 * t  # sleep() is too coarse at this scale
         while time.perf_counter() < deadline:
             pass
 

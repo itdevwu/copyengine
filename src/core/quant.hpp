@@ -104,7 +104,8 @@ CE_HD float e2m1_to_float(uint8_t c) {
 // value is zero (NVFP4 with a zero scale). Computed from the unit's amax, and
 // for uint4 its minimum and maximum (both clamped to include 0).
 struct UnitQ {
-  float div = 1.0f;
+  float div = 1.0f;  // what the values are scaled down by ...
+  float inv = 1.0f;  // ... as a product with its float32 reciprocal (1 / div, once per unit)
   float scale = 0.0f;
   uint8_t bits = 0;
   bool zero_all = false;
@@ -112,7 +113,7 @@ struct UnitQ {
 
 CE_HD bool qfmt_needs_range(QFmt f) { return f == QFmt::uint4; }
 
-CE_HD UnitQ unit_params(QFmt f, float amax, float lo, float hi, float eps, float gs) {
+CE_HD UnitQ unit_params_div(QFmt f, float amax, float lo, float hi, float eps, float gs) {
   UnitQ u;
   auto floor_eps = [&](float v) { return is_nan(v) ? v : (v < eps ? eps : v); };
   switch (f) {
@@ -123,7 +124,8 @@ CE_HD UnitQ unit_params(QFmt f, float amax, float lo, float hi, float eps, float
       return u;
     case QFmt::uint4: {
       u.scale = u.div = mul_rn(floor_eps(hi - lo), div_rn(1.0f, 15.0f));
-      const float zf = clamp_f(rintf(div_rn(-lo, u.div)), 0.0f, 15.0f);
+      u.inv = div_rn(1.0f, u.div);
+      const float zf = clamp_f(rintf(mul_rn(-lo, u.inv)), 0.0f, 15.0f);
       u.bits = is_nan(zf) ? 0 : static_cast<uint8_t>(zf);
       return u;
     }
@@ -160,6 +162,15 @@ CE_HD UnitQ unit_params(QFmt f, float amax, float lo, float hi, float eps, float
   return u;
 }
 
+// The values are multiplied by 1 / div, computed once per unit: the common
+// optimized form (one division per unit, not per value). For MX the divisor
+// is a power of two, so the product equals the division exactly.
+CE_HD UnitQ unit_params(QFmt f, float amax, float lo, float hi, float eps, float gs) {
+  UnitQ u = unit_params_div(f, amax, lo, hi, eps, gs);
+  u.inv = div_rn(1.0f, u.div);
+  return u;
+}
+
 // Static quantization: the unit's parameters from a given scale (float32;
 // for MX / NVFP4 the stored scale byte in `bits`) and uint4's zero point.
 CE_HD UnitQ unit_from_scale(QFmt f, float scale, uint8_t bits, uint8_t zero, float gs) {
@@ -177,6 +188,7 @@ CE_HD UnitQ unit_from_scale(QFmt f, float scale, uint8_t bits, uint8_t zero, flo
     u.div = scale;
     u.bits = zero;
   }
+  u.inv = div_rn(1.0f, u.div);
   return u;
 }
 
@@ -184,17 +196,17 @@ CE_HD UnitQ unit_from_scale(QFmt f, float scale, uint8_t bits, uint8_t zero, flo
 CE_HD uint8_t quant_elem(QFmt f, float x, const UnitQ& u) {
   switch (f) {
     case QFmt::int4: {
-      const float v = div_rn(x, u.div);
+      const float v = mul_rn(x, u.inv);
       return is_nan(v) ? 0 : static_cast<uint8_t>(static_cast<int>(clamp_f(rintf(v), -8.0f, 7.0f)) & 0xF);
     }
     case QFmt::uint4: {
-      const float v = rintf(div_rn(x, u.div)) + static_cast<float>(u.bits);
+      const float v = rintf(mul_rn(x, u.inv)) + static_cast<float>(u.bits);
       return is_nan(v) ? 0 : static_cast<uint8_t>(clamp_f(v, 0.0f, 15.0f));
     }
     case QFmt::nvfp4:
-      return u.zero_all ? 0 : float_to_e2m1(clamp_f(div_rn(x, u.div), -6.0f, 6.0f));
+      return u.zero_all ? 0 : float_to_e2m1(clamp_f(mul_rn(x, u.inv), -6.0f, 6.0f));
     default:
-      return quant_scaled(div_rn(x, u.div), f);
+      return quant_scaled(mul_rn(x, u.inv), f);
   }
 }
 

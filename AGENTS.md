@@ -43,9 +43,10 @@
   and `f` comes from a closed catalog, each entry with one implementation
   shared by host and kernels and a torch recipe (`copyengine/_quant.py`) it
   matches bit for bit on every device. What does not fit stays outside
-  copyengine. Copies (moving, converting) match torch itself bit for bit;
-  computation (a catalog entry) matches its recipe, since torch's own
-  arithmetic differs across devices and forms of the same formula.
+  copyengine. Copies (moving, converting) match torch itself bit for bit.
+  Computation (a catalog entry) takes the common optimized forms (a product
+  with a reciprocal, not a division per value) and matches its recipe on
+  every device; torch's own arithmetic differs across devices and forms.
 - Ops carry absolute element indices (address / itemsize); pure copies are
   normalized to bytes. Dependencies and merging rely on this.
 - Every Executor strategy must be correct for any group it is offered.

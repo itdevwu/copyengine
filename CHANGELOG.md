@@ -4,7 +4,7 @@ copyengine follows [semantic versioning](https://semver.org). From 0.1.0 on,
 the Python API, the C ABI (`CE_ABI_VERSION`) and the tuning profile format
 change incompatibly only in a new minor (0.x) or major release.
 
-## Unreleased
+## 0.3.0
 
 - Step plans take host index arguments (numpy arrays, lists of ints, CPU
   integer tensors) as parameters too: new values each call replay the same

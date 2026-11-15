@@ -777,3 +777,15 @@ def test_copy_many_plans_the_pairs_together(dev):
     arrs = [np.zeros(8, np.float32) for _ in range(3)]
     e.copy_many(arrs, [np.full(8, float(i), np.float32) for i in range(3)])  # not tensors: pair by pair
     assert [a[0] for a in arrs] == [0.0, 1.0, 2.0]
+
+
+def test_copy_many_with_dtypes_the_op_does_not_take():
+    torch = pytest.importorskip("torch")
+    e8 = torch.float8_e8m0fnu  # not on the stable ABI: pair by pair, the rest in one call
+    srcs = [torch.randn(16), torch.randn(8).to(e8), torch.randn(4)]
+    dsts = [torch.zeros(16), torch.zeros(8, dtype=e8), torch.zeros(4)]
+    e = ce.Engine()
+    e.copy_many(dsts, srcs)
+    assert e.stats()["last"]["ops"] == 3
+    for d, s in zip(dsts, srcs):
+        assert torch.equal(d.view(torch.uint8) if d.dtype == e8 else d, s.view(torch.uint8) if s.dtype == e8 else s)

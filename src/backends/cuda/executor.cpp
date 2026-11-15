@@ -1396,6 +1396,14 @@ class CudaExecutor final : public Executor {
           if (op.tile_index[w]) {
             (w ? o.second : o.first) = vals.size();
             for (int64_t i : *op.tile_index[w]) vals.push_back(static_cast<unsigned long long>(i));
+          } else if (op.tile_host_ptr[w]) {  // a plan's parameter buffer: this call's values, checked now
+            (w ? o.second : o.first) = vals.size();
+            const auto* p = reinterpret_cast<const int64_t*>(static_cast<uintptr_t>(w ? op.tile->ci : op.tile->xi));
+            const long long bound = w ? op.tile->cb : op.tile->xb;
+            for (long long r = 0; r < op.tile->rows[0]; ++r) {
+              if (p[r] < 0 || p[r] >= bound) fail(Errc::invalid_argument, "index out of range");
+              vals.push_back(static_cast<unsigned long long>(p[r]));
+            }
           }
         at.push_back(o);
         v.push_back(*op.tile);

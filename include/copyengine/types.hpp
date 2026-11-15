@@ -108,7 +108,10 @@ struct TileSpec {
     uintptr_t dev = 0;
     std::vector<int64_t> host;
     int64_t bound = 0;
-    bool used() const { return dev != 0 || !host.empty(); }
+    // Host values read when the copy runs, from rows[0] int64 at this address
+    // (a step plan's parameter buffer, refilled between calls); 0: none.
+    uintptr_t host_ptr = 0;
+    bool used() const { return dev != 0 || !host.empty() || host_ptr != 0; }
   };
   Index x_index, index;
 };

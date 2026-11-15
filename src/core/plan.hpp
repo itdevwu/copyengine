@@ -111,6 +111,9 @@ struct Op {
   // written per call).
   std::shared_ptr<const std::vector<int64_t>> tile_index[2];
   bool tile_dev_index = false;
+  // Host index tables read when the op runs (TileK::xi / ci point at a step
+  // plan's parameter buffer): their values are checked then, not when queued.
+  bool tile_host_ptr[2] = {false, false};
   struct Extra {
     Device device;
     int64_t lo = 0, hi = 0;  // absolute bytes

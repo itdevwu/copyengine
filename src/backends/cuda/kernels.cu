@@ -759,29 +759,56 @@ __device__ __forceinline__ void store4(long long p, int dt, const float v[4]) {
       make_uint2(h[0] | (static_cast<uint32_t>(h[1]) << 16), h[2] | (static_cast<uint32_t>(h[3]) << 16));
 }
 
-// Threads per unit: 4 values each; a power of two dividing the warp (or the
-// whole warp, looping, for long units). A warp's loads then cover whole
-// units, contiguous (fewer threads per unit would spread a load instruction
-// over many units). 0: the vector path does not apply.
-__device__ __forceinline__ int tile_tpu(const cv::TileK& t) {
-  if (!t.vec) return 0;
-  const int per = t.g >> 2;
-  if (per >= 32) return 32;
-  return (per & (per - 1)) == 0 ? per : 0;
+// Values per chunk W (8 where the unit allows, from 32 values: two adjacent 4-value
+// accesses, twice the bytes in flight per thread at about the same
+// registers; else 4) and threads per unit: a power of two dividing the warp
+// (or the whole warp, looping, for long units). A warp's loads cover whole
+// units, contiguous. tpu 0: the vector path does not apply.
+struct VecShape {
+  int w, tpu;
+};
+__device__ __forceinline__ VecShape tile_shape(const cv::TileK& t) {
+  if (!t.vec) return {4, 0};
+  auto fit = [](int per) { return per >= 32 ? 32 : ((per & (per - 1)) == 0 ? per : 0); };
+  if (t.g % 8 == 0 && t.g >= 32)  // at least 4 threads per unit (fewer spread a load over many units)
+    if (const int tpu = fit(t.g >> 3)) return {8, tpu};
+  return {4, fit(t.g >> 2)};
 }
 
-template <int F, bool Q>
+template <int W>
+__device__ __forceinline__ void loadw(long long p, int dt, float* v) {
+  const long long step = 4LL * (dt == cv::kF32 ? 4 : 2);
+#pragma unroll
+  for (int h = 0; h < W / 4; ++h) load4(p + h * step, dt, v + 4 * h);
+}
+template <int W>
+__device__ __forceinline__ void storew(long long p, int dt, const float* v) {
+  const long long step = 4LL * (dt == cv::kF32 ? 4 : 2);
+#pragma unroll
+  for (int h = 0; h < W / 4; ++h) store4(p + h * step, dt, v + 4 * h);
+}
+
+template <int F, bool Q, int W>
 __device__ void tile_vec(const cv::TileK& t, int lane, long long warp0, long long warps, int tpu) {
   using cv::QFmt;
   constexpr QFmt f = static_cast<QFmt>(F);
   constexpr bool range = f == QFmt::uint4;
   constexpr bool packed = cv::qfmt_packed(f);
-  // Chunks per thread kept in registers (unrolled: no local memory; units
-  // up to 256 values). More would cost occupancy, which is what keeps loads
-  // in flight where few SMs run these kernels.
-  constexpr int kC = 2;
-  const int upw = 32 / tpu, sub = lane & (tpu - 1), cpt = (t.g >> 2) / tpu, stride = 4 * tpu;
+  // Values per thread kept in registers (unrolled: no local memory). More
+  // would cost occupancy, which is what keeps loads in flight where few SMs
+  // run these kernels.
+  constexpr int kC = 8 / W;
+  const int upw = 32 / tpu, sub = lane & (tpu - 1), cpt = (t.g / W) / tpu, stride = W * tpu;
   const long long units = t.units();
+  const float igs = cv::div_rn(1.0f, t.gs);  // once per thread, not per unit
+  // 4 codes per access: a 32-bit word (bytes) or 16 bits (nibbles).
+  auto codes = [&](const cv::UnitAt& a, int base, uint32_t* c4) {
+#pragma unroll
+    for (int h = 0; h < W / 4; ++h) {
+      const uintptr_t qp = static_cast<uintptr_t>(cv::q_at(t, a, base + 4 * h));
+      c4[h] = packed ? *reinterpret_cast<const uint16_t*>(qp) : *reinterpret_cast<const uint32_t*>(qp);
+    }
+  };
   for (long long w = warp0; w * upw < units; w += warps) {
     const long long u = w * upw + lane / tpu;
     cv::UnitAt a{};
@@ -791,30 +818,33 @@ __device__ void tile_vec(const cv::TileK& t, int lane, long long warp0, long lon
       if (a.bad && sub == 0 && t.err) atomicOr(reinterpret_cast<unsigned long long*>(t.err), 1ull);
     }
     const bool ok = u < units && !a.bad;  // the same for a unit's threads: shuffles stay within its group
-    if (!Q) {  // dequantize: 4 codes per load
+    if (!Q) {  // dequantize
       if (!ok) continue;
       const float s = t.scale_byte ? 0.0f : cv::rd<float>(cv::addr(a.s));
       const uint8_t bits =
           t.scale_byte ? cv::rd<uint8_t>(cv::addr(a.s)) : (f == QFmt::uint4 ? cv::rd<uint8_t>(cv::addr(a.z)) : 0);
       const float factor = cv::unit_scale(f, s, bits, t.gs);
       for (int j = 0; j < cpt; ++j) {
-        const int base = sub * 4 + j * stride;
-        const uintptr_t qp = static_cast<uintptr_t>(cv::q_at(t, a, base));
-        const uint32_t c4 = packed ? *reinterpret_cast<const uint16_t*>(qp) : *reinterpret_cast<const uint32_t*>(qp);
-        float v[4];
+        const int base = sub * W + j * stride;
+        uint32_t c4[W / 4];
+        codes(a, base, c4);
+        float v[W];
 #pragma unroll
-        for (int i = 0; i < 4; ++i)
-          v[i] = cv::dequantize_code(f, static_cast<uint8_t>(packed ? (c4 >> (4 * i)) & 0xFu : (c4 >> (8 * i)) & 0xFFu),
-                                     factor, bits);
-        store4(cv::x_at(t, a, base), t.xdt, v);
+        for (int i = 0; i < W; ++i) {
+          const uint32_t c = c4[i / 4];
+          v[i] = cv::dequantize_code(
+              f, static_cast<uint8_t>(packed ? (c >> (4 * (i % 4))) & 0xFu : (c >> (8 * (i % 4))) & 0xFFu), factor,
+              bits);
+        }
+        storew<W>(cv::x_at(t, a, base), t.xdt, v);
       }
       continue;
     }
-    float c[kC][4];
+    float c[kC][W];
     float amax = 0.0f, lo = 0.0f, hi = 0.0f;
-    auto take = [&](const float v[4]) {
+    auto take = [&](const float* v) {
 #pragma unroll
-      for (int i = 0; i < 4; ++i) {
+      for (int i = 0; i < W; ++i) {
         amax = cv::amax_step(amax, cv::abs_f(v[i]));
         if (range) lo = cv::amin_step(lo, v[i]), hi = cv::amax_step(hi, v[i]);
       }
@@ -823,13 +853,15 @@ __device__ void tile_vec(const cv::TileK& t, int lane, long long warp0, long lon
     for (int j = 0; j < kC; ++j) {
       if (j >= cpt) break;
 #pragma unroll
-      for (int i = 0; i < 4; ++i) c[j][i] = 0.0f;
-      if (ok) load4(cv::x_at(t, a, sub * 4 + j * stride), t.xdt, c[j]);
+      for (int i = 0; i < W; ++i) c[j][i] = 0.0f;
+      if (ok) loadw<W>(cv::x_at(t, a, sub * W + j * stride), t.xdt, c[j]);
       take(c[j]);
     }
     for (int j = kC; j < cpt; ++j) {  // long units: read again below
-      float v[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-      if (ok) load4(cv::x_at(t, a, sub * 4 + j * stride), t.xdt, v);
+      float v[W];
+#pragma unroll
+      for (int i = 0; i < W; ++i) v[i] = 0.0f;
+      if (ok) loadw<W>(cv::x_at(t, a, sub * W + j * stride), t.xdt, v);
       take(v);
     }
     for (int o = tpu >> 1; o; o >>= 1) {
@@ -847,34 +879,37 @@ __device__ void tile_vec(const cv::TileK& t, int lane, long long warp0, long lon
       const uint8_t z = f == QFmt::uint4 ? cv::rd<uint8_t>(cv::addr(a.z)) : 0;
       p = cv::unit_from_scale(f, s, sb, z, t.gs);
     } else {
-      p = cv::unit_params(f, amax, lo, hi, t.eps, t.gs);
+      p = cv::unit_params(f, amax, lo, hi, t.eps, t.gs, igs);
       if (sub == 0) {
         if (t.scale_byte) cv::wr<uint8_t>(cv::addr(a.s), p.bits);
         else cv::wr<float>(cv::addr(a.s), p.scale);
         if (f == QFmt::uint4) cv::wr<uint8_t>(cv::addr(a.z), p.bits);
       }
     }
-    auto put = [&](int base, const float v[4]) {
-      uint8_t k[4];
+    auto put = [&](int base, const float* v) {
 #pragma unroll
-      for (int i = 0; i < 4; ++i) k[i] = cv::quant_elem(f, v[i], p);
-      const uintptr_t qp = static_cast<uintptr_t>(cv::q_at(t, a, base));
-      if constexpr (packed) {
-        *reinterpret_cast<uint16_t*>(qp) = static_cast<uint16_t>((k[0] | (k[1] << 4)) | ((k[2] | (k[3] << 4)) << 8));
-      } else {
-        *reinterpret_cast<uint32_t*>(qp) = k[0] | (static_cast<uint32_t>(k[1]) << 8) |
-                                           (static_cast<uint32_t>(k[2]) << 16) | (static_cast<uint32_t>(k[3]) << 24);
+      for (int h = 0; h < W / 4; ++h) {
+        uint8_t k[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) k[i] = cv::quant_elem(f, v[4 * h + i], p);
+        const uintptr_t qp = static_cast<uintptr_t>(cv::q_at(t, a, base + 4 * h));
+        if constexpr (packed) {
+          *reinterpret_cast<uint16_t*>(qp) = static_cast<uint16_t>((k[0] | (k[1] << 4)) | ((k[2] | (k[3] << 4)) << 8));
+        } else {
+          *reinterpret_cast<uint32_t*>(qp) = k[0] | (static_cast<uint32_t>(k[1]) << 8) |
+                                             (static_cast<uint32_t>(k[2]) << 16) | (static_cast<uint32_t>(k[3]) << 24);
+        }
       }
     };
 #pragma unroll
     for (int j = 0; j < kC; ++j) {
       if (j >= cpt) break;
-      put(sub * 4 + j * stride, c[j]);
+      put(sub * W + j * stride, c[j]);
     }
     for (int j = kC; j < cpt; ++j) {
-      float v[4];
-      load4(cv::x_at(t, a, sub * 4 + j * stride), t.xdt, v);
-      put(sub * 4 + j * stride, v);
+      float v[W];
+      loadw<W>(cv::x_at(t, a, sub * W + j * stride), t.xdt, v);
+      put(sub * W + j * stride, v);
     }
   }
 }
@@ -898,8 +933,15 @@ __device__ __forceinline__ void tile_kernel(const cv::TileK* __restrict__ tiles,
           reinterpret_cast<const unsigned long long*>(&tiles[op])[threadIdx.x];
     __syncthreads();
     const cv::TileK& t = sh;
-    if (const int tpu = tile_tpu(t)) {
-      tile_vec<F, Q>(t, lane, warp0, warps, tpu);
+    if (const VecShape v = tile_shape(t); v.tpu) {
+      // NVFP4's units are 16 values: its kernels hold only the 4-wide path.
+      if constexpr (F != static_cast<int>(cv::QFmt::nvfp4)) {
+        if (v.w == 8) {
+          tile_vec<F, Q, 8>(t, lane, warp0, warps, v.tpu);
+          continue;
+        }
+      }
+      tile_vec<F, Q, 4>(t, lane, warp0, warps, v.tpu);
       continue;
     }
     const long long units = t.units();

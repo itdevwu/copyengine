@@ -15,6 +15,7 @@ change incompatibly only in a new minor (0.x) or major release.
   pages by `x_index`, host pool slots by `index`, the slots moved by batched
   DMA). Staging runs in chunks, so DMA overlaps the kernels, and within the
   staging budget.
+- Faster quantization kernels, most where few SMs run them (`max_sms`).
 - Fixes: explicit quantize calls with host indices planned anew on every
   call (new index values missed the plan cache), so they were never tuned;
   device staging of several tile ops in one group could write descriptors

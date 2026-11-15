@@ -79,7 +79,8 @@ Hash128 fingerprint(const Op& op) {
     // Index tables (host values, GPU pointers) are this call's: footprints
     // cover the index bounds and executors read the tables from the ops they
     // run, so new indices hit the same plan.
-    for (int v : {t.g, t.upr, t.fmt, t.xdt, t.scale_byte, t.quantize, t.static_scale}) h.add(static_cast<uint64_t>(v));
+    for (int v : {t.g, t.upr, t.fmt, t.xdt, t.scale_byte, t.quantize, t.static_scale, t.bh}) h.add(static_cast<uint64_t>(v));
+    h.add(static_cast<uint64_t>(t.xp)), h.add(static_cast<uint64_t>(t.qp));
     h.add(std::bit_cast<uint32_t>(t.eps)), h.add(std::bit_cast<uint32_t>(t.gs));
   }
   if (op.opaque && op.form) {  // the structure, not this call's table pointers: new indices hit the same plan

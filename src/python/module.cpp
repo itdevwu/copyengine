@@ -208,15 +208,16 @@ NB_MODULE(_core, m) {
 
   nb::class_<ce::TileSpec::Side>(m, "TileSide")
       .def("__init__", [](ce::TileSpec::Side* s, const ce::Endpoint& ep, int64_t offset,
-                          const std::array<int64_t, 3>& row_stride, int64_t step) {
-        new (s) ce::TileSpec::Side{ep, offset, row_stride, step};
-      }, "ep"_a, "offset"_a, "row_stride"_a, "step"_a);
+                          const std::array<int64_t, 3>& row_stride, int64_t step, int64_t pitch) {
+        new (s) ce::TileSpec::Side{ep, offset, row_stride, step, pitch};
+      }, "ep"_a, "offset"_a, "row_stride"_a, "step"_a, "pitch"_a = 0);
   nb::class_<ce::TileSpec>(m, "TileSpec")
       .def(nb::init<>())
       .def_rw("fmt", &ce::TileSpec::fmt)
       .def_rw("quantize", &ce::TileSpec::quantize)
       .def_rw("static_scale", &ce::TileSpec::static_scale)
       .def_rw("g", &ce::TileSpec::g)
+      .def_rw("bh", &ce::TileSpec::bh)
       .def_rw("eps", &ce::TileSpec::eps)
       .def_rw("gs", &ce::TileSpec::gs)
       .def_rw("rows", &ce::TileSpec::rows)

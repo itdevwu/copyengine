@@ -32,7 +32,9 @@ struct TileK {
   // Units within one row of the first dimension are back to back in every
   // tensor (x, q, s, z): unit u of that row is at a constant step, so finding
   // it takes one division (set when queued; indices still select the row).
-  int flat = 0, pad_ = 0;
+  int flat = 0;
+  int bh = 1;  // box units: bh rows of g values, xp / qp bytes apart (byte formats with float scales)
+  long long xp = 0, qp = 0;
   float eps = 1e-12f, gs = 1.0f;
   // Gathers / scatters: the first row dimension of x (xi), or of the
   // quantized side q, s, z (ci), read through an int64 index table (0: none),
@@ -124,11 +126,45 @@ CE_HD long long q_at(const TileK& t, const UnitAt& a, int k) {
   return qfmt_packed(f) ? a.q + ((a.j * t.g + k) / 2) * t.qe : a.q + (a.j * t.g + k) * t.qe;
 }
 
+// Value (r, c) of a box unit in x, and its code byte in q.
+CE_HD long long xb_at(const TileK& t, const UnitAt& a, int r, int c) { return a.x + r * t.xp + (a.j * t.g + c) * t.xe; }
+CE_HD long long qb_at(const TileK& t, const UnitAt& a, int r, int c) { return a.q + r * t.qp + (a.j * t.g + c) * t.qe; }
+
+// A box unit (byte formats, float32 scale) on the host: the same unit
+// functions over its bh x g values.
+CE_HD void tile_box_unit(const TileK& t, const UnitAt& a) {
+  const QFmt f = static_cast<QFmt>(t.fmt);
+  auto xv = [&](int r, int c) { return val_float(load(addr(xb_at(t, a, r, c)), t.xdt)); };
+  if (!t.quantize) {
+    const float factor = unit_scale(f, rd<float>(addr(a.s)), 0, t.gs);
+    for (int r = 0; r < t.bh; ++r)
+      for (int c = 0; c < t.g; ++c)
+        store_float(addr(xb_at(t, a, r, c)), t.xdt, dequantize_code(f, rd<uint8_t>(addr(qb_at(t, a, r, c))), factor));
+    return;
+  }
+  UnitQ p;
+  if (t.static_scale) {
+    p = unit_from_scale(f, rd<float>(addr(a.s)), 0, 0, t.gs);
+  } else {
+    float amax = 0.0f;
+    for (int r = 0; r < t.bh; ++r)
+      for (int c = 0; c < t.g; ++c) amax = amax_step(amax, abs_f(xv(r, c)));
+    p = unit_params(f, amax, 0.0f, 0.0f, t.eps, t.gs);
+    wr<float>(addr(a.s), p.scale);
+  }
+  for (int r = 0; r < t.bh; ++r)
+    for (int c = 0; c < t.g; ++c) wr<uint8_t>(addr(qb_at(t, a, r, c)), quant_elem(f, xv(r, c), p));
+}
+
 // The host path: one unit, sequentially (kernels split it over a warp).
 CE_HD void tile_unit(const TileK& t, long long u) {
   const QFmt f = static_cast<QFmt>(t.fmt);
   const UnitAt a = unit_at(t, u);
   if (a.bad) return;  // host tables are checked when queued
+  if (t.bh > 1) {
+    tile_box_unit(t, a);
+    return;
+  }
   if (t.quantize && t.static_scale) {
     const float s = t.scale_byte ? 0.0f : rd<float>(addr(a.s));
     const uint8_t sb = t.scale_byte ? rd<uint8_t>(addr(a.s)) : 0;

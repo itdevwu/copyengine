@@ -345,13 +345,21 @@ void scatter_(Tensor dst, Tensor index, Tensor src, int64_t dim, int64_t engine)
 
 // ---- quantization while copying ------------------------------------------------------
 
-// One tensor of a tile op: its storage, and byte offset / row strides / step of the view.
-ce::TileSpec::Side tile_side(const Tensor& t) {
+// One tensor of a tile op: its storage, and byte offset / row strides / step
+// of the view; `bh` > 1: x or q of box units (rows of boxes bh rows apart,
+// a box's rows one row apart).
+ce::TileSpec::Side tile_side(const Tensor& t, int64_t bh = 1) {
   ce::TileSpec::Side s;
   s.ep = endpoint(t);
   const int64_t isz = static_cast<int64_t>(t.element_size()), r = t.dim();
   s.offset = t.storage_offset() * isz;
-  for (int64_t k = 0; k + 1 < r && k < 3; ++k) s.row_stride[static_cast<size_t>(k)] = t.stride(k) * isz;
+  if (bh > 1) {
+    for (int64_t k = 0; k + 2 < r && k < 2; ++k) s.row_stride[static_cast<size_t>(k)] = t.stride(k) * isz;
+    s.row_stride[static_cast<size_t>(std::min<int64_t>(r - 2, 2))] = bh * t.stride(r - 2) * isz;
+    s.pitch = t.stride(r - 2) * isz;
+  } else {
+    for (int64_t k = 0; k + 1 < r && k < 3; ++k) s.row_stride[static_cast<size_t>(k)] = t.stride(k) * isz;
+  }
   s.step = t.stride(r - 1) * isz;
   return s;
 }
@@ -377,10 +385,12 @@ ce::TileSpec::Index tile_index(const std::optional<Tensor>& ix, const Tensor& of
 int64_t unit_of(int64_t fmt, int64_t group) { return fmt == 3 || fmt == 4 ? 32 : fmt == 5 ? 16 : group; }
 
 void tile_op(bool quantize, Tensor x, Tensor q, Tensor scale, const std::optional<Tensor>& zero, int64_t fmt,
-             int64_t group, double eps, double gs, bool static_scale, const std::optional<Tensor>& x_index,
+             int64_t group, int64_t bh, double eps, double gs, bool static_scale, const std::optional<Tensor>& x_index,
              const std::optional<Tensor>& index, int64_t engine) {
   STD_TORCH_CHECK(g_api && g_api->tile, "[copyengine:3] copyengine._torch is not bound to copyengine._core");
-  STD_TORCH_CHECK(x.dim() >= 2 && x.dim() <= 4, "[copyengine:0] x needs one to three leading dimensions");
+  const int64_t lead_dims = x.dim() - (bh > 1 ? 2 : 1);  // box units: rows of boxes are a leading dimension too
+  STD_TORCH_CHECK(lead_dims >= (bh > 1 ? 0 : 1) && lead_dims + (bh > 1 ? 1 : 0) <= 3,
+                  "[copyengine:0] x needs one to three leading dimensions");
   const int64_t D = x.size(x.dim() - 1), g = unit_of(fmt, group);
   STD_TORCH_CHECK(g > 0 && D % g == 0, "[copyengine:0] the last dimension is not a multiple of the unit size");
   ce::TileSpec t;
@@ -388,13 +398,19 @@ void tile_op(bool quantize, Tensor x, Tensor q, Tensor scale, const std::optiona
   t.quantize = quantize;
   t.static_scale = static_scale;
   t.g = static_cast<int>(g);
+  t.bh = static_cast<int>(bh);
   t.eps = static_cast<float>(eps);
   t.gs = static_cast<float>(gs);
   t.upr = D / g;
-  for (int64_t k = 0; k + 1 < x.dim(); ++k) t.rows[static_cast<size_t>(k)] = x.size(k);
+  for (int64_t k = 0; k < lead_dims; ++k) t.rows[static_cast<size_t>(k)] = x.size(k);
+  if (bh > 1) {
+    const int64_t M = x.size(x.dim() - 2);
+    STD_TORCH_CHECK(M % bh == 0, "[copyengine:0] the rows are not a multiple of the block");
+    t.rows[static_cast<size_t>(lead_dims)] = M / bh;
+  }
   if (x_index) t.rows[0] = x_index->numel();
   else if (index) t.rows[0] = index->numel();
-  t.x = tile_side(x), t.q = tile_side(q), t.scale = tile_side(scale);
+  t.x = tile_side(x, bh), t.q = tile_side(q, bh), t.scale = tile_side(scale);
   if (zero) t.zero = tile_side(*zero);
   t.x_index = tile_index(x_index, x);
   t.index = tile_index(index, q);
@@ -406,23 +422,23 @@ void tile_op(bool quantize, Tensor x, Tensor q, Tensor scale, const std::optiona
   STD_TORCH_CHECK(rc == 0, "[copyengine:", rc - 1, "] ", err);
 }
 
-void quantize_(Tensor x, Tensor q, Tensor scale, std::optional<Tensor> zero, int64_t fmt, int64_t group, double eps,
-               double gs, bool static_scale, std::optional<Tensor> x_index, std::optional<Tensor> index,
+void quantize_(Tensor x, Tensor q, Tensor scale, std::optional<Tensor> zero, int64_t fmt, int64_t group, int64_t bh,
+               double eps, double gs, bool static_scale, std::optional<Tensor> x_index, std::optional<Tensor> index,
                int64_t engine) {
-  tile_op(true, std::move(x), std::move(q), std::move(scale), zero, fmt, group, eps, gs, static_scale, x_index, index,
-          engine);
+  tile_op(true, std::move(x), std::move(q), std::move(scale), zero, fmt, group, bh, eps, gs, static_scale, x_index,
+          index, engine);
 }
 
 void dequantize_(Tensor q, Tensor scale, Tensor out, std::optional<Tensor> zero, int64_t fmt, int64_t group,
-                 double gs, std::optional<Tensor> x_index, std::optional<Tensor> index, int64_t engine) {
-  tile_op(false, std::move(out), std::move(q), std::move(scale), zero, fmt, group, 1e-12, gs, false, x_index, index,
-          engine);
+                 int64_t bh, double gs, std::optional<Tensor> x_index, std::optional<Tensor> index, int64_t engine) {
+  tile_op(false, std::move(out), std::move(q), std::move(scale), zero, fmt, group, bh, 1e-12, gs, false, x_index,
+          index, engine);
 }
 
-void quantize_meta(Tensor, Tensor, Tensor, std::optional<Tensor>, int64_t, int64_t, double, double, bool,
+void quantize_meta(Tensor, Tensor, Tensor, std::optional<Tensor>, int64_t, int64_t, int64_t, double, double, bool,
                    std::optional<Tensor>, std::optional<Tensor>, int64_t) {}
-void dequantize_meta(Tensor, Tensor, Tensor, std::optional<Tensor>, int64_t, int64_t, double, std::optional<Tensor>,
-                     std::optional<Tensor>, int64_t) {}
+void dequantize_meta(Tensor, Tensor, Tensor, std::optional<Tensor>, int64_t, int64_t, int64_t, double,
+                     std::optional<Tensor>, std::optional<Tensor>, int64_t) {}
 
 void gather_meta(Tensor, Tensor, int64_t, Tensor, int64_t) {}
 void scatter_meta(Tensor, Tensor, Tensor, int64_t, int64_t) {}
@@ -453,10 +469,10 @@ STABLE_TORCH_LIBRARY(copyengine, m) {
   m.def("scatter_(Tensor(a!) dst, Tensor index, Tensor src, int dim, int engine) -> ()");
   m.def("copy_fn_(Tensor(a!) dst, Tensor src, int engine, float scale, float bias, bool round, bool clamp, "
         "float lo, float hi) -> ()");
-  m.def("quantize_(Tensor x, Tensor(a!) q, Tensor(b!) scale, Tensor(c!)? zero, int fmt, int group, float eps, "
-        "float gs, bool static_scale, Tensor? x_index, Tensor? index, int engine) -> ()");
-  m.def("dequantize_(Tensor q, Tensor scale, Tensor(a!) out, Tensor? zero, int fmt, int group, float gs, "
-        "Tensor? x_index, Tensor? index, int engine) -> ()");
+  m.def("quantize_(Tensor x, Tensor(a!) q, Tensor(b!) scale, Tensor(c!)? zero, int fmt, int group, int block_rows, "
+        "float eps, float gs, bool static_scale, Tensor? x_index, Tensor? index, int engine) -> ()");
+  m.def("dequantize_(Tensor q, Tensor scale, Tensor(a!) out, Tensor? zero, int fmt, int group, int block_rows, "
+        "float gs, Tensor? x_index, Tensor? index, int engine) -> ()");
 }
 
 STABLE_TORCH_LIBRARY_IMPL(copyengine, CompositeExplicitAutograd, m) {

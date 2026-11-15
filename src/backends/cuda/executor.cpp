@@ -1604,13 +1604,18 @@ class CudaExecutor final : public Executor {
     const int xi = t.xi ? 0 : -1, ci = t.ci ? 1 : -1;
     std::vector<TileSide> v;
     auto add = [&](long long cv::TileK::*f, long long (cv::TileK::*rs)[3], int idx, bool host, bool input,
-                   long long count, long long step, long long width) {
-      const auto e = ext(t.*rs, count, step, width);
+                   long long count, long long step, long long width, long long pitch = 0) {
+      auto e = ext(t.*rs, count, step, width);
+      if (t.bh > 1 && pitch) {  // a box's rows
+        const long long span = (t.bh - 1) * pitch;
+        e.first += std::min(0LL, span), e.second += std::max(0LL, span);
+      }
       v.push_back({f, rs, idx, host, input, e.first, e.second});
     };
-    add(&cv::TileK::x, &cv::TileK::xr, xi, xs.device.kind == DeviceKind::host, t.quantize != 0, vals, t.xe, xw);
+    add(&cv::TileK::x, &cv::TileK::xr, xi, xs.device.kind == DeviceKind::host, t.quantize != 0, vals, t.xe, xw,
+        t.xp);
     add(&cv::TileK::q, &cv::TileK::qr, ci, qs.device.kind == DeviceKind::host, !t.quantize, packed ? vals / 2 : vals,
-        t.qe, 1);
+        t.qe, 1, t.qp);
     add(&cv::TileK::s, &cv::TileK::sr, ci, op.extras[0].device.kind == DeviceKind::host, !writes_scale, t.upr, t.se,
         sw);
     if (op.extras.size() > 1)

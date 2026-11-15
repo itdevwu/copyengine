@@ -927,6 +927,82 @@ __device__ void tile_vec(const cv::TileK& t, int lane, long long warp0, long lon
   }
 }
 
+// Box units (byte formats, float32 scales; block FP8 / INT8): one warp per
+// box, a pass for the amax and one for the codes (or one to dequantize), 4
+// consecutive values per access where the layout allows (TileK::vec).
+template <int F, bool Q>
+__device__ void tile_box(const cv::TileK& t, int lane, long long warp0, long long warps) {
+  using cv::QFmt;
+  constexpr QFmt f = static_cast<QFmt>(F);
+  const long long units = t.units();
+  const float igs = cv::div_rn(1.0f, t.gs);
+  const bool v4 = t.vec != 0;
+  for (long long u = warp0; u < units; u += warps) {
+    const cv::UnitAt a = cv::unit_at(t, u);
+    if (a.bad) {
+      if (lane == 0 && t.err) atomicOr(reinterpret_cast<unsigned long long*>(t.err), 1ull);
+      continue;
+    }
+    if (!Q) {
+      const float factor = cv::unit_scale(f, cv::rd<float>(cv::addr(a.s)), 0, t.gs);
+      for (int r = 0; r < t.bh; ++r) {
+        if (v4) {
+          for (int c = lane * 4; c < t.g; c += 128) {
+            const uint32_t c4 = *reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(cv::qb_at(t, a, r, c)));
+            float v[4];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) v[i] = cv::dequantize_code(f, static_cast<uint8_t>(c4 >> (8 * i)), factor);
+            store4(cv::xb_at(t, a, r, c), t.xdt, v);
+          }
+        } else {
+          for (int c = lane; c < t.g; c += 32)
+            cv::store_float(cv::addr(cv::xb_at(t, a, r, c)), t.xdt,
+                            cv::dequantize_code(f, cv::rd<uint8_t>(cv::addr(cv::qb_at(t, a, r, c))), factor));
+        }
+      }
+      continue;
+    }
+    cv::UnitQ p;
+    if (t.static_scale) {
+      p = cv::unit_from_scale(f, cv::rd<float>(cv::addr(a.s)), 0, 0, t.gs);
+    } else {
+      float amax = 0.0f;
+      for (int r = 0; r < t.bh; ++r) {
+        if (v4) {
+          for (int c = lane * 4; c < t.g; c += 128) {
+            float v[4];
+            load4(cv::xb_at(t, a, r, c), t.xdt, v);
+#pragma unroll
+            for (int i = 0; i < 4; ++i) amax = cv::amax_step(amax, cv::abs_f(v[i]));
+          }
+        } else {
+          for (int c = lane; c < t.g; c += 32)
+            amax = cv::amax_step(amax, cv::abs_f(cv::val_float(cv::load(cv::addr(cv::xb_at(t, a, r, c)), t.xdt))));
+        }
+      }
+      amax = warp_amax(amax);
+      p = cv::unit_params(f, amax, 0.0f, 0.0f, t.eps, t.gs, igs);
+      if (lane == 0) cv::wr<float>(cv::addr(a.s), p.scale);
+    }
+    for (int r = 0; r < t.bh; ++r) {
+      if (v4) {
+        for (int c = lane * 4; c < t.g; c += 128) {
+          float v[4];
+          load4(cv::xb_at(t, a, r, c), t.xdt, v);
+          uint32_t w = 0;
+#pragma unroll
+          for (int i = 0; i < 4; ++i) w |= static_cast<uint32_t>(cv::quant_elem(f, v[i], p)) << (8 * i);
+          *reinterpret_cast<uint32_t*>(static_cast<uintptr_t>(cv::qb_at(t, a, r, c))) = w;
+        }
+      } else {
+        for (int c = lane; c < t.g; c += 32)
+          cv::wr<uint8_t>(cv::addr(cv::qb_at(t, a, r, c)),
+                          cv::quant_elem(f, cv::val_float(cv::load(cv::addr(cv::xb_at(t, a, r, c)), t.xdt)), p));
+      }
+    }
+  }
+}
+
 }  // namespace
 
 // Grid: x over warps (8 per block, grid-stride over units), y over the group's ops.
@@ -946,6 +1022,12 @@ __device__ __forceinline__ void tile_kernel(const cv::TileK* __restrict__ tiles,
           reinterpret_cast<const unsigned long long*>(&tiles[op])[threadIdx.x];
     __syncthreads();
     const cv::TileK& t = sh;
+    if constexpr (F <= static_cast<int>(cv::QFmt::int8)) {  // box units: byte formats only
+      if (t.bh > 1) {
+        tile_box<F, Q>(t, lane, warp0, warps);
+        continue;
+      }
+    }
     if (const VecShape v = tile_shape(t); v.tpu) {
       // NVFP4's units are 16 values: its kernels hold only the 4-wide path.
       if constexpr (F != static_cast<int>(cv::QFmt::nvfp4)) {

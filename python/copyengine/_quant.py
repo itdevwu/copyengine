@@ -141,6 +141,45 @@ def dequantize(q, scale, bits, g, fmt, gs=1.0):
     return (vals.view(-1, g) * factor.view(-1, 1)).reshape(-1)
 
 
+# ---- box units: one scale per bh x bw block of the last two dimensions ------------------
+#
+# Block FP8 / INT8 (as DeepSeek-V3 stores weights: one scale per 128 x 128
+# block). The same formulas, over a box's values instead of a row's group.
+BOX_FORMATS = ("fp8_e4m3", "fp8_e5m2", "int8")
+
+
+def boxes(x, bh, bw):
+    """[..., M, N] -> [units, bh * bw], units ordered (..., M / bh, N / bw)."""
+    *lead, M, N = x.shape
+    return x.reshape(*lead, M // bh, bh, N // bw, bw).movedim(-3, -2).reshape(-1, bh * bw)
+
+
+def unboxes(u, shape, bh, bw):
+    *lead, M, N = shape
+    return u.reshape(*lead, M // bh, N // bw, bh, bw).movedim(-2, -3).reshape(shape)
+
+
+def quantize_block(x, block, fmt, eps=EPS):
+    """Codes [..., M, N] (uint8) and float32 scales [..., M / bh, N / bw]."""
+    bh, bw = block
+    codes, s, _ = quantize(boxes(x, bh, bw), bh * bw, fmt, eps)
+    *lead, M, N = x.shape
+    return unboxes(codes, x.shape, bh, bw), s.reshape(*lead, M // bh, N // bw)
+
+
+def quantize_static_block(x, block, fmt, scale):
+    bh, bw = block
+    codes = quantize_static(boxes(x, bh, bw), bh * bw, fmt, scale.reshape(-1))
+    return unboxes(codes, x.shape, bh, bw)
+
+
+def dequantize_block(q, scale, block, fmt):
+    """float32 values [..., M, N] from codes (uint8) and scales [..., M / bh, N / bw]."""
+    bh, bw = block
+    vals = dequantize(boxes(q, bh, bw).reshape(-1), scale.reshape(-1), None, bh * bw, fmt)
+    return unboxes(vals, q.shape, bh, bw)
+
+
 # ---- torch baselines of ce.quantize / ce.dequantize ---------------------------------
 
 def _scale_out(scale, fmt):
@@ -159,7 +198,12 @@ def _write_rows(t, idx, v):
         t.index_copy_(0, idx.to(t.device), v.view((len(idx),) + tuple(t.shape[1:])).to(t.device, t.dtype))
 
 
-def native_quantize(x, q, scale, zero, fmt, g, eps, gs, x_index=None, index=None):
+def native_quantize(x, q, scale, zero, fmt, g, eps, gs, x_index=None, index=None, block=None):
+    if block is not None:
+        codes, s = quantize_block(_rows(x, x_index), block, fmt, eps)
+        _write_rows(q.view(torch.uint8), index, codes)
+        _write_rows(scale, index, s)
+        return
     codes, s, bits = quantize(_rows(x, x_index), g, fmt, eps, gs)
     _write_rows(q.view(torch.uint8), index, codes)
     if s is not None:
@@ -170,14 +214,20 @@ def native_quantize(x, q, scale, zero, fmt, g, eps, gs, x_index=None, index=None
         _write_rows(_scale_out(scale, fmt), index, bits)
 
 
-def native_quantize_static(x, q, scale, zero, fmt, g, gs, x_index=None, index=None):
+def native_quantize_static(x, q, scale, zero, fmt, g, gs, x_index=None, index=None, block=None):
+    if block is not None:
+        _write_rows(q.view(torch.uint8), index, quantize_static_block(_rows(x, x_index), block, fmt, _rows(scale, index)))
+        return
     sc = _rows(_scale_out(scale, fmt), index)
     s = sc if scale.dtype == torch.float32 else None
     bits = _rows(zero, index) if fmt == "uint4" else (None if s is not None else sc)
     _write_rows(q.view(torch.uint8), index, quantize_static(_rows(x, x_index), g, fmt, s, bits, gs))
 
 
-def native_dequantize(q, scale, zero, out, fmt, g, gs, x_index=None, index=None):
+def native_dequantize(q, scale, zero, out, fmt, g, gs, x_index=None, index=None, block=None):
+    if block is not None:
+        _write_rows(out, x_index, dequantize_block(_rows(q.view(torch.uint8), index), _rows(scale, index), block, fmt))
+        return
     codes = _rows(q.view(torch.uint8), index).reshape(-1)
     sc = _rows(_scale_out(scale, fmt), index)
     s = sc.reshape(-1) if scale.dtype == torch.float32 else None

@@ -91,11 +91,15 @@ struct TileSpec {
     int64_t offset = 0;
     std::array<int64_t, 3> row_stride{0, 0, 0};
     int64_t step = 0;
+    int64_t pitch = 0;  // box units: bytes between a box's rows (x and q)
   };
   int fmt = 0;              // ce::cv::QFmt
   bool quantize = true;     // else dequantize
   bool static_scale = false;  // quantize with the given scale / zero point (read, not written)
-  int g = 1;                // values per unit
+  int g = 1;                // values per unit (per row of a box)
+  // Box units: `bh` rows of `g` values each, `pitch` bytes apart in x and q
+  // (one scale per box: block FP8 / INT8, as DeepSeek-V3 stores weights).
+  int bh = 1;
   float eps = 1e-12f, gs = 1.0f;
   std::array<int64_t, 3> rows{1, 1, 1};
   int64_t upr = 1;          // units per row

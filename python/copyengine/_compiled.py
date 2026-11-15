@@ -192,7 +192,8 @@ def _index(ix):
     return None  # lists / arrays: not traced (the caller breaks the graph)
 
 
-def tile(engine: int, quantize: bool, x, q, scale, zero, fmt, group, eps, gs, static, x_index, index) -> bool:
+def tile(engine: int, quantize: bool, x, q, scale, zero, fmt, group, eps, gs, static, x_index, index,
+         block=None) -> bool:
     from . import _quant
     if fmt not in _quant.FMT:
         raise ValueError(f"unknown format {fmt!r}; one of {sorted(_quant.FMT)}")
@@ -200,6 +201,11 @@ def tile(engine: int, quantize: bool, x, q, scale, zero, fmt, group, eps, gs, st
     if (x_index is not None and xi is None) or (index is not None and ci is None):
         return False
     D = x.shape[-1]
+    bh = 1
+    if block is not None:
+        if fmt not in _quant.BOX_FORMATS:
+            raise ValueError(f"block= is for {', '.join(_quant.BOX_FORMATS)}")
+        bh, group = int(block[0]), int(block[1])
     g = _quant.UNIT.get(fmt, group if group is not None else D)
     if group is not None and fmt in _quant.UNIT and group != g:
         raise ValueError(f"{fmt} uses units of {g} values")
@@ -207,8 +213,8 @@ def tile(engine: int, quantize: bool, x, q, scale, zero, fmt, group, eps, gs, st
         raise ValueError("uint4 needs a zero-point tensor (`zero`)")
     z = zero if fmt == "uint4" else None
     if quantize:
-        torch.ops.copyengine.quantize_(x, q, scale, z, _quant.FMT[fmt], g, float(eps), float(gs), bool(static), xi, ci,
-                                       engine)
+        torch.ops.copyengine.quantize_(x, q, scale, z, _quant.FMT[fmt], g, bh, float(eps), float(gs), bool(static), xi,
+                                       ci, engine)
     else:
-        torch.ops.copyengine.dequantize_(q, scale, x, z, _quant.FMT[fmt], g, float(gs), xi, ci, engine)
+        torch.ops.copyengine.dequantize_(q, scale, x, z, _quant.FMT[fmt], g, bh, float(gs), xi, ci, engine)
     return True

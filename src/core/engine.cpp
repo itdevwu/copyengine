@@ -605,13 +605,17 @@ struct Engine::Impl {
     push(std::move(op), strm);
   }
 
-  // Byte range [lo, hi) a tile tensor's layout touches: rows, then `count`
-  // steps of `step` bytes, each `width` bytes wide.
+  // Byte range [lo, hi) a tile tensor's layout touches: rows, a box's rows
+  // (x and q of box units), then `count` steps of `step` bytes, each `width` bytes wide.
   static std::pair<int64_t, int64_t> tile_extent(const TileSpec& t, const TileSpec::Side& s, int64_t count,
                                                  int64_t width) {
     int64_t lo = static_cast<int64_t>(s.ep.base) + s.offset, hi = lo;
     for (int k = 0; k < 3; ++k) {
       const int64_t span = (t.rows[k] - 1) * s.row_stride[k];
+      lo += std::min<int64_t>(0, span), hi += std::max<int64_t>(0, span);
+    }
+    if (t.bh > 1) {
+      const int64_t span = (t.bh - 1) * s.pitch;
       lo += std::min<int64_t>(0, span), hi += std::max<int64_t>(0, span);
     }
     const int64_t span = (count - 1) * s.step;
@@ -626,6 +630,9 @@ struct Engine::Impl {
     const bool packed = cv::qfmt_packed(f), mx = cv::qfmt_mx(f), byte_scale = mx || f == QFmt::nvfp4;
     if (t.g <= 0 || (packed && t.g % 2) || t.upr <= 0) fail(Errc::invalid_argument, "bad unit size");
     if (mx && t.g != 32) fail(Errc::invalid_argument, "MX formats use units of 32 values");
+    if (t.bh < 1) fail(Errc::invalid_argument, "bad box height");
+    if (t.bh > 1 && f != QFmt::fp8_e4m3 && f != QFmt::fp8_e5m2 && f != QFmt::int8)
+      fail(Errc::invalid_argument, "box units are for FP8 and INT8 with float32 scales");
     if (f == QFmt::nvfp4 && t.g != 16) fail(Errc::invalid_argument, "NVFP4 uses units of 16 values");
     const DType xd = t.x.ep.dtype;
     if (xd != DType::f32 && xd != DType::f16 && xd != DType::bf16)
@@ -697,10 +704,11 @@ struct Engine::Impl {
     k->g = t.g, k->upr = static_cast<int>(t.upr), k->fmt = t.fmt, k->xdt = static_cast<int>(xd);
     k->scale_byte = byte_scale, k->quantize = t.quantize, k->eps = t.eps, k->gs = t.gs;
     k->static_scale = t.quantize && t.static_scale;
+    k->bh = t.bh, k->xp = t.bh > 1 ? t.x.pitch : 0, k->qp = t.bh > 1 ? t.q.pitch : 0;
     {  // the kernels' vector path (TileK::vec)
       const long long xa = 4 * static_cast<long long>(itemsize(xd)), qa = packed ? 2 : 4;
       bool v = t.g % 4 == 0 && k->xe == static_cast<long long>(itemsize(xd)) && k->qe == 1 && k->x % xa == 0 &&
-               k->q % qa == 0;
+               k->q % qa == 0 && k->xp % xa == 0 && k->qp % qa == 0;
       for (int i = 0; i < 3; ++i) v = v && k->xr[i] % xa == 0 && k->qr[i] % qa == 0;
       k->vec = v;
     }
@@ -712,7 +720,7 @@ struct Engine::Impl {
         const long long row2 = t.upr * unit;
         return (t.rows[2] == 1 || r[2] == row2) && (t.rows[1] == 1 || r[1] == t.rows[2] * row2);
       };
-      bool f = flat(k->xr, t.g * k->xe) && flat(k->qr, qv * k->qe) && flat(k->sr, k->se);
+      bool f = t.bh == 1 && flat(k->xr, t.g * k->xe) && flat(k->qr, qv * k->qe) && flat(k->sr, k->se);
       if (zero) f = f && flat(k->zr, k->ze);
       k->flat = f;
     }
@@ -771,8 +779,8 @@ struct Engine::Impl {
         bool input;
       };
       const bool reads_scale = !t.quantize || t.static_scale;
-      std::vector<S> ss{{t.x, t.x_index, xr, xw, vals, t.quantize},
-                        {t.q, t.index, qr, 1, packed ? vals / 2 : vals, !t.quantize},
+      std::vector<S> ss{{t.x, t.x_index, xr, xw, vals * t.bh, t.quantize},
+                        {t.q, t.index, qr, 1, (packed ? vals / 2 : vals) * t.bh, !t.quantize},
                         {t.scale, t.index, sr, sw, t.upr, reads_scale}};
       if (zero) ss.push_back({t.zero, t.index, zr, 1, t.upr, reads_scale});
       // Staging runs in chunks of rows of the first dimension, two at a time
@@ -811,7 +819,7 @@ struct Engine::Impl {
     kh.add(fingerprint_sides(op));
     kh.add(uint64_t{0x711E});
     kh.add(static_cast<uint64_t>(t.fmt) | (uint64_t{t.quantize} << 8) | (uint64_t{t.static_scale} << 9));
-    kh.add(static_cast<uint64_t>(lg2(op.tile->units() * t.g)));
+    kh.add(static_cast<uint64_t>(lg2(op.tile->units() * t.g * t.bh)));
     op.key = kh.done();
     op.native = hints.native;
     op.host_async = hints.host_async;

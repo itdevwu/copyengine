@@ -6,6 +6,12 @@ change incompatibly only in a new minor (0.x) or major release.
 
 ## Unreleased
 
+- Block quantization: `ce.quantize(w, q, scale, fmt="fp8_e4m3", block=(128, 128))`
+  (FP8 E4M3 / E5M2, INT8) uses one float32 scale per block of the last two
+  dimensions, as DeepSeek-V3 stores weights; the same formula as the group
+  formats over a box's values, recipes in `copyengine/_quant.py`. On the host
+  and the GPU, with indices, pinned host memory, step plans and torch.compile.
+
 - A new engine's first copy on a GPU no longer loads the kernels and runs the
   admission test copies again: that happens once per device and process, and
   engines share the module (each engine used to load, and keep, its own).

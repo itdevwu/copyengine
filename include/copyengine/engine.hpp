@@ -26,8 +26,9 @@ enum class Strategy : uint8_t {
   lowered,        // CUDA: host index tables expanded into DMA descriptors at each run
   tile,           // tile ops (quantization while copying): units of values (host loop, or one warp each)
   bulk,           // CUDA: pure device copies through shared memory (TMA on sm90+, cp.async on sm80-89)
+  tile_staged,    // CUDA: tile ops with host sides through device staging (DMA in, kernel, DMA out)
 };
-inline constexpr int kNumStrategies = 13;
+inline constexpr int kNumStrategies = 14;
 std::string_view strategy_name(Strategy s);
 Strategy parse_strategy(std::string_view name);
 

@@ -736,6 +736,29 @@ struct Engine::Impl {
     op.tile = std::move(k);
     op.tile_index[0] = std::move(hx), op.tile_index[1] = std::move(hc);
     op.tile_host_ptr[0] = by_ptr[0], op.tile_host_ptr[1] = by_ptr[1];
+    {  // device staging for host sides (Op::tile_staged_ok)
+      const int64_t rows = t.rows[0] * t.rows[1] * t.rows[2];
+      const int64_t xw = static_cast<int64_t>(itemsize(xd)), sw = byte_scale ? 1 : 4;
+      struct S {
+        const TileSpec::Side& side;
+        std::pair<int64_t, int64_t> e;
+        int64_t need;
+        bool input;
+      };
+      const bool reads_scale = !t.quantize || t.static_scale;
+      std::vector<S> ss{{t.x, xr, rows * vals * xw, t.quantize}, {t.q, qr, rows * (packed ? vals / 2 : vals), !t.quantize},
+                        {t.scale, sr, rows * t.upr * sw, reads_scale}};
+      if (zero) ss.push_back({t.zero, zr, rows * t.upr, reads_scale});
+      bool host = false, ok = !t.x_index.used() && !t.index.used();
+      for (const S& s : ss) {
+        if (s.side.ep.device.kind != DeviceKind::host) continue;
+        host = true;
+        const int64_t span = s.e.second - s.e.first;
+        ok = ok && (s.input ? span <= 2 * s.need : span == s.need);
+      }
+      op.tile_host = host;
+      op.tile_staged_ok = host && ok && dev.kind == DeviceKind::cuda;
+    }
     op.tile_dev_index = t.x_index.dev || t.index.dev;
     op.opaque = true;
     op.ctx = hints.ctx;

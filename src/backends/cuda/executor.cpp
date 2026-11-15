@@ -266,10 +266,16 @@ class CudaExecutor final : public Executor {
     Dev& s = state(di);
     if (g.tiles) {  // quantization while copying: the tile kernel on this GPU
       if (!s.kernels) fail(Errc::unsupported, "quantization on the GPU needs the copy kernels: " + s.kernel_error);
-      const bool host_side = g.src.device.kind != DeviceKind::cuda || g.dst.device.kind != DeviceKind::cuda;
-      if (host_side && !zero_copy_ok(s))  // pinned host memory read / written by the kernel
-        fail(Errc::unsupported, "quantizing to or from host memory needs zero-copy kernels: " + s.zero_copy_error);
-      return {Strategy::tile};
+      if (!g.tile_host_sides) return {Strategy::tile};
+      // Host sides: the kernel reading / writing pinned memory directly, or
+      // through device staging (DMA in, kernel, DMA out); measured.
+      std::vector<Strategy> c;
+      if (zero_copy_ok(s)) c.push_back(Strategy::tile);
+      if (g.tile_staged_ok) c.push_back(Strategy::tile_staged);
+      if (c.empty())
+        fail(Errc::unsupported, "quantizing to or from host memory needs zero-copy kernels (" + s.zero_copy_error +
+                                    ") or compact host tensors for staging");
+      return c;
     }
     if (g.opaque()) {  // indices read at run time: the statement kernel, or (host tables) DMA expanded per run
       std::vector<Strategy> c;
@@ -400,6 +406,7 @@ class CudaExecutor final : public Executor {
       case Strategy::paced: return paced(s, g, st);
       case Strategy::lowered: return lowered(s, g, ops, st);
       case Strategy::tile: return tile(s, g, ops, st);
+      case Strategy::tile_staged: return tile_staged(s, g, ops, st);
       case Strategy::bulk: return bulk(s, g, st);
       default: fail(Errc::unsupported, "CUDA backend cannot run strategy " + std::string(strategy_name(strat)));
     }
@@ -1374,8 +1381,6 @@ class CudaExecutor final : public Executor {
     auto& slot = g.exec_cache[static_cast<int>(Strategy::tile)];
     if (!slot) slot = std::make_shared<TileExec>();
     auto& x = *static_cast<TileExec*>(slot.get());
-    long long most = 0;
-    for (int k : g.ops) most = std::max(most, ops[k].tile->units());
     CUdeviceptr table = 0;
     if (!tile_indexed(g, ops)) {
       if (!x.table) {
@@ -1408,6 +1413,19 @@ class CudaExecutor final : public Executor {
         at.push_back(o);
         v.push_back(*op.tile);
       }
+      table = upload_tiles(s, x, std::move(vals), v, &at, st);
+    }
+    launch_tiles(s, g, ops, table, st);
+    return 1;
+  }
+
+  // This call's TileKs (after `vals`, host index values they point into:
+  // `at` gives each op's x / c offsets in vals), written in stream order to
+  // the group's mirror for this stream; returns the TileK table's address.
+  CUdeviceptr upload_tiles(Dev& s, TileExec& x, std::vector<unsigned long long> vals, std::vector<cv::TileK>& v,
+                           const std::vector<std::pair<size_t, size_t>>* at, CUstream st) {
+    constexpr size_t kNone = ~size_t{0};
+    {
       const size_t tk_words = sizeof(cv::TileK) / 8, words = vals.size() + v.size() * tk_words;
       TileExec::Mirror* m = nullptr;
       for (auto& y : x.mirrors)
@@ -1425,18 +1443,25 @@ class CudaExecutor final : public Executor {
         m->table = t, m->words = words;
       }
       const CUdeviceptr base = static_cast<DevTable*>(m->table.get())->ptr;
-      const CUdeviceptr err = error_word(s);
-      for (size_t i = 0; i < v.size(); ++i) {
-        if (at[i].first != kNone) v[i].xi = static_cast<long long>(base + at[i].first * 8);
-        if (at[i].second != kNone) v[i].ci = static_cast<long long>(base + at[i].second * 8);
-        v[i].err = static_cast<long long>(err);
+      if (at) {
+        const CUdeviceptr err = error_word(s);
+        for (size_t i = 0; i < v.size(); ++i) {
+          if ((*at)[i].first != kNone) v[i].xi = static_cast<long long>(base + (*at)[i].first * 8);
+          if ((*at)[i].second != kNone) v[i].ci = static_cast<long long>(base + (*at)[i].second * 8);
+          v[i].err = static_cast<long long>(err);
+        }
+        s.err_armed = true;
       }
-      s.err_armed = true;
       const auto* tw = reinterpret_cast<const unsigned long long*>(v.data());
       vals.insert(vals.end(), tw, tw + v.size() * tk_words);
       put_words(s, base, vals.data(), vals.size(), st);
-      table = base + (words - v.size() * tk_words) * 8;
+      return base + (words - v.size() * tk_words) * 8;
     }
+  }
+
+  void launch_tiles(Dev& s, const Group& g, const std::vector<Op>& ops, CUdeviceptr table, CUstream st) {
+    long long most = 0;
+    for (int k : g.ops) most = std::max(most, ops[k].tile->units());
     const cv::TileK& t0 = *ops[g.ops[0]].tile;  // a group shares format and direction
     const std::string name = std::string(t0.quantize ? "ce_tile_q" : "ce_tile_d") + std::to_string(t0.fmt);
     CUfunction f = function(s, name);
@@ -1445,7 +1470,83 @@ class CudaExecutor final : public Executor {
     const unsigned gx = static_cast<unsigned>(std::min<long long>((most + 7) / 8, 1 << 20));
     const unsigned gy = static_cast<unsigned>(std::min<long long>(count, 65535));
     run_kernel(s, f, {std::max(1u, gx), gy, 1}, {256, 1, 1}, args, st, name.c_str());
-    return 1;
+  }
+
+  // ---- tile ops with host sides: through device staging ----------------------------------
+
+  struct TileSide {
+    long long* field;  // the TileK base it rewrites
+    bool host, input;
+    long long lo, hi, need;  // byte extent, and bytes it holds
+  };
+
+  // A TileK's four tensors: extent, whether on the host, whether the kernel reads them.
+  static std::vector<TileSide> tile_sides(cv::TileK& t, const Op& op) {
+    auto ext = [&](long long base, const long long r[3], long long count, long long step, long long width) {
+      long long lo = base, hi = base;
+      for (int k = 0; k < 3; ++k) {
+        const long long span = (t.rows[k] - 1) * r[k];
+        lo += std::min(0LL, span), hi += std::max(0LL, span);
+      }
+      const long long span = (count - 1) * step;
+      lo += std::min(0LL, span), hi += std::max(0LL, span);
+      return std::pair<long long, long long>{lo, hi + width};
+    };
+    const bool packed = cv::qfmt_packed(static_cast<cv::QFmt>(t.fmt));
+    const long long rows = t.rows[0] * t.rows[1] * t.rows[2], vals = static_cast<long long>(t.g) * t.upr;
+    const long long xw = static_cast<long long>(cv::dt_size(t.xdt)), sw = t.scale_byte ? 1 : 4;
+    const Side& xs = t.quantize ? op.src : op.dst;
+    const Side& qs = t.quantize ? op.dst : op.src;
+    const bool writes_scale = t.quantize && !t.static_scale;
+    std::vector<TileSide> v;
+    auto add = [&](long long* f, bool host, bool input, std::pair<long long, long long> e, long long need) {
+      v.push_back({f, host, input, e.first, e.second, need});
+    };
+    add(&t.x, xs.device.kind == DeviceKind::host, t.quantize != 0, ext(t.x, t.xr, vals, t.xe, xw), rows * vals * xw);
+    const long long qn = packed ? vals / 2 : vals;
+    add(&t.q, qs.device.kind == DeviceKind::host, !t.quantize, ext(t.q, t.qr, qn, t.qe, 1), rows * qn);
+    add(&t.s, op.extras[0].device.kind == DeviceKind::host, !writes_scale, ext(t.s, t.sr, t.upr, t.se, sw), rows * t.upr * sw);
+    if (op.extras.size() > 1)
+      add(&t.z, op.extras[1].device.kind == DeviceKind::host, !writes_scale, ext(t.z, t.zr, t.upr, t.ze, 1), rows * t.upr);
+    return v;
+  }
+
+  int64_t tile_staged(Dev& s, const Group& g, const std::vector<Op>& ops, CUstream st) {
+    struct Back {
+      CUdeviceptr dev;
+      long long host, len;
+    };
+    std::vector<cv::TileK> v;
+    std::vector<std::vector<TileSide>> sides;
+    size_t total = 0;
+    for (int k : g.ops) {
+      v.push_back(*ops[k].tile);
+      sides.push_back(tile_sides(v.back(), ops[k]));
+      for (const TileSide& x : sides.back())
+        if (x.host) total += (static_cast<size_t>(x.hi - x.lo) + 255) & ~size_t{255};
+    }
+    const CUdeviceptr stg = staging(s, total, st);
+    const Side dev_side{{DeviceKind::cuda, s.index}, DType::u8, false}, host_side{{DeviceKind::host, 0}, DType::u8, true};
+    std::vector<Back> back;
+    size_t off = 0;
+    int64_t calls = 1;
+    for (size_t i = 0; i < v.size(); ++i)
+      for (const TileSide& x : sides[i]) {
+        if (!x.host) continue;
+        const CUdeviceptr d = stg + off;
+        const size_t len = static_cast<size_t>(x.hi - x.lo);
+        if (x.input) copy1d(host_side, dev_side, static_cast<uintptr_t>(x.lo), d, len, st), ++calls;
+        else back.push_back({d, x.lo, static_cast<long long>(len)});
+        *x.field = static_cast<long long>(d) + (*x.field - x.lo);  // the kernel works on the staged copy
+        off += (len + 255) & ~size_t{255};
+      }
+    auto& slot = g.exec_cache[static_cast<int>(Strategy::tile_staged)];
+    if (!slot) slot = std::make_shared<TileExec>();
+    launch_tiles(s, g, ops, upload_tiles(s, *static_cast<TileExec*>(slot.get()), {}, v, nullptr, st), st);
+    for (const Back& b : back)
+      copy1d(dev_side, host_side, b.dev, static_cast<uintptr_t>(b.host), static_cast<size_t>(b.len), st), ++calls;
+    staging_release(s, st);
+    return calls;
   }
 
   // Host index tables expanded into copy descriptors now (DMA; pure copies).

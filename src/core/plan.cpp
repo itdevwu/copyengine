@@ -290,7 +290,12 @@ Plan build_plan(const std::vector<Op>& ops) {
       }
       it->ops.push_back(k);
       it->runs.append(op.runs());
-      if (op.tile) it->opaque_elems += op.tile->units() * op.tile->g, it->tiles = true;
+      if (op.tile) {
+        const bool first = it->ops.size() == 1;
+        it->opaque_elems += op.tile->units() * op.tile->g, it->tiles = true;
+        it->tile_host_sides = it->tile_host_sides || op.tile_host;
+        it->tile_staged_ok = (first || it->tile_staged_ok) && op.tile_staged_ok;
+      }
       else if (op.opaque) it->opaque_elems += op.form->numel;
     }
     for (Group& g : groups) {

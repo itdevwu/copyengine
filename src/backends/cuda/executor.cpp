@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -755,9 +757,23 @@ class CudaExecutor final : public Executor {
     check(d_->cuEventCreate(&s.ev_out, CU_EVENT_DISABLE_TIMING), "cuEventCreate");
     s.stagings.reserve(kLanes);
     for (Slot& sl : s.slots) check(d_->cuEventCreate(&sl.done, CU_EVENT_DISABLE_TIMING), "cuEventCreate");
-    admit_kernels(s);
-    admit_batch(s);
-    admit_bulk(s);
+    {  // once per device and process: the module and the verdicts of the test copies
+      Admitted& a = admitted(di);
+      std::lock_guard<std::mutex> lock(a.m);
+      if (!a.done) {
+        admit_kernels(s);
+        admit_batch(s);
+        admit_bulk(s);
+        a.done = true;
+        a.mod = s.mod, a.kernels = s.kernels, a.kernel_error = s.kernel_error;
+        a.batch = s.batch, a.batch_error = s.batch_error;
+        a.bulk = s.bulk, a.bulk_error = s.bulk_error, a.bulk_seg = s.bulk_seg;
+      } else {
+        s.mod = a.mod, s.kernels = a.kernels, s.kernel_error = a.kernel_error;
+        s.batch = a.batch, s.batch_error = a.batch_error;
+        s.bulk = a.bulk, s.bulk_error = a.bulk_error, s.bulk_seg = a.bulk_seg;
+      }
+    }
     if (s.kernels) {  // before any capture can need them
       error_word(s);
       s.capture_arena = dev_alloc(s, kCaptureArena, "capture tables");
@@ -768,6 +784,26 @@ class CudaExecutor final : public Executor {
   }
 
   // ---- admission: call once, verify bit-exact ------------------------------------
+
+  // Admission is per device and process: engines share the primary context,
+  // so they share the kernels' module (loaded once, kept for the process) and
+  // the verdicts of the test copies.
+  struct Admitted {
+    std::mutex m;
+    bool done = false;
+    CUmodule mod{};
+    bool kernels = false, batch = false;
+    std::string kernel_error, batch_error, bulk, bulk_error;
+    int bulk_seg = 8192;
+  };
+  static Admitted& admitted(int device) {
+    static std::mutex m;
+    static std::map<int, std::unique_ptr<Admitted>> all;
+    std::lock_guard<std::mutex> lock(m);
+    auto& a = all[device];
+    if (!a) a = std::make_unique<Admitted>();
+    return *a;
+  }
 
   void admit_kernels(Dev& s) {
 #if CE_CUDA_KERNELS

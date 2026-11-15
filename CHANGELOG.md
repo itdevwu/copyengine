@@ -6,6 +6,10 @@ change incompatibly only in a new minor (0.x) or major release.
 
 ## Unreleased
 
+- A new engine's first copy on a GPU no longer loads the kernels and runs the
+  admission test copies again: that happens once per device and process, and
+  engines share the module (each engine used to load, and keep, its own).
+
 - The explicit API inside torch.compile regions is one graph node per call
   (`copy_`, `copy_many`, lazy gathers and scatters with GPU indices,
   `gather`, `scatter_`, `quantize`, `dequantize`), also under CUDA graphs;

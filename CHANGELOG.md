@@ -4,7 +4,7 @@ copyengine follows [semantic versioning](https://semver.org). From 0.1.0 on,
 the Python API, the C ABI (`CE_ABI_VERSION`) and the tuning profile format
 change incompatibly only in a new minor (0.x) or major release.
 
-## Unreleased
+## 0.4.2
 
 - Fix: memory copyengine took from torch's allocator (copy tables, staging,
   upload buffers) was first written on copyengine's own stream without

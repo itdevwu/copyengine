@@ -76,7 +76,9 @@
   (`dev_alloc` / `dev_free` in the CUDA executor), which uses the framework's
   allocator when one is registered. Before such memory goes back, its
   allocation stream is ordered after every stream copyengine used on that
-  device; a test checks the ordering, not just the data.
+  device; the stream that first uses fresh memory is ordered after its
+  allocation stream (a freed tensor may still have work pending there).
+  Tests check the ordering, not just the data.
 - Intercepted `copy_` keeps the caller's `non_blocking` semantics; explicit
   `ce.copy_` returns with host-side copies complete.
 

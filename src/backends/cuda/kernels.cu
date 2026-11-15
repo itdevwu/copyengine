@@ -287,6 +287,71 @@ extern "C" __global__ void __launch_bounds__(32) ce_bytes_bulk(const Chunk* __re
   (void)smem;
 }
 
+// ---- 2-D TMA (sm90+): a block's rows as tensor maps -----------------------------------
+//
+// Each 2-D block of a pure copy (width bytes x height rows, a pitch per side)
+// is a pair of uint8 tensor maps (encoded on the host, resident with the
+// plan) moved box by box (TmaBlock::bw bytes x bh rows) through two shared
+// buffers: a whole box per TMA operation, where the row-wise bulk copy needs
+// one per row segment. Loads past the block fill zeros, stores past it are
+// clipped by the hardware, so edge boxes need no special case.
+
+struct alignas(64) TmaMap {
+  unsigned long long w[16];  // a CUtensorMap
+};
+struct alignas(64) TmaBlock {
+  TmaMap src, dst;
+  int width, height;  // bytes, rows
+  int bw, bh;         // the box
+};
+
+extern "C" __global__ void __launch_bounds__(32) ce_bytes_tma2d(const TmaBlock* __restrict__ blocks, int n) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  constexpr int kTmaBox = 8192;  // bytes per box (bw x bh), two per block; the executor sizes boxes to it
+  __shared__ alignas(128) unsigned char buf[2][kTmaBox];
+  __shared__ alignas(8) unsigned long long bar[2];
+  if (threadIdx.x != 0) return;
+  for (int b = 0; b < 2; ++b) mbar_init(&bar[b]);
+  asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+  unsigned phase[2] = {0, 0};
+  for (int k = blockIdx.x; k < n; k += gridDim.x) {
+    const TmaBlock& B = blocks[k];
+    const unsigned long long sm = reinterpret_cast<unsigned long long>(&B.src);
+    const unsigned long long dm = reinterpret_cast<unsigned long long>(&B.dst);
+    asm volatile("fence.proxy.tensormap::generic.acquire.gpu [%0], 128;" ::"l"(sm) : "memory");
+    asm volatile("fence.proxy.tensormap::generic.acquire.gpu [%0], 128;" ::"l"(dm) : "memory");
+    const int nx = (B.width + B.bw - 1) / B.bw, ny = (B.height + B.bh - 1) / B.bh, tiles = nx * ny;
+    const unsigned bytes = static_cast<unsigned>(B.bw * B.bh);
+    auto load = [&](int i) {
+      const int b = i & 1, x = (i % nx) * B.bw, y = (i / nx) * B.bh;
+      mbar_expect(&bar[b], bytes);
+      asm volatile(
+          "cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];"
+          ::"r"(smem_addr(buf[b])), "l"(sm), "r"(x), "r"(y), "r"(smem_addr(&bar[b]))
+          : "memory");
+    };
+    for (int i = 0; i < tiles && i < 2; ++i) load(i);
+    for (int i = 0; i < tiles; ++i) {
+      const int b = i & 1, x = (i % nx) * B.bw, y = (i / nx) * B.bh;
+      mbar_wait(&bar[b], phase[b]);
+      phase[b] ^= 1u;
+      asm volatile("cp.async.bulk.tensor.2d.global.shared::cta.tile.bulk_group [%0, {%1, %2}], [%3];" ::"l"(dm),
+                   "r"(x), "r"(y), "r"(smem_addr(buf[b]))
+                   : "memory");
+      asm volatile("cp.async.bulk.commit_group;" ::: "memory");
+      if (i + 2 < tiles) {
+        asm volatile("cp.async.bulk.wait_group.read 0;" ::: "memory");  // buffer b read by its store
+        load(i + 2);
+      }
+    }
+    asm volatile("cp.async.bulk.wait_group.read 0;" ::: "memory");  // buffers free for the next block
+  }
+  asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");  // stores done before exit
+#else
+  (void)blocks, (void)n;  // admitted on sm90+ only
+#endif
+}
+
 extern "C" __global__ void ce_bytes(const Chunk* __restrict__ chunks, int n, long long sadd, long long dadd) {
   CE_FOR_CHUNKS(chunks, n, sadd, dadd) bytes_one<false>(c, lane);
 }

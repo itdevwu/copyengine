@@ -782,3 +782,29 @@ def test_copyengine_memory_waits_for_the_allocation_stream():
         e.copy_(dst, src.t())
         torch.cuda.synchronize()
         assert torch.equal(dst, src.t().to(torch.float16)), k
+
+
+def test_tma2d_admission_and_pitched_copies():
+    # sm90+: 2-D blocks of pure device copies as tensor maps (admitted by a
+    # verified test copy); older GPUs report why not.
+    st = ce.Engine().stats()
+    major = torch.cuda.get_device_capability(0)[0]
+    x = torch.randn(4, 4, device=DEV)
+    e = ce.Engine(tune_trials=2, tune_topk=6)
+    e.copy_(torch.empty_like(x), x)
+    info = e.stats()["cuda"][0]["tma2d"]
+    if major < 9:
+        assert info == "needs sm90 or later" or info == "no kernels", info
+        return
+    assert info is True, info
+    # Narrow rows (a KV head of 128 bf16 values) gathered by a permute: 2-D blocks.
+    src = torch.randn(64, 512, 8, 128, device=DEV).bfloat16()  # [blocks, tok, heads, d]
+    dst = torch.empty(64, 8, 512, 128, device=DEV, dtype=torch.bfloat16)
+    seen = set()
+    for _ in range(30):
+        dst.zero_()
+        e.copy_(dst, src.permute(0, 2, 1, 3))
+        torch.cuda.synchronize()
+        seen.update(e.stats()["last"]["strategies"])
+        assert torch.equal(dst, src.permute(0, 2, 1, 3))
+    assert "tma2d" in seen, seen

@@ -315,6 +315,7 @@ class CudaExecutor final : public Executor {
         if (rects <= 2) std::stable_partition(c.begin(), c.end(), [](Strategy x) { return x == Strategy::runs; });
         // Large groups: first among the candidates, so the shortlist keeps it (measured like the rest).
         if (!s.bulk.empty() && g.bytes() >= kBulkMinBytes) c.insert(c.begin(), Strategy::bulk);
+        if (s.tma2d && g.bytes() >= kBulkMinBytes && tma2d_fits(g)) c.insert(c.begin(), Strategy::tma2d);
       } else if (src_cuda && dst_cuda) {
         if (s.batch) c.push_back(Strategy::batch);
         c.push_back(Strategy::runs);
@@ -360,6 +361,7 @@ class CudaExecutor final : public Executor {
       case Strategy::passthrough: return !g.opaque() && g.pure() && src_ok && dst_ok;
       case Strategy::kernel: return on_device && g.exec_cache[static_cast<int>(Strategy::kernel)] != nullptr;
       case Strategy::bulk: return on_device && g.exec_cache[static_cast<int>(Strategy::bulk)] != nullptr;
+      case Strategy::tma2d: return on_device && g.exec_cache[static_cast<int>(Strategy::tma2d)] != nullptr;
       case Strategy::tile: {  // descriptors resident; indexed ones are written per call (allocation): not yet
         const auto& slot = g.exec_cache[static_cast<int>(Strategy::tile)];
         return on_device && slot && static_cast<const TileExec*>(slot.get())->table != nullptr;
@@ -417,6 +419,7 @@ class CudaExecutor final : public Executor {
       case Strategy::tile: return tile(s, g, ops, st);
       case Strategy::tile_staged: return tile_staged(s, g, ops, st);
       case Strategy::bulk: return bulk(s, g, st);
+      case Strategy::tma2d: return tma2d(s, g, st);
       default: fail(Errc::unsupported, "CUDA backend cannot run strategy " + std::string(strategy_name(strat)));
     }
   }
@@ -516,6 +519,7 @@ class CudaExecutor final : public Executor {
                     .set("batch", s.batch ? Json(true) : Json(s.batch_error))
                     .set("sm_limit", s.sm_limit)
                     .set("bulk", s.bulk.empty() ? Json(s.bulk_error) : Json(s.bulk))
+                    .set("tma2d", s.tma2d ? Json(true) : Json(s.tma2d_error))
                     .set("zero_copy", s.zero_copy < 0 ? Json("unchecked")
                                                       : (s.zero_copy ? Json(true) : Json(s.zero_copy_error)))
                     .set("allocator", device_allocator() ? device_allocator()->name : "cuda")
@@ -583,6 +587,9 @@ class CudaExecutor final : public Executor {
     // admitted by a verified test copy; empty: not available (bulk_error says why).
     std::string bulk, bulk_error;
     int bulk_seg = 8192;  // bytes per segment: kBulkBufs of them per block (shared memory)
+    // 2-D blocks as tensor maps (sm90+), admitted by a verified test copy.
+    bool tma2d = false;
+    std::string tma2d_error = "not admitted";
     std::unordered_map<std::string, CUfunction> fns;
     CUstream side{};
     CUevent ev_in{}, ev_out{};
@@ -764,7 +771,9 @@ class CudaExecutor final : public Executor {
         admit_kernels(s);
         admit_batch(s);
         admit_bulk(s);
+        admit_tma2d(s);
         a.done = true;
+        a.tma2d = s.tma2d, a.tma2d_error = s.tma2d_error;
         a.mod = s.mod, a.kernels = s.kernels, a.kernel_error = s.kernel_error;
         a.batch = s.batch, a.batch_error = s.batch_error;
         a.bulk = s.bulk, a.bulk_error = s.bulk_error, a.bulk_seg = s.bulk_seg;
@@ -772,6 +781,7 @@ class CudaExecutor final : public Executor {
         s.mod = a.mod, s.kernels = a.kernels, s.kernel_error = a.kernel_error;
         s.batch = a.batch, s.batch_error = a.batch_error;
         s.bulk = a.bulk, s.bulk_error = a.bulk_error, s.bulk_seg = a.bulk_seg;
+        s.tma2d = a.tma2d, s.tma2d_error = a.tma2d_error;
       }
     }
     if (s.kernels) {  // before any capture can need them
@@ -795,6 +805,8 @@ class CudaExecutor final : public Executor {
     bool kernels = false, batch = false;
     std::string kernel_error, batch_error, bulk, bulk_error;
     int bulk_seg = 8192;
+    bool tma2d = false;
+    std::string tma2d_error;
   };
   static Admitted& admitted(int device) {
     static std::mutex m;
@@ -1457,6 +1469,126 @@ class CudaExecutor final : public Executor {
     run_kernel(s, f, {static_cast<unsigned>(std::min<size_t>(t.count, 1 << 16)), 1, 1}, {32, 1, 1}, args, st,
                "ce_bytes_bulk", static_cast<unsigned>(kBulkBufs * seg));
     return 1;
+  }
+
+  // ---- 2-D blocks through tensor maps (sm90+) ---------------------------------------------
+
+  // Mirrors kernels.cu TmaBlock: a source and a destination tensor map, the
+  // block (bytes x rows) and the box.
+  struct alignas(64) TmaBlock {
+    CUtensorMap src, dst;
+    int width, height, bw, bh;
+  };
+  static_assert(sizeof(CUtensorMap) == 128 && sizeof(TmaBlock) % 64 == 0, "TmaBlock mirrors kernels.cu");
+  static constexpr int kTmaBox = 8192;  // kernels.cu: bytes per box
+
+  // What the hardware takes: 16-byte aligned addresses and pitches, widths up
+  // to 2^32, and the box from the width (up to 256 bytes) and kTmaBox.
+  static bool tma2d_block_ok(i64 s, i64 d, i64 w, i64 h, i64 sp, i64 dp) {
+    if (((s | d) & 15) || w <= 0 || h <= 0 || w >= (i64{1} << 32) || h >= (i64{1} << 32)) return false;
+    if (h > 1 && ((sp | dp) & 15)) return false;
+    return true;
+  }
+  static bool tma2d_fits(const Group& g) {
+    const Rects& r = g.rects;
+    if (r.size() == 0 || r.size() > 4096) return false;  // a tensor map pair per block
+    bool rows = false;
+    for (size_t i = 0; i < r.size(); ++i) {
+      if (!tma2d_block_ok(r.src[i], r.dst[i], r.width[i], r.height[i], r.src_pitch[i], r.dst_pitch[i])) return false;
+      rows = rows || r.height[i] > 1;
+    }
+    return rows;  // 2-D work: 1-D runs are the row-wise bulk copy's
+  }
+
+  bool encode_tma(CUtensorMap* m, i64 addr, i64 w, i64 h, i64 pitch, int bw, int bh) {
+    const cuuint64_t dims[2] = {static_cast<cuuint64_t>(w), static_cast<cuuint64_t>(h)};
+    const cuuint64_t strides[1] = {static_cast<cuuint64_t>(h > 1 ? pitch : ((w + 15) & ~i64{15}))};
+    const cuuint32_t box[2] = {static_cast<cuuint32_t>(bw), static_cast<cuuint32_t>(bh)}, el[2] = {1, 1};
+    return d_->cuTensorMapEncodeTiled(m, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2, reinterpret_cast<void*>(addr), dims,
+                                      strides, box, el, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE,
+                                      CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+                                      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) == CUDA_SUCCESS;
+  }
+
+  // The group's blocks as tensor map pairs; empty if the driver refuses one.
+  std::vector<TmaBlock> tma_blocks(const Rects& r, i64 sadd = 0, i64 dadd = 0) {
+    std::vector<TmaBlock> v(r.size());
+    for (size_t i = 0; i < r.size(); ++i) {
+      TmaBlock& b = v[i];
+      b.width = static_cast<int>(r.width[i]), b.height = static_cast<int>(r.height[i]);
+      b.bw = static_cast<int>(std::min<i64>(256, (r.width[i] + 15) & ~i64{15}));
+      b.bh = static_cast<int>(std::clamp<i64>(kTmaBox / b.bw, 1, 256));
+      if (!encode_tma(&b.src, r.src[i] + sadd, r.width[i], r.height[i], r.src_pitch[i], b.bw, b.bh) ||
+          !encode_tma(&b.dst, r.dst[i] + dadd, r.width[i], r.height[i], r.dst_pitch[i], b.bw, b.bh))
+        return {};
+    }
+    return v;
+  }
+
+  int64_t tma2d(Dev& s, const Group& g, CUstream st) {
+    auto& slot = g.exec_cache[static_cast<int>(Strategy::tma2d)];
+    if (!slot) {
+      const std::vector<TmaBlock> v = tma_blocks(g.rects);
+      if (v.empty()) fail(Errc::backend, "cuTensorMapEncodeTiled refused a block");
+      slot = resident(s, v);
+    }
+    const auto& t = *static_cast<DevTable*>(slot.get());
+    CUfunction f = function(s, "ce_bytes_tma2d");
+    CUdeviceptr table = t.ptr;
+    int n = static_cast<int>(t.count);
+    void* args[] = {&table, &n};
+    run_kernel(s, f, {static_cast<unsigned>(std::min<size_t>(t.count, 1 << 16)), 1, 1}, {32, 1, 1}, args, st,
+               "ce_bytes_tma2d");
+    return 1;
+  }
+
+  void admit_tma2d(Dev& s) {
+    s.tma2d = false;
+    if (!s.kernels) return void(s.tma2d_error = "no kernels");
+    int major = 0;
+    check(d_->cuDeviceGetAttribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, s.dev), "cuDeviceGetAttribute");
+    if (major < 9) return void(s.tma2d_error = "needs sm90 or later");
+    if (!d_->cuTensorMapEncodeTiled)
+      return void(s.tma2d_error = "cuTensorMapEncodeTiled: " + cuda::missing_reason("cuTensorMapEncodeTiled"));
+    try {  // narrow rows (two boxes across, edge boxes on both axes), pitched: verified byte for byte
+      const i64 rows = 77, width = 272, sp = 384, dp = 320;
+      const size_t sbytes = rows * sp, dbytes = rows * dp;
+      CUdeviceptr a = 0, b = 0;
+      check(d_->cuMemAlloc(&a, sbytes), "cuMemAlloc");
+      check(d_->cuMemAlloc(&b, dbytes), "cuMemAlloc");
+      std::vector<uint8_t> in(sbytes), out(dbytes, 0);
+      for (size_t i = 0; i < sbytes; ++i) in[i] = static_cast<uint8_t>(i * 131 + 7);
+      check(d_->cuMemcpyHtoDAsync(a, in.data(), sbytes, s.side), "cuMemcpyHtoDAsync");
+      check(d_->cuMemsetD8Async(b, 0, dbytes, s.side), "cuMemsetD8Async");
+      Rects r;
+      r.push(static_cast<i64>(a), static_cast<i64>(b), width, rows, sp, dp);
+      const std::vector<TmaBlock> v = tma_blocks(r);
+      if (v.empty()) {
+        d_->cuMemFree(a), d_->cuMemFree(b);
+        return void(s.tma2d_error = "cuTensorMapEncodeTiled refused the test block");
+      }
+      Slot& sl = upload(s, v.data(), v.size() * sizeof(TmaBlock), s.side);
+      CUfunction f = function(s, "ce_bytes_tma2d");
+      CUdeviceptr t = sl.dev.ptr;
+      int n = 1;
+      void* args[] = {&t, &n};
+      check(d_->cuLaunchKernel(f, 1, 1, 1, 32, 1, 1, 0, s.side, args, nullptr), "cuLaunchKernel ce_bytes_tma2d");
+      check(d_->cuEventRecord(sl.done, s.side), "cuEventRecord");
+      sl.used = true;
+      check(d_->cuMemcpyDtoHAsync(out.data(), b, dbytes, s.side), "cuMemcpyDtoHAsync");
+      check(d_->cuStreamSynchronize(s.side), "cuStreamSynchronize");
+      d_->cuMemFree(a);
+      d_->cuMemFree(b);
+      bool ok = true;
+      for (i64 row = 0; row < rows && ok; ++row) {
+        ok = std::memcmp(out.data() + row * dp, in.data() + row * sp, width) == 0;
+        for (i64 k = width; k < dp && ok; ++k) ok = out[row * dp + k] == 0;  // nothing past the block
+      }
+      if (ok) s.tma2d = true, s.tma2d_error.clear();
+      else s.tma2d_error = "tma2d test copy came back wrong";
+    } catch (const std::exception& e) {
+      s.tma2d_error = std::string("tma2d: ") + e.what();
+    }
   }
 
   // Tile ops: their descriptors resident with the plan, one launch per group.

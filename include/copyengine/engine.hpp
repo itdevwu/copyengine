@@ -27,8 +27,9 @@ enum class Strategy : uint8_t {
   tile,           // tile ops (quantization while copying): units of values (host loop, or one warp each)
   bulk,           // CUDA: pure device copies through shared memory (TMA on sm90+, cp.async on sm80-89)
   tile_staged,    // CUDA: tile ops with host sides through device staging (DMA in, kernel, DMA out)
+  tma2d,          // CUDA sm90+: pure device copies, each 2-D block as tensor maps moved box by box
 };
-inline constexpr int kNumStrategies = 14;
+inline constexpr int kNumStrategies = 15;
 std::string_view strategy_name(Strategy s);
 Strategy parse_strategy(std::string_view name);
 

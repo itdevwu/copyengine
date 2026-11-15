@@ -6,6 +6,11 @@ change incompatibly only in a new minor (0.x) or major release.
 
 ## Unreleased
 
+- `tma2d` (sm90 and later): pure device copies whose rows form 2-D blocks
+  (narrow rows under a permute, say) move as TMA tensor-map boxes, many rows
+  per operation; admitted by a verified test copy and chosen by measurement
+  (`stats()["cuda"][i]["tma2d"]`).
+
 - Block quantization: `ce.quantize(w, q, scale, fmt="fp8_e4m3", block=(128, 128))`
   (FP8 E4M3 / E5M2, INT8) uses one float32 scale per block of the last two
   dimensions, as DeepSeek-V3 stores weights; the same formula as the group

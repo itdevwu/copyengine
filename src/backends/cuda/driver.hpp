@@ -63,7 +63,8 @@ namespace ce::cuda {
   X(cuDevResourceGenerateDesc)    \
   X(cuGreenCtxCreate)             \
   X(cuGreenCtxDestroy)            \
-  X(cuGreenCtxStreamCreate)
+  X(cuGreenCtxStreamCreate)       \
+  X(cuTensorMapEncodeTiled)
 
 struct Driver {
 #define CE_CUDA_DECL(name) decltype(&::name) name = nullptr;

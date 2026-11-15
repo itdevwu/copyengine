@@ -512,20 +512,27 @@ __device__ __forceinline__ float warp_amin(float v) {
 
 // One unit on one warp: the same unit functions as the host path (the
 // reductions are exact and NaN-propagating, so their order does not matter).
-__device__ void tile_unit_warp(const cv::TileK& t, long long u, int lane) {
+// The format and direction are compile-time constants: one kernel each keeps
+// registers and branches down.
+template <int F, bool Q>
+__device__ __forceinline__ void tile_unit_warp(const cv::TileK& t, long long u, int lane) {
   using cv::QFmt;
-  const QFmt f = static_cast<QFmt>(t.fmt);
+  constexpr QFmt f = static_cast<QFmt>(F);
   const cv::UnitAt a = cv::unit_at(t, u);
   if (a.bad) {  // an index out of range: skipped, reported at synchronize()
     if (lane == 0 && t.err) atomicOr(reinterpret_cast<unsigned long long*>(t.err), 1ull);
     return;
   }
   auto xv = [&](int k) { return cv::val_float(cv::load(cv::addr(cv::x_at(t, a, k)), t.xdt)); };
-  if (t.quantize) {
+  if constexpr (Q) {
+    constexpr bool range = f == QFmt::uint4;
+    constexpr int kCache = 8;  // values per lane kept in registers (units up to 256)
+    float c[kCache];
     float amax = 0.0f, lo = 0.0f, hi = 0.0f;
-    const bool range = cv::qfmt_needs_range(f);
-    for (int k = lane; k < t.g; k += 32) {
+    int n = 0;
+    for (int k = lane; k < t.g; k += 32, ++n) {
       const float v = xv(k);
+      if (n < kCache) c[n] = v;
       amax = cv::amax_step(amax, cv::abs_f(v));
       if (range) lo = cv::amin_step(lo, v), hi = cv::amax_step(hi, v);
     }
@@ -537,33 +544,48 @@ __device__ void tile_unit_warp(const cv::TileK& t, long long u, int lane) {
       else cv::wr<float>(cv::addr(a.s), p.scale);
       if (f == QFmt::uint4) cv::wr<uint8_t>(cv::addr(a.z), p.bits);
     }
-    if (cv::qfmt_packed(f)) {
+    if constexpr (cv::qfmt_packed(f)) {
       for (int i = lane; i < t.g / 2; i += 32)
         cv::wr<uint8_t>(cv::addr(cv::q_at(t, a, 2 * i)),
                         static_cast<uint8_t>(cv::quant_elem(f, xv(2 * i), p) | (cv::quant_elem(f, xv(2 * i + 1), p) << 4)));
     } else {
-      for (int k = lane; k < t.g; k += 32) cv::wr<uint8_t>(cv::addr(cv::q_at(t, a, k)), cv::quant_elem(f, xv(k), p));
+      n = 0;
+      for (int k = lane; k < t.g; k += 32, ++n)
+        cv::wr<uint8_t>(cv::addr(cv::q_at(t, a, k)), cv::quant_elem(f, n < kCache ? c[n] : xv(k), p));
     }
-    return;
+  } else {
+    const float s = t.scale_byte ? 0.0f : cv::rd<float>(cv::addr(a.s));
+    const uint8_t bits = t.scale_byte ? cv::rd<uint8_t>(cv::addr(a.s)) : (f == QFmt::uint4 ? cv::rd<uint8_t>(cv::addr(a.z)) : 0);
+    const float factor = cv::unit_scale(f, s, bits, t.gs);
+    const uint8_t* q0 = static_cast<const uint8_t*>(cv::addr(cv::q_at(t, a, 0)));
+    for (int k = lane; k < t.g; k += 32)
+      cv::store_float(cv::addr(cv::x_at(t, a, k)), t.xdt, cv::dequantize_at(q0, t.qe, k, f, factor, bits));
   }
-  const float s = t.scale_byte ? 0.0f : cv::rd<float>(cv::addr(a.s));
-  const uint8_t bits = t.scale_byte ? cv::rd<uint8_t>(cv::addr(a.s)) : (f == QFmt::uint4 ? cv::rd<uint8_t>(cv::addr(a.z)) : 0);
-  const float factor = cv::unit_scale(f, s, bits, t.gs);
-  const uint8_t* q0 = static_cast<const uint8_t*>(cv::addr(cv::q_at(t, a, 0)));
-  for (int k = lane; k < t.g; k += 32)
-    cv::store_float(cv::addr(cv::x_at(t, a, k)), t.xdt, cv::dequantize_at(q0, t.qe, k, f, factor, bits));
 }
 
 }  // namespace
 
 // Grid: x over units (8 warps per block, grid-stride), y over the group's ops.
-extern "C" __global__ void ce_tile(const cv::TileK* __restrict__ tiles, int count) {
+template <int F, bool Q>
+__device__ __forceinline__ void tile_kernel(const cv::TileK* __restrict__ tiles, int count) {
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, wpb = blockDim.x >> 5;
   for (int op = blockIdx.y; op < count; op += gridDim.y) {
     const cv::TileK t = tiles[op];
     const long long units = t.units();
     for (long long u = static_cast<long long>(blockIdx.x) * wpb + warp; u < units;
          u += static_cast<long long>(gridDim.x) * wpb)
-      tile_unit_warp(t, u, lane);
+      tile_unit_warp<F, Q>(t, u, lane);
   }
 }
+
+#define CE_TILE(F)                                                                                \
+  extern "C" __global__ void ce_tile_q##F(const cv::TileK* __restrict__ t, int n) { tile_kernel<F, true>(t, n); } \
+  extern "C" __global__ void ce_tile_d##F(const cv::TileK* __restrict__ t, int n) { tile_kernel<F, false>(t, n); }
+CE_TILE(0)
+CE_TILE(1)
+CE_TILE(2)
+CE_TILE(3)
+CE_TILE(4)
+CE_TILE(5)
+CE_TILE(6)
+CE_TILE(7)

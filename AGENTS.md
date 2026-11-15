@@ -41,8 +41,11 @@
   split by any cut; `f` reads only its own unit (no reduction across units,
   no output whose size depends on values; tensor-wide quantities are inputs);
   and `f` comes from a closed catalog, each entry with one implementation
-  shared by host and kernels and a torch recipe it matches bit for bit. What
-  does not fit stays outside copyengine.
+  shared by host and kernels and a torch recipe (`copyengine/_quant.py`) it
+  matches bit for bit on every device. What does not fit stays outside
+  copyengine. Copies (moving, converting) match torch itself bit for bit;
+  computation (a catalog entry) matches its recipe, since torch's own
+  arithmetic differs across devices and forms of the same formula.
 - Ops carry absolute element indices (address / itemsize); pure copies are
   normalized to bytes. Dependencies and merging rely on this.
 - Every Executor strategy must be correct for any group it is offered.

@@ -69,7 +69,14 @@ scope: it runs as usual, ordered correctly around the copies.
 2. **The same results.** copyengine only takes a copy when it can produce
    exactly torch's result; otherwise torch runs it. Host and GPU conversions
    are bit-identical. (NaN stays NaN, but its sign and payload bits are not
-   kept: torch's own differ between its CPU and CUDA conversions.)
+   kept: torch's own differ between its CPU and CUDA conversions.) This is a
+   guarantee about copies: moving and converting values. Quantization
+   (`ce.quantize`) computes, and computation has no single "torch result":
+   the order and form of the arithmetic decide the last bit, and torch itself
+   gives different bits on the CPU and the GPU for the same expression. There
+   copyengine follows its own written recipe (`copyengine/_quant.py`), with
+   the same bits on the host and every GPU; torch code computing the same
+   formula another way may differ in the last bit.
 3. **Easy to turn off.** `CE_DISABLE=1` turns copyengine's choices off: every
    copy runs through torch's own `copy_`, or exactly as submitted where torch
    has no equivalent.

@@ -31,6 +31,13 @@ def data(lead, D, dtype, dev, seed=0):
     return x.to(dtype).to(dev)
 
 
+def rows(t, idx):
+    """t[idx] through a byte view: old torch cannot index fp8 tensors on the CPU."""
+    if t.element_size() == 1:
+        return t.view(torch.uint8)[idx.to(t.device)].view(t.dtype)
+    return t[idx.to(t.device)]
+
+
 def engines():
     # The torch baseline only, and ce's strategies while exploring (the
     # recipe's own bits either way).
@@ -151,7 +158,7 @@ def test_gather_then_quantize_into_cache_blocks(dev, fmt, g, gpu_index):
             e.quantize(kv, q, scale, zero, fmt=fmt, group=g, global_scale=gs, x_index=si, index=di)
             if dev == "cuda":
                 torch.cuda.synchronize()
-            check(fmt, g, kv[src], q[dst], scale[dst], None if zero is None else zero[dst], gs)
+            check(fmt, g, kv[src], rows(q, dst), rows(scale, dst), None if zero is None else zero[dst], gs)
             back = torch.zeros(blocks, 4, D, dtype=torch.float32, device=dev)
             e.dequantize(q, scale, back, zero, fmt=fmt, group=g, global_scale=gs, x_index=si, index=di)
             if dev == "cuda":

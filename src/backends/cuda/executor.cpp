@@ -250,6 +250,7 @@ class CudaExecutor final : public Executor {
         if (b.done) d_->cuEventDestroy(b.done);
       }
       if (s.ev_free) d_->cuEventDestroy(s.ev_free);
+      if (s.ev_alloc) d_->cuEventDestroy(s.ev_alloc);
       for (Staging& g : s.stagings) {
         if (g.done) d_->cuEventDestroy(g.done);
         if (g.aux) {
@@ -604,6 +605,7 @@ class CudaExecutor final : public Executor {
     std::vector<uintptr_t> streams;
     bool many_streams = false;
     CUevent ev_free{};
+    CUevent ev_alloc{};  // dev_alloc: orders a first use after the framework's allocation stream
     DevMem err;               // set by kernels that meet an out-of-range device index
     bool err_armed = false;   // such kernels ran since the last check
     bool err_graphs = false;  // ... or were captured: graph replays may set it at any time
@@ -621,7 +623,7 @@ class CudaExecutor final : public Executor {
 
   CUdeviceptr error_word(Dev& s) {
     if (!s.err.ptr) {
-      s.err = dev_alloc(s, 8, "error word");
+      s.err = dev_alloc(s, 8, "error word", s.side);
       check(d_->cuMemsetD8Async(s.err.ptr, 0, 8, s.side), "cuMemsetD8Async");
       check(d_->cuStreamSynchronize(s.side), "cuStreamSynchronize");
     }
@@ -630,12 +632,23 @@ class CudaExecutor final : public Executor {
   static constexpr size_t kMaxStreams = 32;
   static constexpr size_t kLanes = 8;
 
-  DevMem dev_alloc(Dev& s, size_t bytes, const char* what) {
+  // Device memory for copyengine itself. From the framework's allocator it
+  // is ordered on m.stream only: the block may have been freed by a tensor
+  // whose kernels on m.stream still read or write it. So `use`, the stream
+  // that touches it first, waits for m.stream first (null: the host waits;
+  // setup only). The mirror of dev_free's ordering.
+  DevMem dev_alloc(Dev& s, size_t bytes, const char* what, CUstream use = nullptr) {
     if (const DeviceAllocator* a = device_allocator()) {
       DevMem m;
       m.ptr = static_cast<CUdeviceptr>(a->alloc(s.index, bytes, &m.handle, &m.stream));
       if (!m.ptr) fail(Errc::backend, std::string(what) + ": out of memory (" + a->name + " allocator, " +
                                           std::to_string(bytes) + " bytes)");
+      if (reinterpret_cast<uintptr_t>(use) != m.stream || !use) {
+        if (!s.ev_alloc) check(d_->cuEventCreate(&s.ev_alloc, CU_EVENT_DISABLE_TIMING), "cuEventCreate");
+        check(d_->cuEventRecord(s.ev_alloc, reinterpret_cast<CUstream>(m.stream)), "cuEventRecord");
+        if (use) check(d_->cuStreamWaitEvent(use, s.ev_alloc, 0), "cuStreamWaitEvent");
+        else check(d_->cuEventSynchronize(s.ev_alloc), "cuEventSynchronize");
+      }
       return m;
     }
     DevMem m;
@@ -1133,7 +1146,7 @@ class CudaExecutor final : public Executor {
       size_t cap = 64 << 10;
       while (cap < need) cap <<= 1;
       sl.host = pinned_alloc(cap, &sl.host_handle, "upload buffer");
-      sl.dev = dev_alloc(s, cap, "upload buffer");
+      sl.dev = dev_alloc(s, cap, "upload buffer", st);
       sl.cap = cap;
     }
     std::memcpy(sl.host, data, need);
@@ -1355,7 +1368,7 @@ class CudaExecutor final : public Executor {
     if (m->words < w.size()) {
       auto t = std::make_shared<DevTable>();
       t->owner = this, t->device = s.index, t->alive = alive_, t->count = w.size();
-      t->mem = dev_alloc(s, w.size() * 8, "host index mirror");
+      t->mem = dev_alloc(s, w.size() * 8, "host index mirror", st);
       t->ptr = t->mem.ptr;
       m->table = t, m->words = w.size();
     }
@@ -1482,7 +1495,7 @@ class CudaExecutor final : public Executor {
       if (m->words < words) {
         auto t = std::make_shared<DevTable>();
         t->owner = this, t->device = s.index, t->alive = alive_, t->count = words;
-        t->mem = dev_alloc(s, words * 8, "tile descriptors");
+        t->mem = dev_alloc(s, words * 8, "tile descriptors", st);
         t->ptr = t->mem.ptr;
         m->table = t, m->words = words;
       }
@@ -1815,7 +1828,7 @@ class CudaExecutor final : public Executor {
       if (!hit->table) {
         auto t = std::make_shared<DevTable>();
         t->owner = this, t->device = s.index, t->alive = alive_, t->count = bases.size();
-        t->mem = dev_alloc(s, bases.size() * sizeof(Base), "copy table");
+        t->mem = dev_alloc(s, bases.size() * sizeof(Base), "copy table", st);
         t->ptr = t->mem.ptr;
         hit->table = t;
       }
@@ -1835,7 +1848,7 @@ class CudaExecutor final : public Executor {
     t->owner = this, t->device = s.index, t->alive = alive_, t->count = v.size();
     if (v.empty()) return t;
     const size_t bytes = v.size() * sizeof(T);
-    t->mem = dev_alloc(s, bytes, "copy table");
+    t->mem = dev_alloc(s, bytes, "copy table", s.side);
     t->ptr = t->mem.ptr;
     check(d_->cuMemcpyHtoDAsync(t->ptr, v.data(), bytes, s.side), "cuMemcpyHtoDAsync");
     check(d_->cuStreamSynchronize(s.side), "cuStreamSynchronize");
@@ -2168,7 +2181,7 @@ class CudaExecutor final : public Executor {
       while (cap < bytes) cap <<= 1;
       cap = std::min<size_t>(cap, static_cast<size_t>(std::max<int64_t>(opt_.staging_budget, 1 << 20)));
       if (cap < bytes) fail(Errc::invalid_argument, "staging request exceeds the budget");
-      g.mem = dev_alloc(s, cap, "staging");
+      g.mem = dev_alloc(s, cap, "staging", st);
       g.cap = cap;
       g.used = false;
     }
@@ -2406,7 +2419,7 @@ class CudaExecutor final : public Executor {
     if (!g.pure() && sc && dc && !same_dev)
       fail(Errc::unsupported, "converting copies between two GPUs are not supported yet");
     if (!s.pace.ptr) {
-      s.pace = dev_alloc(s, 3 * sizeof(unsigned long long), "pacing words");
+      s.pace = dev_alloc(s, 3 * sizeof(unsigned long long), "pacing words", s.side);
       check(d_->cuMemsetD8Async(s.pace.ptr, 0, 3 * sizeof(unsigned long long), s.side), "cuMemsetD8Async");
       check(d_->cuStreamSynchronize(s.side), "cuStreamSynchronize");
     }

@@ -762,3 +762,23 @@ def test_narrow_rows_cast_matches_torch(D, pair):
     want = x.permute(0, 2, 1, 3).to(dst_dt)
     nan = want.isnan()
     assert torch.equal(out.isnan(), nan) and torch.equal(out[~nan], want[~nan])
+
+
+def test_copyengine_memory_waits_for_the_allocation_stream():
+    # A block torch hands copyengine may still have pending writes from a freed
+    # tensor on torch's stream; copyengine's first write to it (a copy table,
+    # written on its own stream) must come after them, or the table is
+    # overwritten and its copies read garbage.
+    for k in range(6):
+        e = ce.Engine(prior_only=True)  # a fresh engine: its first copy builds its tables
+        src = torch.randn(64 + k, 128, device=DEV)
+        dst = torch.empty(128, 64 + k, device=DEV, dtype=torch.float16)
+        # Blocks of the sizes copy tables take, freed with a write still pending.
+        doomed = [torch.empty(n // 4, device=DEV) for n in (512, 1024, 2048, 4096, 8192, 16384, 32768, 65536)]
+        torch.cuda._sleep(50_000_000)
+        for t in doomed:
+            t.fill_(float("nan"))
+        del doomed, t
+        e.copy_(dst, src.t())
+        torch.cuda.synchronize()
+        assert torch.equal(dst, src.t().to(torch.float16)), k

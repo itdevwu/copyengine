@@ -134,7 +134,8 @@ def test_block_rejects_other_formats_and_shapes():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or not ce._compiled.available(), reason="needs CUDA and torch ops")
-def test_block_quantize_compiled():
+def test_block_quantize_compiled(monkeypatch):
+    monkeypatch.setenv("CE_COMPILE_BASELINE", "0")
     fmt, block = "fp8_e4m3", (128, 128)
     w = data((256, 512), torch.bfloat16, "cuda", seed=6)
     q = torch.zeros(256, 512, dtype=torch.float8_e4m3fn, device="cuda")

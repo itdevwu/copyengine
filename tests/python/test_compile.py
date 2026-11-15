@@ -13,6 +13,12 @@ DEV = "cuda"
 ops = pytest.mark.skipif(not ce._compiled.available(), reason="the torch ops need torch 2.10+")
 
 
+@pytest.fixture(autouse=True)
+def no_baseline_measurement(monkeypatch):
+    # Measuring the compiled baseline costs a compile per layout: only the tests about it measure.
+    monkeypatch.setenv("CE_COMPILE_BASELINE", "0")
+
+
 def breaks(fn, *args):
     torch._dynamo.reset()
     return torch._dynamo.explain(fn)(*args).graph_break_count
@@ -147,3 +153,82 @@ def test_reduce_overhead_cuda_graphs():
         r = g(x)
         torch.cuda.synchronize()
         assert torch.equal(r, (x * 3).to(torch.bfloat16))
+
+
+def _graph_ops(fn, *args):
+    torch._dynamo.reset()
+    ex = torch._dynamo.explain(fn)(*args)
+    return "\n".join(g.code for g in ex.graphs), ex.graph_break_count
+
+
+@ops
+def test_the_compiled_baseline_is_emitted_when_it_is_as_fast(monkeypatch):
+    # The decision is measured once per layout; forced here both ways.
+    monkeypatch.delenv("CE_COMPILE_BASELINE")
+    src = torch.randn(64, 128, device=DEV)
+    dst = torch.empty(128, 64, device=DEV, dtype=torch.float16)
+
+    def f(x):
+        ce.copy_(dst, (x * 2).t())
+        return dst
+
+    for verdict, has_op in (("torch", False), ("ce", True)):
+        ce._compiled._DECISIONS.clear()
+        monkeypatch.setattr(ce._compiled, "_measure", lambda *a, verdict=verdict, **k: (verdict, "forced"))
+        code, breaks_ = _graph_ops(f, src)
+        assert breaks_ == 0 and ("copyengine" in code) == has_op, (verdict, code)
+        torch._dynamo.reset()
+        torch.compile(f)(src)
+        torch.cuda.synchronize()
+        assert torch.equal(dst, (src * 2).t().to(torch.float16))
+    ce._compiled._DECISIONS.clear()
+
+
+@ops
+def test_the_measurement_runs_and_is_kept(monkeypatch):
+    monkeypatch.delenv("CE_COMPILE_BASELINE")
+    ce._compiled._DECISIONS.clear()
+    kv = torch.randn(32, 16, 64, device=DEV)
+    out = torch.empty(8, 16, 64, device=DEV)
+
+    def f(idx):
+        ce.gather(kv, idx, 0, out=out)
+        return idx
+
+    idx = torch.randperm(32, device=DEV)[:8]
+    torch._dynamo.reset()
+    torch.compile(f)(idx)
+    torch.cuda.synchronize()
+    assert torch.equal(out, kv[idx])
+    assert any(k[0] == "gather" for k in ce._compiled._DECISIONS)
+    assert set(ce._compiled._DECISIONS.values()) <= {"ce", "torch"}
+    why = [w for k, w in ce._compiled._REASONS.items() if k[0] == "gather"]
+    assert why and "us" in why[0], why  # measured (not a baseline that failed to build)
+    monkeypatch.setenv("CE_COMPILE_BASELINE", "0")
+    code, _ = _graph_ops(f, idx)
+    assert "copyengine" in code
+    ce._compiled._DECISIONS.clear()
+
+
+@ops
+def test_warm_when_the_model_is_warm():
+    # Module-level calls in a compiled model explore on its warmup runs and lock;
+    # compiled_stats() shows the process-wide engine they use.
+    blocks, n = 64, 16
+    kv = torch.randn(blocks, 32, 128, device=DEV)
+    host = torch.empty(n, 32, 128).pin_memory()
+
+    def step(idx):
+        ce.copy_(host, ce.lazy(kv).index_select(0, idx))
+        return idx
+
+    torch._dynamo.reset()
+    g = torch.compile(step)
+    for _ in range(60):
+        idx = torch.randperm(blocks, device=DEV)[:n]
+        g(idx)
+    torch.cuda.synchronize()
+    assert torch.equal(host, kv[idx].cpu())
+    st = ce.compiled_stats()
+    whys = [d["why"] for d in st["last"]["decisions"]]
+    assert whys and all(w.startswith("locked") for w in whys), whys

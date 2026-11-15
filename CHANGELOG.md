@@ -6,6 +6,14 @@ change incompatibly only in a new minor (0.x) or major release.
 
 ## Unreleased
 
+- Inside torch.compile regions copyengine is measured against what
+  torch.compile makes of the same operation: per call kind and layout, the
+  torch equivalent compiled by Inductor (admitted only with the same bits)
+  and copyengine are timed when first traced, and the graph gets
+  copyengine's op only where it is faster. `ce.compiled_stats()` reports the
+  engine compiled regions use and these decisions; `CE_COMPILE_BASELINE=0`
+  skips the measurement.
+
 - Step plans replay steps that stage copies through tensors they allocate
   and drop: copies into and out of such a temporary compose into direct
   copies, and it is not written (before, the step ran plainly).

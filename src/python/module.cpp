@@ -415,6 +415,10 @@ NB_MODULE(_core, m) {
 
   m.def("hardware_fingerprint", &ce::hardware_fingerprint);
   m.def("host_is_pinned", &ce::host_is_pinned, "ptr"_a);
+  // The process-wide engine of module-level calls inside torch.compile regions (FrontendApi::shared_engine).
+  m.def("shared_engine_stats", [] { return ce::frontend_api()->shared_engine()->stats_json(); });
+  m.def("shared_engine_profile", [] { return ce::frontend_api()->shared_engine()->dump_profile(); });
+  m.def("shared_engine_load_profile", [](const std::string& p) { ce::frontend_api()->shared_engine()->load_profile(p); });
   // torch's float8_e4m3fn overflow mode (convert.hpp): set once at import, before any copy.
   m.def("_set_f8e4m3_saturate", [](bool v) { ce::cv::f8e4m3_saturate = v ? 1 : 0; });
   m.def("_f8e4m3_saturate", [] { return ce::cv::f8e4m3_saturate != 0; });

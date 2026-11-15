@@ -1143,3 +1143,14 @@ def barrier():
 
 def stats() -> dict:
     return default_engine().stats()
+
+
+def compiled_stats() -> dict:
+    """Statistics of the engine module-level calls use inside torch.compile
+    regions (one per process): decisions, lock state, as :meth:`Engine.stats`;
+    ``"baselines"`` lists the compiled-baseline measurements (copyengine or
+    torch.compile's code per call kind and layout, and why)."""
+    out = json.loads(_core.shared_engine_stats())
+    out["baselines"] = [{"kind": k[0], "choice": _compiled._DECISIONS[k], "why": _compiled._REASONS.get(k, "")}
+                        for k in list(_compiled._DECISIONS)]
+    return out

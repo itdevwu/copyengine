@@ -81,7 +81,8 @@ def test_merges_that_are_not_views(dev):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or not ce._compiled.available(), reason="needs CUDA and torch ops")
-def test_rearrange_in_a_compiled_region():
+def test_rearrange_in_a_compiled_region(monkeypatch):
+    monkeypatch.setenv("CE_COMPILE_BASELINE", "0")
     kv = torch.randn(8 * 16, 4, 32, device="cuda")
     out = torch.empty(3, 4, 16, 32, device="cuda")
 

@@ -40,6 +40,19 @@ def timeit(fn, reps: int) -> float:
     return statistics.median(ts) * 1e6
 
 
+class _NoScope:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def _scope(e):
+    """A scope eagerly; inside a compiled region each call is its own graph node (scopes stay outside)."""
+    return _NoScope() if torch.compiler.is_compiling() else e.scope()
+
+
 def compiled(fn, mode=None):
     torch._dynamo.reset()
     c = torch.compile(fn, mode=mode, fullgraph=False, dynamic=False)
@@ -66,7 +79,7 @@ def case_offload(q):
             host[l].copy_(kv[l].index_select(0, idx), non_blocking=True)
 
     def ce_fn(e):
-        with e.scope():
+        with _scope(e):
             for l in range(L):
                 e.copy_(host[l], ce.lazy(kv[l]).index_select(0, idx))
 
@@ -88,7 +101,7 @@ def case_onload(q):
             kv[l].index_copy_(0, idx, host[l].to(DEV, non_blocking=True))
 
     def ce_fn(e):
-        with e.scope():
+        with _scope(e):
             for l in range(L):
                 e.copy_(ce.lazy(kv[l]).index_select(0, idx), host[l])
 
@@ -181,6 +194,16 @@ def run(name, quick, reps):
     warm(lambda: ce_fn(e), 80)  # explored, A/B tested and locked, as after a model's warmup
     row["copyengine"] = timeit(lambda: ce_fn(e), reps)
     row["copyengine_ok"] = bool(check())
+    # copyengine inside the compiled function (0.5: never worse than torch.compile alone)
+    try:
+        e2 = ce.Engine(tune_trials=3, tune_topk=4)
+        cc = compiled(lambda: ce_fn(e2))
+        warm(cc, 80)
+        row["compile_ce"] = timeit(cc, reps)
+        row["compile_ce_ok"] = bool(check())
+    except Exception as ex:
+        row["compile_ce"] = None
+        row["compile_ce_error"] = f"{type(ex).__name__}: {str(ex).splitlines()[0][:120]}"
     row["strategies"] = sorted({d["strategy"] for d in e.stats()["last"]["decisions"]})
     return row
 
@@ -196,7 +219,8 @@ def main():
     reps = 10 if a.quick else 30
     rows = []
     print(f"torch {torch.__version__}, copyengine {ce.__version__}; median us per iteration")
-    hdr = f"{'case':15s} {'MB':>7s} {'eager':>9s} {'compile':>9s} {'compile_cg':>10s} {'copyengine':>10s}  ce strategies"
+    hdr = (f"{'case':15s} {'MB':>7s} {'eager':>9s} {'compile':>9s} {'compile_cg':>10s} {'copyengine':>10s} "
+           f"{'compile+ce':>10s}  ce strategies")
     print(hdr)
     for name in a.only or CASES:
         r = run(name, a.quick, reps)
@@ -204,7 +228,7 @@ def main():
         f = lambda k: "-" if r.get(k) is None else f"{r[k]:.0f}"
         bad = [k for k in r if k.endswith("_ok") and not r[k]] + [k for k in r if k.endswith("_error")]
         print(f"{name:15s} {r['MB']:7.1f} {f('eager'):>9s} {f('compile'):>9s} {f('compile_cg'):>10s} "
-              f"{f('copyengine'):>10s}  {','.join(r['strategies'])}" + (f"  !! {bad}" if bad else ""))
+              f"{f('copyengine'):>10s} {f('compile_ce'):>10s}  {','.join(r['strategies'])}" + (f"  !! {bad}" if bad else ""))
     if a.json:
         with open(a.json, "w") as fh:
             json.dump({"torch": torch.__version__, "copyengine": ce.__version__, "rows": rows}, fh, indent=1)

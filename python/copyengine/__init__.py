@@ -12,6 +12,7 @@ from ._api import (
     FrozenPlan,
     Pending,
     barrier,
+    compiled_stats,
     copy_,
     copy_many,
     default_engine,
@@ -44,7 +45,7 @@ from ._core import (
 __all__ = [
     "ABI_VERSION", "Access", "BackendError", "CopyEngineError", "Elementwise", "Engine", "FrozenPlan", "Pending",
     "NeedsMaterialize", "Rects", "Runs", "Stmt", "Unsupported", "UnsafeCopy", "__version__", "barrier",
-    "copy_", "copy_many", "default_engine", "dequantize", "quantize", "gather", "hardware_fingerprint", "indices", "lazy", "Lazy", "lower", "plan", "probe", "scatter_",
+    "compiled_stats", "copy_", "copy_many", "default_engine", "dequantize", "quantize", "gather", "hardware_fingerprint", "indices", "lazy", "Lazy", "lower", "plan", "probe", "scatter_",
     "scope", "segments", "stats",
 ]
 

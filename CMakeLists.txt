@@ -38,6 +38,8 @@ add_library(copyengine
 add_library(copyengine::copyengine ALIAS copyengine)
 # Host and device conversions must agree bit for bit: no FMA contraction.
 set_source_files_properties(src/backends/host/host.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+# The quantization test hooks evaluate convert.hpp / quant.hpp too.
+set_source_files_properties(src/python/module.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
 find_package(Threads REQUIRED)
 target_link_libraries(copyengine PRIVATE Threads::Threads)
 target_include_directories(copyengine
@@ -144,6 +146,7 @@ if(CE_BUILD_PYTHON)
   find_package(nanobind CONFIG REQUIRED)
   nanobind_add_module(_core STABLE_ABI NB_STATIC src/python/module.cpp)
   target_link_libraries(_core PRIVATE copyengine)
+  target_include_directories(_core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)  # quant.hpp test hooks
   install(TARGETS _core LIBRARY DESTINATION copyengine)
 
   # Interception shim sources, laid out as in the wheel: the runtime compiles

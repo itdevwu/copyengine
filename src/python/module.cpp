@@ -1,6 +1,7 @@
 #include <atomic>
 
 #include <nanobind/nanobind.h>
+#include <cstring>
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/pair.h>
@@ -10,6 +11,7 @@
 #include <nanobind/stl/vector.h>
 #include <nanobind/stl/array.h>
 
+#include "core/quant.hpp"
 #include "copyengine/copyengine.h"
 #include "copyengine/copyengine.hpp"
 #include "copyengine/engine.hpp"
@@ -375,4 +377,42 @@ NB_MODULE(_core, m) {
   m.def("host_is_pinned", &ce::host_is_pinned, "ptr"_a);
   // Address of the FrontendApi table handed to copyengine._torch.
   m.def("_frontend_api", [] { return reinterpret_cast<uintptr_t>(ce::frontend_api()); });
+
+  // Test hooks: the quantization catalog's host implementation, unit by unit
+  // (tests/python/test_quant_ref.py checks it against the torch recipes).
+  m.def("_quant_ref", [](int fmt, nb::ndarray<const float, nb::ndim<1>, nb::c_contig, nb::device::cpu> x, int group,
+                         float eps, float gs) {
+    const auto f = static_cast<ce::cv::QFmt>(fmt);
+    const size_t n = x.shape(0), units = n / static_cast<size_t>(group);
+    const size_t per = f == ce::cv::QFmt::nvfp4 ? static_cast<size_t>(group) / 2 : static_cast<size_t>(group);
+    std::string q(units * per, '\0'), scale(units * 4, '\0'), bits(units, '\0');
+    for (size_t u = 0; u < units; ++u) {
+      const float* xp = x.data() + u * static_cast<size_t>(group);
+      float s = 0;
+      uint8_t sb = 0;
+      ce::cv::quantize_unit([&](long long i) { return xp[i]; }, 1, group, f, eps, gs,
+                            reinterpret_cast<uint8_t*>(q.data()) + u * per, 1, &s, &sb);
+      std::memcpy(scale.data() + u * 4, &s, 4);
+      bits[u] = static_cast<char>(sb);
+    }
+    return nb::make_tuple(nb::bytes(q.data(), q.size()), nb::bytes(scale.data(), scale.size()),
+                          nb::bytes(bits.data(), bits.size()));
+  }, "fmt"_a, "x"_a, "group"_a, "eps"_a = 1e-12f, "gs"_a = 1.0f);
+  m.def("_dequant_ref", [](int fmt, nb::bytes q, nb::bytes scale, nb::bytes bits, int group, float gs) {
+    const auto f = static_cast<ce::cv::QFmt>(fmt);
+    const size_t units = bits.size(), n = units * static_cast<size_t>(group);
+    const size_t per = f == ce::cv::QFmt::nvfp4 ? static_cast<size_t>(group) / 2 : static_cast<size_t>(group);
+    std::string y(n * 4, '\0');
+    const auto* qp = reinterpret_cast<const uint8_t*>(q.c_str());
+    for (size_t u = 0; u < units; ++u) {
+      float s;
+      std::memcpy(&s, scale.c_str() + u * 4, 4);
+      const float factor = ce::cv::unit_scale(f, s, static_cast<uint8_t>(bits.c_str()[u]), gs);
+      for (int i = 0; i < group; ++i) {
+        const float v = ce::cv::dequantize_at(qp + u * per, 1, i, f, factor);
+        std::memcpy(y.data() + (u * static_cast<size_t>(group) + static_cast<size_t>(i)) * 4, &v, 4);
+      }
+    }
+    return nb::bytes(y.data(), y.size());
+  }, "fmt"_a, "q"_a, "scale"_a, "bits"_a, "group"_a, "gs"_a = 1.0f);
 }

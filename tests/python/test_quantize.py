@@ -257,6 +257,44 @@ def test_across_gpu_and_pinned_host(fmt, g):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("fmt,g", [("fp8_e4m3", 128), ("uint4", 64)])
+def test_many_layers_across_gpu_and_pinned_host_in_one_scope(fmt, g):
+    # Many tile ops in one group (one per layer), each staged through the
+    # device: every layer's staged addresses must land in its own descriptor.
+    layers, blocks, D = 24, 4, 2 * g
+    kvs = [data((blocks, 4), D, torch.bfloat16, "cuda", seed=k) for k in range(layers)]
+    outs = [tuple(None if t is None else t.pin_memory() for t in outputs(fmt, (blocks, 4), D, g, "cpu"))
+            for _ in kvs]
+    e = ce.Engine(tune_trials=1, tune_topk=4)
+    seen = set()
+    for _ in range(8):
+        for o in outs:
+            for t in o:
+                if t is not None:
+                    t.zero_()
+        with e.scope():
+            for kv, (q, s, z) in zip(kvs, outs):
+                e.quantize(kv, q, s, z, fmt=fmt, group=g)
+        e.synchronize()
+        seen.update(e.stats()["last"]["strategies"])
+        for kv, (q, s, z) in zip(kvs, outs):
+            check(fmt, g, kv, q, s, z)
+        backs = [torch.zeros(blocks, 4, D, device="cuda") for _ in kvs]
+        with e.scope():
+            for b, (q, s, z) in zip(backs, outs):
+                e.dequantize(q, s, b, z, fmt=fmt, group=g)
+        torch.cuda.synchronize()
+        seen.update(e.stats()["last"]["strategies"])
+        for kv, b in zip(kvs, backs):
+            codes, s, bits = _quant.quantize(kv.cpu(), g, fmt)
+            want = _quant.dequantize(codes, s, bits, g, fmt).view(b.shape)
+            got = b.cpu()
+            nan = got.isnan()
+            assert torch.equal(nan, want.isnan()) and torch.equal(got[~nan], want[~nan])
+    assert "tile_staged" in seen
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_step_plan_quantizes_with_new_gpu_indices():
     blocks, D, g = 32, 256, 128
     kv = data((blocks, 4), D, torch.float32, "cuda", seed=3)

@@ -80,65 +80,42 @@ CE_HD float e2m1_to_float(uint8_t c) {
 
 // ---- units ----------------------------------------------------------------------
 
-// Dynamic quantization of one unit of `g` values (strided by `xs`) into `q`
-// (strided by `qs`; nvfp4: packed bytes, two values each) and its scale:
-// float32 for scaled formats, the E8M0 / E4M3 byte for MX / NVFP4 (in
-// *scale_bits). `gs`: NVFP4's global scale. `eps`: the scaled formats' floor.
-template <class In>
-CE_HD void quantize_unit(In x, long long xs, int g, QFmt f, float eps, float gs, uint8_t* q, long long qs,
-                         float* scale, uint8_t* scale_bits) {
-  float amax = 0.0f;
-  for (int i = 0; i < g; ++i) amax = amax_step(amax, abs_f(x(i * xs)));
-  if (f == QFmt::int4) {  // symmetric: round(x / (amax / 7)) in [-8, 7], two's complement nibbles; NaN -> 0
-    const float s = (is_nan(amax) ? amax : (amax < eps ? eps : amax)) / 7.0f;
-    *scale = s;
-    for (int i = 0; i + 1 < g; i += 2) {
-      uint8_t n[2];
-      for (int k = 0; k < 2; ++k) {
-        const float v = x((i + k) * xs) / s;
-        n[k] = is_nan(v) ? 0 : static_cast<uint8_t>(static_cast<int>(clamp_f(rintf(v), -8.0f, 7.0f)) & 0xF);
+// What quantizing one unit needs once its reductions are known: the divisor
+// of each value, the scale to store (float32: scaled formats and INT4; a byte:
+// E8M0 for MX, E4M3 for NVFP4, the zero point for uint4), and whether every
+// value is zero (NVFP4 with a zero scale). Computed from the unit's amax, and
+// for uint4 its minimum and maximum (both clamped to include 0).
+struct UnitQ {
+  float div = 1.0f;
+  float scale = 0.0f;
+  uint8_t bits = 0;
+  bool zero_all = false;
+};
+
+CE_HD bool qfmt_needs_range(QFmt f) { return f == QFmt::uint4; }
+
+CE_HD UnitQ unit_params(QFmt f, float amax, float lo, float hi, float eps, float gs) {
+  UnitQ u;
+  auto floor_eps = [&](float v) { return is_nan(v) ? v : (v < eps ? eps : v); };
+  switch (f) {
+    case QFmt::fp8_e4m3: case QFmt::fp8_e5m2: case QFmt::int8: case QFmt::int4:
+      u.scale = u.div = floor_eps(amax) / qmax_of(f);
+      return u;
+    case QFmt::uint4: {
+      u.scale = u.div = floor_eps(hi - lo) / 15.0f;
+      const float zf = clamp_f(rintf(-lo / u.div), 0.0f, 15.0f);
+      u.bits = is_nan(zf) ? 0 : static_cast<uint8_t>(zf);
+      return u;
+    }
+    case QFmt::mxfp8_e4m3: case QFmt::mxfp8_e5m2: {
+      const int emax = f == QFmt::mxfp8_e4m3 ? 8 : 15;
+      const uint32_t b = f2u(amax);
+      const uint32_t e = (b >> 23) & 0xFFu, man = b & 0x7FFFFFu;
+      if (e == 0xFFu) {  // NaN or Inf: no scale (0xFF, NaN) and NaN values
+        u.bits = 0xFF;
+        u.div = u2f(0x7FC00000u);
+        return u;
       }
-      q[(i / 2) * qs] = static_cast<uint8_t>(n[0] | (n[1] << 4));
-    }
-    return;
-  }
-  if (f == QFmt::uint4) {  // asymmetric with a zero point (torchao affine): scale and zero per unit
-    float lo = 0.0f, hi = 0.0f;  // the range always includes 0
-    for (int i = 0; i < g; ++i) {
-      const float v = x(i * xs);
-      lo = amin_step(lo, v), hi = amax_step(hi, v);
-    }
-    const float span = hi - lo;
-    const float s = (is_nan(span) ? span : (span < eps ? eps : span)) / 15.0f;
-    const float zf = clamp_f(rintf(-lo / s), 0.0f, 15.0f);
-    const uint8_t z = is_nan(zf) ? 0 : static_cast<uint8_t>(zf);
-    *scale = s;
-    *scale_bits = z;
-    for (int i = 0; i + 1 < g; i += 2) {
-      uint8_t n[2];
-      for (int k = 0; k < 2; ++k) {
-        const float v = rintf(x((i + k) * xs) / s) + static_cast<float>(z);
-        n[k] = is_nan(v) ? 0 : static_cast<uint8_t>(clamp_f(v, 0.0f, 15.0f));
-      }
-      q[(i / 2) * qs] = static_cast<uint8_t>(n[0] | (n[1] << 4));
-    }
-    return;
-  }
-  if (f == QFmt::fp8_e4m3 || f == QFmt::fp8_e5m2 || f == QFmt::int8) {
-    const float s = (is_nan(amax) ? amax : (amax < eps ? eps : amax)) / qmax_of(f);
-    *scale = s;
-    for (int i = 0; i < g; ++i) q[i * qs] = quant_scaled(x(i * xs) / s, f);
-    return;
-  }
-  if (qfmt_mx(f)) {
-    const int emax = f == QFmt::mxfp8_e4m3 ? 8 : 15;
-    const uint32_t b = f2u(amax);
-    const uint32_t e = (b >> 23) & 0xFFu, man = b & 0x7FFFFFu;
-    float sf;
-    if (e == 0xFFu) {  // NaN or Inf: no scale (0xFF, NaN) and NaN values
-      *scale_bits = 0xFF;
-      sf = u2f(0x7FC00000u);
-    } else {
       int shared;
       if (b == 0) shared = -127;
       else {
@@ -146,24 +123,64 @@ CE_HD void quantize_unit(In x, long long xs, int g, QFmt f, float eps, float gs,
         shared = fl - emax;
         shared = shared < -127 ? -127 : shared > 127 ? 127 : shared;
       }
-      *scale_bits = static_cast<uint8_t>(shared + 127);
-      sf = shared >= -126 ? u2f(static_cast<uint32_t>(shared + 127) << 23) : u2f(0x00400000u);
+      u.bits = static_cast<uint8_t>(shared + 127);
+      u.div = shared >= -126 ? u2f(static_cast<uint32_t>(shared + 127) << 23) : u2f(0x00400000u);
+      return u;
     }
-    for (int i = 0; i < g; ++i) q[i * qs] = quant_scaled(x(i * xs) / sf, f);
+    case QFmt::nvfp4: {
+      float sv = amax / 6.0f / gs;  // .clamp(max=448)
+      if (!is_nan(sv) && sv > 448.0f) sv = 448.0f;
+      u.bits = float_to_f8e4m3(sv);
+      const float sf = f8e4m3_to_float(u.bits);
+      u.zero_all = sf == 0.0f;
+      u.div = sf * gs;
+      return u;
+    }
+  }
+  return u;
+}
+
+// One value's code: a byte, or a nibble for the packed formats.
+CE_HD uint8_t quant_elem(QFmt f, float x, const UnitQ& u) {
+  switch (f) {
+    case QFmt::int4: {
+      const float v = x / u.div;
+      return is_nan(v) ? 0 : static_cast<uint8_t>(static_cast<int>(clamp_f(rintf(v), -8.0f, 7.0f)) & 0xF);
+    }
+    case QFmt::uint4: {
+      const float v = rintf(x / u.div) + static_cast<float>(u.bits);
+      return is_nan(v) ? 0 : static_cast<uint8_t>(clamp_f(v, 0.0f, 15.0f));
+    }
+    case QFmt::nvfp4:
+      return u.zero_all ? 0 : float_to_e2m1(clamp_f(x / u.div, -6.0f, 6.0f));
+    default:
+      return quant_scaled(x / u.div, f);
+  }
+}
+
+// Dynamic quantization of one unit of `g` values (strided by `xs`) into `q`
+// (strided by `qs`; packed formats: bytes of two values) and its scale
+// (*scale: float32; *scale_bits: E8M0 / E4M3 byte or uint4's zero point).
+// The host path, unit by unit; kernels share unit_params and quant_elem.
+template <class In>
+CE_HD void quantize_unit(In x, long long xs, int g, QFmt f, float eps, float gs, uint8_t* q, long long qs,
+                         float* scale, uint8_t* scale_bits) {
+  float amax = 0.0f, lo = 0.0f, hi = 0.0f;
+  for (int i = 0; i < g; ++i) {
+    const float v = x(i * xs);
+    amax = amax_step(amax, abs_f(v));
+    if (qfmt_needs_range(f)) lo = amin_step(lo, v), hi = amax_step(hi, v);
+  }
+  const UnitQ u = unit_params(f, amax, lo, hi, eps, gs);
+  *scale = u.scale;
+  *scale_bits = u.bits;
+  if (qfmt_packed(f)) {
+    for (int i = 0; i + 1 < g; i += 2)
+      q[(i / 2) * qs] =
+          static_cast<uint8_t>(quant_elem(f, x(i * xs), u) | (quant_elem(f, x((i + 1) * xs), u) << 4));
     return;
   }
-  // nvfp4
-  float sv = amax / 6.0f / gs;  // .clamp(max=448)
-  if (!is_nan(sv) && sv > 448.0f) sv = 448.0f;
-  const uint8_t sb = float_to_f8e4m3(sv);
-  *scale_bits = sb;
-  const float sf = f8e4m3_to_float(sb);
-  const float den = sf * gs;
-  for (int i = 0; i + 1 < g; i += 2) {
-    const uint8_t lo = sf == 0.0f ? 0 : float_to_e2m1(clamp_f(x(i * xs) / den, -6.0f, 6.0f));
-    const uint8_t hi = sf == 0.0f ? 0 : float_to_e2m1(clamp_f(x((i + 1) * xs) / den, -6.0f, 6.0f));
-    q[(i / 2) * qs] = static_cast<uint8_t>(lo | (hi << 4));
-  }
+  for (int i = 0; i < g; ++i) q[i * qs] = quant_elem(f, x(i * xs), u);
 }
 
 // The scale of one unit as a float32 factor (dequantization multiplies by it).

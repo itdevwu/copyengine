@@ -12,11 +12,11 @@ bits, faster) on the user's machine. Never claim a speedup you did not measure.
 
 ## Check the installation
 
-This Skill supports copyengine `0.3.x`:
+This Skill supports copyengine `0.4.x`:
 
 ```bash
 python -c "import copyengine as ce, torch; print(ce.__version__, torch.__version__)"
-python -m pip install 'copyengine~=0.3.0'   # if missing or another series
+python -m pip install 'copyengine~=0.4.0'   # if missing or another series
 python -c "import copyengine as ce; print('shim:', ce._shim.lib is not None, ce._shim.error); print('ops:', ce._torch_ops.copy_ is not None, ce._torch_ops.error)"
 ```
 

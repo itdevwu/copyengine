@@ -469,6 +469,17 @@ std::optional<std::vector<i64>> view_strides(const std::vector<i64>& oshape,
 }
 }  // namespace
 
+namespace {
+std::vector<i64> term_values(const Term& t);
+std::vector<i64> outer_offsets(const std::vector<std::vector<i64>>& vals, size_t k, i64 base);
+}  // namespace
+
+// A reshape torch would call a view keeps strides. Otherwise the dimensions
+// regroup: old and new dimensions pair into groups of equal size (size-one
+// dimensions aside); a group of one new dimension over several old ones (a
+// merge, as einops' "(t h)" after a transpose) becomes a table of its
+// offsets, and one old dimension split into several new ones stays strided.
+// A group that both splits and merges, or splits a table, is not a view.
 Access Access::reshape(std::span<const i64> nshape) const {
   i64 n = 1;
   for (i64 s : nshape) {
@@ -476,12 +487,63 @@ Access Access::reshape(std::span<const i64> nshape) const {
     n *= s;
   }
   require(n == numel(), "reshape: element count differs");
-  if (has_table() || has_device_table()) fail(Errc::needs_materialize, "reshape across a table dimension");
-  std::vector<i64> st;
-  for (auto& t : terms_) st.push_back(t.stride);
-  auto ns = view_strides(shape(), st, nshape);
-  if (!ns) fail(Errc::needs_materialize, "reshape is not view-compatible");
-  return strided(nshape, *ns, base_);
+  if (!has_table() && !has_device_table()) {
+    std::vector<i64> st;
+    for (auto& t : terms_) st.push_back(t.stride);
+    if (auto ns = view_strides(shape(), st, nshape)) return strided(nshape, *ns, base_);
+  }
+  if (has_device_table()) fail(Errc::needs_materialize, "reshape across a device table dimension");
+  if (n == 0) return contiguous(nshape, base_);
+  // Size-one old dimensions are constant offsets; size-one new ones are added back last.
+  i64 base = base_;
+  std::vector<Term> old;
+  for (const Term& t : terms_) {
+    if (t.size == 1) base += term_values(t)[0];
+    else old.push_back(t);
+  }
+  std::vector<i64> ns;
+  for (i64 s : nshape)
+    if (s != 1) ns.push_back(s);
+  std::vector<Term> out;
+  size_t i = 0, k = 0;
+  while (i < old.size() || k < ns.size()) {
+    require(i < old.size() && k < ns.size(), "reshape: element count differs");
+    const size_t i0 = i, k0 = k;
+    i64 po = old[i++].size, pn = ns[k++];
+    while (po != pn) {
+      if (po < pn) {
+        require(i < old.size(), "reshape: element count differs");
+        po *= old[i++].size;
+      } else {
+        require(k < ns.size(), "reshape: element count differs");
+        pn *= ns[k++];
+      }
+    }
+    if (k - k0 == 1) {  // one new dimension: the old one, or a merge as a table of offsets
+      if (i - i0 == 1) {
+        out.push_back(old[i0]);
+        continue;
+      }
+      std::vector<std::vector<i64>> vals;
+      for (size_t d = i0; d < i; ++d) vals.push_back(term_values(old[d]));
+      auto table = std::make_shared<const std::vector<i64>>(outer_offsets(vals, vals.size(), 0));
+      out.emplace_back(pn, 1, std::move(table));
+    } else if (i - i0 == 1 && !old[i0].table) {  // one old dimension split: strided
+      i64 stride = old[i0].stride;
+      std::vector<Term> split;
+      for (size_t d = k; d-- > k0;) {
+        split.emplace_back(ns[d], stride);
+        stride *= ns[d];
+      }
+      out.insert(out.end(), split.rbegin(), split.rend());
+    } else {
+      fail(Errc::needs_materialize, "reshape is not view-compatible");
+    }
+  }
+  std::vector<Term> terms;
+  size_t o = 0;
+  for (i64 s : nshape) terms.push_back(s == 1 ? Term(1, 0) : out[o++]);
+  return Access(base, std::move(terms));
 }
 
 namespace {

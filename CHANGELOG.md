@@ -6,6 +6,12 @@ change incompatibly only in a new minor (0.x) or major release.
 
 ## Unreleased
 
+- einops on lazy views: `einops.rearrange(ce.lazy(x), ...)` and
+  `einops.repeat` compose into the view (no materialization), so a chain of
+  rearrangements, gathers, conversions and the write into a destination is
+  one planned copy; also inside torch.compile regions. Lazy reshapes no torch
+  view expresses (a merge after a transpose or a gather) compose too.
+
 - `tma2d` (sm90 and later): pure device copies whose rows form 2-D blocks
   (narrow rows under a permute, say) move as TMA tensor-map boxes, many rows
   per operation; admitted by a verified test copy and chosen by measurement

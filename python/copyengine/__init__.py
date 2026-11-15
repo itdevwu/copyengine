@@ -3,6 +3,7 @@
 import json as _json
 
 from . import _core
+from . import _einops  # einops on ce.lazy views (when einops is installed)
 from ._api import (
     Elementwise,
     Lazy,

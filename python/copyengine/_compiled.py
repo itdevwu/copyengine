@@ -31,11 +31,12 @@ def available() -> bool:
 class TracedLazy:
     """`ce.lazy(t)` while Dynamo traces: the tensor and the ops, recorded."""
 
-    def __init__(self, t, ops=()):
+    def __init__(self, t, ops=(), shape=None):
         self.t, self.ops = t, ops
+        self.shape = tuple(t.shape) if shape is None else shape
 
     def _with(self, *op):
-        return TracedLazy(self.t, self.ops + (op,))
+        return TracedLazy(self.t, self.ops + (op,), _shape_after(self.shape, op))
 
     def permute(self, *dims):
         dims = dims[0] if len(dims) == 1 and isinstance(dims[0], (list, tuple)) else dims
@@ -74,6 +75,46 @@ class TracedLazy:
         for op in self.ops:
             lz = getattr(lz, op[0])(*op[1:])
         return lz
+
+
+def _shape_after(shape, op):
+    """The shape a recorded op gives (einops asks for it at each step)."""
+    s, name = list(shape), op[0]
+    if name == "permute":
+        return tuple(s[d] for d in op[1])
+    if name == "transpose":
+        a, b = op[1] % len(s), op[2] % len(s)
+        s[a], s[b] = s[b], s[a]
+        return tuple(s)
+    if name == "index_select":
+        s[op[1]] = len(op[2])
+        return tuple(s)
+    if name == "slice":
+        _, dim, start, stop, step = op
+        s[dim] = len(range(*slice(start, stop, step).indices(s[dim])))
+        return tuple(s)
+    if name == "select":
+        del s[op[1]]
+        return tuple(s)
+    if name == "unsqueeze":
+        d = op[1] if op[1] >= 0 else op[1] + len(s) + 1
+        s.insert(d, 1)
+        return tuple(s)
+    if name == "expand":
+        return tuple(o if n == -1 else n for o, n in zip([1] * (len(op[1]) - len(s)) + s, op[1]))
+    if name == "reshape":
+        new = list(op[1])
+        if -1 in new:
+            known = 1
+            for n in new:
+                if n != -1:
+                    known *= n
+            total = 1
+            for n in s:
+                total *= n
+            new[new.index(-1)] = total // known
+        return tuple(new)
+    return tuple(s)  # flip
 
 
 def _view(t, op):

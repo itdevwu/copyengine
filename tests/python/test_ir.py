@@ -92,13 +92,21 @@ def test_access_algebra_matches_numpy(seed):
 
 
 def test_reshape_view_rules():
-    a = ce.Access.contiguous([4, 6]).permute([1, 0])     # not view-compatible as [24]
+    x = np.arange(24).reshape(4, 6)
+    a = ce.Access.contiguous([4, 6]).permute([1, 0])     # no view as [24]: a merge, a table of offsets
+    np.testing.assert_array_equal(a.reshape([24]).offsets(), x.T.reshape(-1))
+    np.testing.assert_array_equal(a.reshape([1, 24, 1]).offsets(), x.T.reshape(-1))
+    b = ce.Access.contiguous([4, 6]).slice(1, 0, 6, 2)    # [4, 3] stride (6, 2): a view
+    np.testing.assert_array_equal(b.reshape([2, 2, 3]).offsets(), x[:, ::2].reshape(-1))
+    c = ce.Access.contiguous([4]).index_select(0, [1, 2])  # a table dimension, split into one
+    np.testing.assert_array_equal(c.reshape([2, 1]).offsets(), np.array([1, 2]))
+    d = ce.Access.contiguous([5, 4]).index_select(0, [4, 0, 2])  # merged across a table dimension
+    np.testing.assert_array_equal(d.reshape([12]).offsets(), np.arange(20).reshape(5, 4)[[4, 0, 2]].reshape(-1))
     with pytest.raises(ce.NeedsMaterialize):
-        a.reshape([24])
-    b = ce.Access.contiguous([4, 6]).slice(1, 0, 6, 2)    # [4, 3] stride (6, 2)
-    np.testing.assert_array_equal(b.reshape([2, 2, 3]).offsets(), np.arange(24).reshape(4, 6)[:, ::2].reshape(-1))
+        a.reshape([3, 8])  # [6, 4] transposed into [3, 8]: splits and merges at once
     with pytest.raises(ce.NeedsMaterialize):
-        ce.Access.contiguous([4]).index_select(0, [1, 2]).reshape([2, 1])
+        c.reshape([1, 2]).reshape([2])  # fine
+        ce.Access.contiguous([4]).index_select(0, [1, 2, 3, 0]).reshape([2, 2])  # splits a table
 
 
 def test_errors():

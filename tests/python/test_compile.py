@@ -34,7 +34,7 @@ def test_copy_is_one_node(engine):
     torch._dynamo.reset()
     out = torch.compile(f)(src)
     assert torch.equal(dst, (src * 2).to(torch.float16))
-    assert torch.allclose(out, (src * 2).to(torch.float16).float().sum())
+    assert torch.allclose(out, (src * 2).to(torch.float16).float().sum(), rtol=1e-4)  # summation order differs
 
 
 @ops

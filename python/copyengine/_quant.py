@@ -42,9 +42,11 @@ def e2m1_value(code):
     return torch.where((code & 8) != 0, -mag, mag)
 
 
-# Divisions by constants are written as products with their reciprocal
-# (rounded to float32 by torch): torch computes tensor / scalar that way on
-# the GPU but divides on the CPU, so `amax / 448` would differ between devices.
+# Divisions are written as products with a float32 reciprocal: by constants
+# because torch computes tensor / scalar that way on the GPU but divides on
+# the CPU (so `amax / 448` would differ between devices); by a unit's scale
+# because that is the common optimized form (one reciprocal per unit, one
+# product per value). For MX scales (powers of two) it equals the division.
 
 def quantize(x, g, fmt, eps=EPS, gs=1.0):
     """Codes (uint8; packed formats two per byte), float32 scales or scale
@@ -54,23 +56,24 @@ def quantize(x, g, fmt, eps=EPS, gs=1.0):
     scale = bits = None
     if fmt in ("fp8_e4m3", "fp8_e5m2", "int8"):
         scale = amax.clamp(min=eps) * (1 / QMAX[fmt])
-        v = xf / scale
+        v = xf * torch.reciprocal(scale)
         if fmt == "int8":
             q = torch.where(v.isnan(), 0.0, torch.round(v).clamp(-127, 127)).to(torch.int8).view(torch.uint8)
         else:
             q = v.clamp(-QMAX[fmt], QMAX[fmt]).to(_fp8(fmt)).view(torch.uint8)
     elif fmt == "int4":
         scale = amax.clamp(min=eps) * (1 / 7)
-        v = xf / scale
+        v = xf * torch.reciprocal(scale)
         n = torch.where(v.isnan(), 0.0, torch.round(v).clamp(-8, 7)).to(torch.int32) & 0xF
         q = _pack(n.to(torch.uint8))
     elif fmt == "uint4":
         lo = xf.amin(-1, keepdim=True).clamp(max=0)
         hi = xf.amax(-1, keepdim=True).clamp(min=0)
         scale = (hi - lo).clamp(min=eps) * (1 / 15)
-        zf = torch.round(-lo / scale).clamp(0, 15)
+        inv = torch.reciprocal(scale)
+        zf = torch.round(-lo * inv).clamp(0, 15)
         z = torch.where(zf.isnan(), 0.0, zf)
-        v = torch.round(xf / scale) + z
+        v = torch.round(xf * inv) + z
         q = _pack(torch.where(v.isnan(), 0.0, v.clamp(0, 15)).to(torch.uint8))
         bits = z.to(torch.uint8)
     elif fmt in ("mxfp8_e4m3", "mxfp8_e5m2"):
@@ -82,13 +85,13 @@ def quantize(x, g, fmt, eps=EPS, gs=1.0):
         tiny = torch.tensor(0x00400000, dtype=torch.int32, device=x.device).view(torch.float32)
         sf = torch.where(shared >= -126, ((shared + 127).to(torch.int32) << 23).view(torch.float32), tiny)
         sf = torch.where(finite, sf, float("nan"))
-        q = (xf / sf).clamp(-QMAX[fmt], QMAX[fmt]).to(_fp8(fmt)).view(torch.uint8)
+        q = (xf * torch.reciprocal(sf)).clamp(-QMAX[fmt], QMAX[fmt]).to(_fp8(fmt)).view(torch.uint8)
         bits = torch.where(finite, shared + 127, 255).to(torch.uint8)
     elif fmt == "nvfp4":
         sv = (amax * (1 / 6) * (1 / gs)).clamp(max=448)
         s = sv.to(torch.float8_e4m3fn)
         sf = s.float()
-        v = (xf / (sf * gs)).clamp(-6, 6)
+        v = (xf * torch.reciprocal(sf * gs)).clamp(-6, 6)
         q = _pack(torch.where(sf == 0, 0, e2m1(v)).to(torch.uint8))
         bits = s.view(torch.uint8)
     else:
@@ -108,7 +111,7 @@ def quantize_static(x, g, fmt, scale=None, bits=None, gs=1.0):
         div = sf * gs
     else:
         div = scale.reshape(-1, 1)
-    v = xf / div
+    v = xf * torch.reciprocal(div)
     if fmt == "int8":
         q = torch.where(v.isnan(), 0.0, torch.round(v).clamp(-127, 127)).to(torch.int8).view(torch.uint8)
     elif fmt == "int4":

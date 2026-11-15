@@ -56,10 +56,13 @@ results, graphs nor speed).
 | Background copies that must not take SMs or bandwidth from compute | copyengine (`max_sms`, `bandwidth=`) |
 | Paths where a compile (seconds, again per new shape) is not affordable | copyengine |
 
-Call copyengine outside compiled regions: a `ce.*` call inside a
-`torch.compile`d function works but splits its graph. When unsure, measure
-both on the real step; `bench/bench_compile.py` in the repository compares
-the common patterns.
+Inside a `torch.compile`d function, `ce.copy_`, `ce.copy_many`,
+`ce.lazy(...).index_select(...)` copies (GPU indices), `ce.gather`,
+`ce.scatter_`, `ce.quantize` and `ce.dequantize` are one graph node each
+(no graph break; CUDA graphs work); other forms (host index lists, a lazy
+`flip`) break the graph and run eagerly with the same results. Scopes stay
+outside compiled regions. When unsure, measure both on the real step;
+`bench/bench_compile.py` in the repository compares the common patterns.
 
 ## Pick the integration
 

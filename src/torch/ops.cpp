@@ -5,8 +5,10 @@
 
 #include <dlfcn.h>
 
+#include <algorithm>
 #include <array>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -71,6 +73,14 @@ ce::Endpoint endpoint(const Tensor& t) {
   return e;
 }
 
+// An op's engine: a Python Engine's handle, or 0 for the process-wide one
+// (the explicit API inside torch.compile regions, where no Engine is traced).
+ce::Engine& engine_of(int64_t handle) {
+  if (handle) return *reinterpret_cast<ce::Engine*>(handle);
+  STD_TORCH_CHECK(g_api->shared_engine, "[copyengine:3] copyengine._core has no shared engine");
+  return *g_api->shared_engine();
+}
+
 // torch's current CUDA stream. Resolved at run time from the already loaded
 // libtorch_cuda (Python loads it RTLD_LOCAL, so the global scope cannot see
 // it), so this library does not depend on torch's CUDA build.
@@ -107,7 +117,7 @@ void copy_with(Tensor dst, Tensor src, int64_t engine, const ce::Elementwise& fn
   else if (src.is_cuda()) stream = current_stream(se.device.index);
   const auto ds = dst.sizes(), dt = dst.strides(), ss = src.sizes(), st = src.strides();
   std::string err;
-  const int rc = g_api->copy_strided(*reinterpret_cast<ce::Engine*>(engine), se, de, ss.data(), st.data(),
+  const int rc = g_api->copy_strided(engine_of(engine), se, de, ss.data(), st.data(),
                                      static_cast<int>(ss.size()), src.storage_offset(), ds.data(), dt.data(),
                                      static_cast<int>(ds.size()), dst.storage_offset(), fn, std::move(native), 0,
                                      stream, &err);
@@ -116,11 +126,23 @@ void copy_with(Tensor dst, Tensor src, int64_t engine, const ce::Elementwise& fn
 
 void copy_(Tensor dst, Tensor src, int64_t engine) { copy_with(std::move(dst), std::move(src), engine, {}); }
 
-// Many pairs in one call (the caller holds a scope open, so they plan together).
+// Many pairs in one call, inside a scope of their own (nested in the
+// caller's, if any): they plan together.
 void copy_many_(std::vector<Tensor> dsts, std::vector<Tensor> srcs, int64_t engine) {
   STD_TORCH_CHECK(dsts.size() == srcs.size(), "[copyengine:0] copy_many: ", dsts.size(), " destinations, ",
                   srcs.size(), " sources");
-  for (size_t i = 0; i < dsts.size(); ++i) copy_with(dsts[i], srcs[i], engine, {});
+  STD_TORCH_CHECK(g_api && g_api->begin_scope, "[copyengine:3] copyengine._torch is not bound to copyengine._core");
+  ce::Engine& e = engine_of(engine);
+  g_api->begin_scope(e);
+  std::string err;
+  try {
+    for (size_t i = 0; i < dsts.size(); ++i) copy_with(dsts[i], srcs[i], engine, {});
+  } catch (...) {
+    g_api->end_scope(e, &err);  // the pairs queued so far still run
+    throw;
+  }
+  const int rc = g_api->end_scope(e, &err);
+  STD_TORCH_CHECK(rc == 0, "[copyengine:", rc - 1, "] ", err);
 }
 
 void copy_fn_(Tensor dst, Tensor src, int64_t engine, double scale, double bias, bool round, bool clamp, double lo,
@@ -219,15 +241,40 @@ Tensor dispatch(const char* name, const char* overload, StableIValue* stack) {
   return torch::stable::detail::to<Tensor>(stack[0]);
 }
 
+// A contiguous copy of `t` (host) on `like`'s GPU.
+Tensor on_gpu_like(const Tensor& t, const Tensor& like) {
+  const int64_t r = t.dim();
+  std::vector<int64_t> sizes(static_cast<size_t>(r)), strides(static_cast<size_t>(r));
+  int64_t st = 1;
+  for (int64_t k = r - 1; k >= 0; --k) sizes[k] = t.size(k), strides[k] = st, st *= std::max<int64_t>(1, t.size(k));
+  int32_t dtype = 0;
+  TORCH_ERROR_CODE_CHECK(aoti_torch_get_dtype(t.get(), &dtype));
+  AtenTensorHandle h = nullptr;
+  TORCH_ERROR_CODE_CHECK(aoti_torch_empty_strided(r, sizes.data(), strides.data(), dtype,
+                                                  aoti_torch_device_type_cuda(),
+                                                  static_cast<int32_t>(like.get_device_index()), &h));
+  Tensor out(h);
+  torch::stable::copy_(out, t, true);
+  return out;
+}
+
 // Baselines: what a torch user writes.
 class TorchGather final : public ce::NativeOp {  // index_select(src, dim, index, out=out)
  public:
   TorchGather(Tensor out, Tensor src, int64_t dim, Tensor index)
       : out_(std::move(out)), src_(std::move(src)), index_(std::move(index)), dim_(dim) {}
   void run(uintptr_t) override {
-    std::array<StableIValue, 4> st{torch::stable::detail::from(src_), torch::stable::detail::from(dim_),
-                                   torch::stable::detail::from(index_), torch::stable::detail::from(out_)};
-    dispatch("aten::index_select", "out", st.data());
+    if (out_.is_cuda()) {
+      std::array<StableIValue, 4> st{torch::stable::detail::from(src_), torch::stable::detail::from(dim_),
+                                     torch::stable::detail::from(index_), torch::stable::detail::from(out_)};
+      dispatch("aten::index_select", "out", st.data());
+      return;
+    }
+    // Into host memory: gather on the GPU, then copy (torch's index_select needs one device).
+    std::array<StableIValue, 3> st{torch::stable::detail::from(src_), torch::stable::detail::from(dim_),
+                                   torch::stable::detail::from(index_)};
+    Tensor tmp = dispatch("aten::index_select", "", st.data());
+    torch::stable::copy_(out_, tmp, true);
   }
 
  private:
@@ -240,8 +287,10 @@ class TorchScatter final : public ce::NativeOp {  // dst.index_copy_(dim, index,
   TorchScatter(Tensor dst, Tensor src, int64_t dim, Tensor index)
       : dst_(std::move(dst)), src_(std::move(src)), index_(std::move(index)), dim_(dim) {}
   void run(uintptr_t) override {
+    Tensor src = src_;
+    if (!src.is_cuda()) src = on_gpu_like(src_, dst_);  // index_copy_ needs one device
     std::array<StableIValue, 4> st{torch::stable::detail::from(dst_), torch::stable::detail::from(dim_),
-                                   torch::stable::detail::from(index_), torch::stable::detail::from(src_)};
+                                   torch::stable::detail::from(index_), torch::stable::detail::from(src)};
     dispatch("aten::index_copy_", "", st.data());
   }
 
@@ -275,7 +324,7 @@ void indexed(Tensor dst, Tensor src, int side, int64_t dim, Tensor index, int64_
   }
   const auto ds = dst.sizes(), dt = dst.strides(), ss = src.sizes(), st = src.strides();
   std::string err;
-  const int rc = g_api->copy_indexed(*reinterpret_cast<ce::Engine*>(engine), se, de, ss.data(), st.data(),
+  const int rc = g_api->copy_indexed(engine_of(engine), se, de, ss.data(), st.data(),
                                      static_cast<int>(ss.size()), src.storage_offset(), ds.data(), dt.data(),
                                      static_cast<int>(ds.size()), dst.storage_offset(), side, dim,
                                      reinterpret_cast<uintptr_t>(index.data_ptr()), index.numel(),
@@ -293,6 +342,87 @@ void scatter_(Tensor dst, Tensor index, Tensor src, int64_t dim, int64_t engine)
   if (index.numel() == 0) return;
   indexed(std::move(dst), std::move(src), 1, dim, std::move(index), engine);
 }
+
+// ---- quantization while copying ------------------------------------------------------
+
+// One tensor of a tile op: its storage, and byte offset / row strides / step of the view.
+ce::TileSpec::Side tile_side(const Tensor& t) {
+  ce::TileSpec::Side s;
+  s.ep = endpoint(t);
+  const int64_t isz = static_cast<int64_t>(t.element_size()), r = t.dim();
+  s.offset = t.storage_offset() * isz;
+  for (int64_t k = 0; k + 1 < r && k < 3; ++k) s.row_stride[static_cast<size_t>(k)] = t.stride(k) * isz;
+  s.step = t.stride(r - 1) * isz;
+  return s;
+}
+
+// An index over the first dimension of `of`: GPU values stay there, host values are read now.
+ce::TileSpec::Index tile_index(const std::optional<Tensor>& ix, const Tensor& of) {
+  ce::TileSpec::Index i;
+  if (!ix) return i;
+  const Tensor& t = *ix;
+  STD_TORCH_CHECK(t.scalar_type() == ST::Long && t.dim() == 1 && t.stride(0) == 1,
+                  "[copyengine:0] an index is a contiguous int64 vector");
+  i.bound = of.size(0);
+  if (t.is_cuda()) {
+    i.dev = reinterpret_cast<uintptr_t>(t.data_ptr());
+  } else {
+    const auto* p = static_cast<const int64_t*>(t.data_ptr());
+    i.host.assign(p, p + t.numel());
+  }
+  return i;
+}
+
+// The unit size of `fmt` (MX: 32, NVFP4: 16; the others: `group`); copyengine/_quant.py UNIT.
+int64_t unit_of(int64_t fmt, int64_t group) { return fmt == 3 || fmt == 4 ? 32 : fmt == 5 ? 16 : group; }
+
+void tile_op(bool quantize, Tensor x, Tensor q, Tensor scale, const std::optional<Tensor>& zero, int64_t fmt,
+             int64_t group, double eps, double gs, bool static_scale, const std::optional<Tensor>& x_index,
+             const std::optional<Tensor>& index, int64_t engine) {
+  STD_TORCH_CHECK(g_api && g_api->tile, "[copyengine:3] copyengine._torch is not bound to copyengine._core");
+  STD_TORCH_CHECK(x.dim() >= 2 && x.dim() <= 4, "[copyengine:0] x needs one to three leading dimensions");
+  const int64_t D = x.size(x.dim() - 1), g = unit_of(fmt, group);
+  STD_TORCH_CHECK(g > 0 && D % g == 0, "[copyengine:0] the last dimension is not a multiple of the unit size");
+  ce::TileSpec t;
+  t.fmt = static_cast<int>(fmt);
+  t.quantize = quantize;
+  t.static_scale = static_scale;
+  t.g = static_cast<int>(g);
+  t.eps = static_cast<float>(eps);
+  t.gs = static_cast<float>(gs);
+  t.upr = D / g;
+  for (int64_t k = 0; k + 1 < x.dim(); ++k) t.rows[static_cast<size_t>(k)] = x.size(k);
+  if (x_index) t.rows[0] = x_index->numel();
+  else if (index) t.rows[0] = index->numel();
+  t.x = tile_side(x), t.q = tile_side(q), t.scale = tile_side(scale);
+  if (zero) t.zero = tile_side(*zero);
+  t.x_index = tile_index(x_index, x);
+  t.index = tile_index(index, q);
+  uintptr_t stream = 0;
+  if (x.is_cuda()) stream = current_stream(static_cast<int>(x.get_device_index()));
+  else if (q.is_cuda()) stream = current_stream(static_cast<int>(q.get_device_index()));
+  std::string err;
+  const int rc = g_api->tile(engine_of(engine), t, stream, &err);
+  STD_TORCH_CHECK(rc == 0, "[copyengine:", rc - 1, "] ", err);
+}
+
+void quantize_(Tensor x, Tensor q, Tensor scale, std::optional<Tensor> zero, int64_t fmt, int64_t group, double eps,
+               double gs, bool static_scale, std::optional<Tensor> x_index, std::optional<Tensor> index,
+               int64_t engine) {
+  tile_op(true, std::move(x), std::move(q), std::move(scale), zero, fmt, group, eps, gs, static_scale, x_index, index,
+          engine);
+}
+
+void dequantize_(Tensor q, Tensor scale, Tensor out, std::optional<Tensor> zero, int64_t fmt, int64_t group,
+                 double gs, std::optional<Tensor> x_index, std::optional<Tensor> index, int64_t engine) {
+  tile_op(false, std::move(out), std::move(q), std::move(scale), zero, fmt, group, 1e-12, gs, false, x_index, index,
+          engine);
+}
+
+void quantize_meta(Tensor, Tensor, Tensor, std::optional<Tensor>, int64_t, int64_t, double, double, bool,
+                   std::optional<Tensor>, std::optional<Tensor>, int64_t) {}
+void dequantize_meta(Tensor, Tensor, Tensor, std::optional<Tensor>, int64_t, int64_t, double, std::optional<Tensor>,
+                     std::optional<Tensor>, int64_t) {}
 
 void gather_meta(Tensor, Tensor, int64_t, Tensor, int64_t) {}
 void scatter_meta(Tensor, Tensor, Tensor, int64_t, int64_t) {}
@@ -323,6 +453,10 @@ STABLE_TORCH_LIBRARY(copyengine, m) {
   m.def("scatter_(Tensor(a!) dst, Tensor index, Tensor src, int dim, int engine) -> ()");
   m.def("copy_fn_(Tensor(a!) dst, Tensor src, int engine, float scale, float bias, bool round, bool clamp, "
         "float lo, float hi) -> ()");
+  m.def("quantize_(Tensor x, Tensor(a!) q, Tensor(b!) scale, Tensor(c!)? zero, int fmt, int group, float eps, "
+        "float gs, bool static_scale, Tensor? x_index, Tensor? index, int engine) -> ()");
+  m.def("dequantize_(Tensor q, Tensor scale, Tensor(a!) out, Tensor? zero, int fmt, int group, float gs, "
+        "Tensor? x_index, Tensor? index, int engine) -> ()");
 }
 
 STABLE_TORCH_LIBRARY_IMPL(copyengine, CompositeExplicitAutograd, m) {
@@ -331,6 +465,8 @@ STABLE_TORCH_LIBRARY_IMPL(copyengine, CompositeExplicitAutograd, m) {
   m.impl("copy_many_", TORCH_BOX(&copy_many_));
   m.impl("gather_", TORCH_BOX(&gather_));
   m.impl("scatter_", TORCH_BOX(&scatter_));
+  m.impl("quantize_", TORCH_BOX(&quantize_));
+  m.impl("dequantize_", TORCH_BOX(&dequantize_));
 }
 
 STABLE_TORCH_LIBRARY_IMPL(copyengine, Meta, m) {
@@ -339,4 +475,6 @@ STABLE_TORCH_LIBRARY_IMPL(copyengine, Meta, m) {
   m.impl("copy_many_", TORCH_BOX(&copy_many_meta));
   m.impl("gather_", TORCH_BOX(&gather_meta));
   m.impl("scatter_", TORCH_BOX(&scatter_meta));
+  m.impl("quantize_", TORCH_BOX(&quantize_meta));
+  m.impl("dequantize_", TORCH_BOX(&dequantize_meta));
 }

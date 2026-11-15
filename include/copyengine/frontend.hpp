@@ -36,7 +36,7 @@ const DeviceAllocator* device_allocator();
 // extensions need not link the core. Both sides come from the same build;
 // errors cross as codes because exception types do not cross shared objects.
 struct FrontendApi {
-  static constexpr uint32_t kVersion = 4;
+  static constexpr uint32_t kVersion = 5;
   enum Flags : uint32_t {
     kHostAsync = 1,  // see Hints::host_async
   };
@@ -66,6 +66,14 @@ struct FrontendApi {
                       const int64_t* d_strides, int d_rank, int64_t d_off, int side, int dim, uintptr_t table,
                       int64_t n, int table_device, const Elementwise& fn, std::shared_ptr<NativeOp> native,
                       uint32_t flags, uintptr_t stream, std::string* error) = nullptr;
+  // The process-wide engine of calls that name none (engine handle 0: the
+  // explicit API inside torch.compile regions), created on first use.
+  Engine* (*shared_engine)() = nullptr;
+  // Engine::tile (quantization while copying).
+  int (*tile)(Engine& engine, const TileSpec& spec, uintptr_t stream, std::string* error) = nullptr;
+  // Engine::begin_scope / end_scope: calls between them plan together.
+  void (*begin_scope)(Engine& engine) = nullptr;
+  int (*end_scope)(Engine& engine, std::string* error) = nullptr;
 };
 
 const FrontendApi* frontend_api();

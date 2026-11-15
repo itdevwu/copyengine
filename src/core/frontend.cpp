@@ -113,6 +113,39 @@ void decline(Engine& engine, const char* reason) {
   }
 }
 
+Engine* shared_engine() {
+  static Engine* e = new Engine(EngineOptions::from_env());  // lives as long as the process
+  return e;
+}
+
+int tile(Engine& engine, const TileSpec& spec, uintptr_t stream, std::string* error) {
+  try {
+    engine.tile(spec, {}, stream);
+    return 0;
+  } catch (const Error& e) {
+    if (error) *error = e.what();
+    return 1 + static_cast<int>(e.code());
+  } catch (const std::exception& e) {
+    if (error) *error = e.what();
+    return 1 + static_cast<int>(Errc::backend);
+  }
+}
+
+void begin_scope(Engine& engine) { engine.begin_scope(); }
+
+int end_scope(Engine& engine, std::string* error) {
+  try {
+    engine.end_scope();
+    return 0;
+  } catch (const Error& e) {
+    if (error) *error = e.what();
+    return 1 + static_cast<int>(e.code());
+  } catch (const std::exception& e) {
+    if (error) *error = e.what();
+    return 1 + static_cast<int>(Errc::backend);
+  }
+}
+
 }  // namespace
 
 const FrontendApi* frontend_api() {
@@ -125,6 +158,10 @@ const FrontendApi* frontend_api() {
     a.decline = &decline;
     a.set_device_allocator = &set_device_allocator;
     a.copy_indexed = &copy_indexed;
+    a.shared_engine = &shared_engine;
+    a.tile = &tile;
+    a.begin_scope = &begin_scope;
+    a.end_scope = &end_scope;
     return a;
   }();
   return &api;

@@ -14,13 +14,13 @@ from typing import Any, Optional, Sequence
 
 import numpy as np
 
-from . import _core, _plan, _torch_ops, _shim  # the shim lets copyengine:: ops through: load them first
+from . import _compiled, _core, _plan, _torch_ops, _shim  # the shim lets copyengine:: ops through: load them first
 from ._tensor import (
     device_table,
     select_device,
     Lazy,
     View,
-    lazy,
+    lazy as _lazy,
     broadcast_to,
     current_stream,
     device_index,
@@ -326,6 +326,9 @@ class Engine:
 
     def copy_(self, dst, src, *, fn: Optional[Elementwise] = None, ctx: str = "") -> Any:
         """``dst[...] = fn(src)`` for any strided views; ``src`` broadcasts to ``dst``."""
+        if _compiled.compiling():
+            return _compiled_copy(self, dst, src, fn, ctx)
+        dst, src = _eager(dst), _eager(src)
         op = _torch_ops.copy_
         # Strided only: the stable ABI the op targets cannot tell it a tensor's layout.
         if (op is not None and not ctx and type(dst) is _Tensor and type(src) is _Tensor
@@ -379,6 +382,10 @@ class Engine:
         """
         if len(dsts) != len(srcs):
             raise ValueError(f"copy_many: {len(dsts)} destinations, {len(srcs)} sources")
+        if _compiled.compiling():
+            if _compiled.available() and not ctx and _compiled.copy_many(self._handle, dsts, srcs):
+                return
+            return _eager_call(Engine.copy_many, self, dsts, srcs, ctx=ctx)
         op = _torch_ops.copy_many_
 
         def stable(t):
@@ -423,12 +430,24 @@ class Engine:
         with the given `scale` (and `zero`) instead of computing them; a
         scale broadcast with `expand` serves every unit.
         """
+        if _compiled.compiling():
+            if _compiled.available() and not ctx and _compiled.tile(self._handle, True, x, q, scale, zero, fmt, group,
+                                                                     eps, global_scale, static, x_index, index):
+                return
+            return _eager_call(Engine.quantize, self, x, q, scale, zero, fmt=fmt, group=group, eps=eps,
+                               global_scale=global_scale, static=static, x_index=x_index, index=index, ctx=ctx)
         self._tile(True, x, q, scale, zero, fmt, group, eps, global_scale, ctx, x_index, index, static)
 
     def dequantize(self, q, scale, out, zero=None, *, fmt: str, group: Optional[int] = None,
                    global_scale: float = 1.0, x_index=None, index=None, ctx: str = "") -> None:
         """``out = q * scale`` per unit (the inverse of :meth:`quantize`);
         `index` gathers rows of q / scale / zero, `x_index` scatters into out."""
+        if _compiled.compiling():
+            if _compiled.available() and not ctx and _compiled.tile(self._handle, False, out, q, scale, zero, fmt,
+                                                                     group, 1e-12, global_scale, False, x_index, index):
+                return
+            return _eager_call(Engine.dequantize, self, q, scale, out, zero, fmt=fmt, group=group,
+                               global_scale=global_scale, x_index=x_index, index=index, ctx=ctx)
         self._tile(False, out, q, scale, zero, fmt, group, 1e-12, global_scale, ctx, x_index, index)
 
     def _tile(self, quantize, x, q, scale, zero, fmt, group, eps, gs, ctx, x_index=None, index=None,
@@ -559,6 +578,16 @@ class Engine:
     def gather(self, src, index, dim: int = 0, *, out=None, fn: Optional[Elementwise] = None,
                dtype=None, ctx: str = ""):
         """``out = fn(src.index_select(dim, index))``; allocates ``out`` like ``src`` if omitted."""
+        if _compiled.compiling():
+            if (_compiled.available() and (fn is None or fn is _IDENTITY) and dtype is None and not ctx
+                    and isinstance(src, _Tensor)):
+                if out is None:
+                    shape = list(src.shape)
+                    shape[dim] = index.numel()
+                    out = torch.empty(shape, dtype=src.dtype, device=src.device)
+                if _compiled.gather(self._handle, src, index, dim, out):
+                    return out
+            return _eager_call(Engine.gather, self, src, index, dim, out=out, fn=fn, dtype=dtype, ctx=ctx)
         if (fn is None or fn is _IDENTITY) and not ctx and self._fast_indexed(src, index, out, dtype):
             if out is None:
                 shape = list(src.shape)
@@ -592,6 +621,11 @@ class Engine:
 
     def scatter_(self, dst, index, src, dim: int = 0, *, fn: Optional[Elementwise] = None, ctx: str = ""):
         """``dst.index_copy_(dim, index, fn(src))``. Duplicate indices raise UnsafeCopy."""
+        if _compiled.compiling():
+            if (_compiled.available() and (fn is None or fn is _IDENTITY) and not ctx
+                    and _compiled.scatter_(self._handle, dst, index, src, dim)):
+                return dst
+            return _eager_call(Engine.scatter_, self, dst, index, src, dim, fn=fn, ctx=ctx)
         if ((fn is None or fn is _IDENTITY) and not ctx and self._fast_indexed(dst, index, src, None)
                 and self._indexed(_torch_ops.scatter_, dst, src, dim, index, (dst, src, dim))):
             return dst
@@ -984,19 +1018,64 @@ def scope(stream=None, *, bandwidth: Optional[float] = None):
     return default_engine().scope(stream, bandwidth=bandwidth, _site=(f.f_code, f.f_lineno))
 
 
+# Inside torch.compile regions the module-level functions use the process-wide
+# engine (handle 0: no Python engine is traced); see copyengine/_compiled.py.
+class _Shared:
+    _handle = 0
+
+
+def _compiled_copy(engine, dst, src, fn=None, ctx=""):
+    if _compiled.available() and not ctx and _compiled.copy_(engine._handle, dst, src, fn):
+        return dst
+    return _eager_call(Engine.copy_, engine, dst, src, fn=fn, ctx=ctx)
+
+
+def _eager_call(method, engine, *args, **kw):
+    """No op takes the call: it breaks the graph and runs eagerly, with the same results."""
+    return method(_real(engine), *args, **kw)
+
+
+if torch is not None:
+    _eager_call = torch._dynamo.disable(_eager_call)  # runs outside the trace (no recursion into it)
+
+
+def _real(e):
+    return default_engine() if e is _Shared else e
+
+
+def _eager(x):
+    """A view recorded while tracing, used after a graph break."""
+    return x.eager() if isinstance(x, _compiled.TracedLazy) else x
+
+
+def lazy(x):
+    """A lazy view of ``x`` (see :class:`Lazy`); inside torch.compile regions, recorded for the op."""
+    if _compiled.compiling():
+        return x if isinstance(x, _compiled.TracedLazy) else _compiled.TracedLazy(x)
+    return _lazy(x)
+
+
 def copy_(dst, src, **kw):
+    if _compiled.compiling():
+        return _compiled_copy(_Shared, dst, src, kw.get("fn"), kw.get("ctx", ""))
     return default_engine().copy_(dst, src, **kw)
 
 
 def quantize(x, q, scale, zero=None, **kw):
+    if _compiled.compiling():
+        return Engine.quantize(_Shared, x, q, scale, zero, **kw)
     return default_engine().quantize(x, q, scale, zero, **kw)
 
 
 def dequantize(q, scale, out, zero=None, **kw):
+    if _compiled.compiling():
+        return Engine.dequantize(_Shared, q, scale, out, zero, **kw)
     return default_engine().dequantize(q, scale, out, zero, **kw)
 
 
 def copy_many(dsts, srcs, **kw):
+    if _compiled.compiling():
+        return Engine.copy_many(_Shared, dsts, srcs, **kw)
     return default_engine().copy_many(dsts, srcs, **kw)
 
 
@@ -1009,10 +1088,14 @@ def indices(src, dst, src_idx, dst_idx, **kw):
 
 
 def gather(src, index, dim: int = 0, **kw):
+    if _compiled.compiling():
+        return Engine.gather(_Shared, src, index, dim, **kw)
     return default_engine().gather(src, index, dim, **kw)
 
 
 def scatter_(dst, index, src, dim: int = 0, **kw):
+    if _compiled.compiling():
+        return Engine.scatter_(_Shared, dst, index, src, dim, **kw)
     return default_engine().scatter_(dst, index, src, dim, **kw)
 
 

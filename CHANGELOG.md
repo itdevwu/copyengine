@@ -6,6 +6,12 @@ change incompatibly only in a new minor (0.x) or major release.
 
 ## Unreleased
 
+- The explicit API inside torch.compile regions is one graph node per call
+  (`copy_`, `copy_many`, lazy gathers and scatters with GPU indices,
+  `gather`, `scatter_`, `quantize`, `dequantize`), also under CUDA graphs;
+  forms no op takes break the graph explicitly and run eagerly. Module-level
+  calls there use one process-wide engine.
+
 - Explicit copies with GPU indices may have their other side in pinned host
   memory (paged offload by GPU block ids: `ce.copy_(host, ce.lazy(kv).index_select(0, gpu_ids))`,
   and the load back): the statement kernel reads the indices and reaches the

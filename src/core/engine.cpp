@@ -704,6 +704,18 @@ struct Engine::Impl {
       for (int i = 0; i < 3; ++i) v = v && k->xr[i] % xa == 0 && k->qr[i] % qa == 0;
       k->vec = v;
     }
+    {  // TileK::flat: within a row of the first dimension, unit r of the row at r unit steps
+      // in every tensor. That is the general address (i1, i2, j) exactly when each
+      // inner dimension continues the next: row stride = units per row x unit step.
+      const long long qv = packed ? t.g / 2 : t.g;
+      auto flat = [&](const long long r[3], long long unit) {
+        const long long row2 = t.upr * unit;
+        return (t.rows[2] == 1 || r[2] == row2) && (t.rows[1] == 1 || r[1] == t.rows[2] * row2);
+      };
+      bool f = flat(k->xr, t.g * k->xe) && flat(k->qr, qv * k->qe) && flat(k->sr, k->se);
+      if (zero) f = f && flat(k->zr, k->ze);
+      k->flat = f;
+    }
     // Index tables: host values live with the op (the executor reads them, or
     // uploads them for a kernel); GPU ones are this call's pointer.
     std::shared_ptr<std::vector<int64_t>> hx, hc;

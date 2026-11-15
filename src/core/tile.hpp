@@ -29,6 +29,10 @@ struct TileK {
   // the unit, every unit's x (8 / 16 bytes) and q (4 / 2 bytes) aligned, and
   // g a multiple of 4 (set when queued).
   int vec = 0;
+  // Units within one row of the first dimension are back to back in every
+  // tensor (x, q, s, z): unit u of that row is at a constant step, so finding
+  // it takes one division (set when queued; indices still select the row).
+  int flat = 0, pad_ = 0;
   float eps = 1e-12f, gs = 1.0f;
   // Gathers / scatters: the first row dimension of x (xi), or of the
   // quantized side q, s, z (ci), read through an int64 index table (0: none),
@@ -53,6 +57,33 @@ struct UnitAt {
 CE_HD UnitAt unit_at(const TileK& t, long long u) {
   UnitAt a;
   a.bad = false;
+  if (t.flat) {  // one division: the row of the first dimension, then constant steps
+    const long long per = t.rows[1] * t.rows[2] * t.upr;
+    long long i0, r;
+    if (u < 0x7FFFFFFFLL && per < 0x7FFFFFFFLL) {
+      const uint32_t uu = static_cast<uint32_t>(u), pp = static_cast<uint32_t>(per);
+      i0 = uu / pp, r = uu - static_cast<uint32_t>(i0) * pp;
+    } else {
+      i0 = u / per, r = u - i0 * per;
+    }
+    long long ix = i0, ic = i0;
+    if (t.xi) {
+      ix = rd<long long>(addr(t.xi + i0 * 8));
+      a.bad = a.bad || ix < 0 || ix >= t.xb;
+    }
+    if (t.ci) {
+      ic = rd<long long>(addr(t.ci + i0 * 8));
+      a.bad = a.bad || ic < 0 || ic >= t.cb;
+    }
+    const long long vals = static_cast<long long>(t.g);
+    const long long qstep = qfmt_packed(static_cast<QFmt>(t.fmt)) ? vals / 2 : vals;
+    a.j = 0;
+    a.x = t.x + ix * t.xr[0] + r * vals * t.xe;
+    a.q = t.q + ic * t.qr[0] + r * qstep * t.qe;
+    a.s = t.s + ic * t.sr[0] + r * t.se;
+    a.z = t.z + ic * t.zr[0] + r * t.ze;
+    return a;
+  }
   long long i0, i1, i2;
   if (u < 0x7FFFFFFFLL && t.rows[1] * t.rows[2] < 0x7FFFFFFFLL) {  // 32-bit divisions: a few times cheaper
     const uint32_t uu = static_cast<uint32_t>(u), up = static_cast<uint32_t>(t.upr);

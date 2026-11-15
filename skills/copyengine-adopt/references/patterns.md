@@ -95,3 +95,20 @@ print(eng.stats()["cuda"][0]["sm_limit"])  # "hard: green context ..." or "soft:
 ```
 
 DMA copies use copy engines, not SMs; memory bandwidth is still shared.
+
+
+## Quantize while copying (0.4)
+
+```python
+# Offload KV pages to a pinned FP8 cache, scales per group of 128 values.
+ce.quantize(kv, q_cache, scales, fmt="fp8_e4m3", group=128, x_index=pages, index=slots)
+# Load them back.
+ce.dequantize(q_cache, scales, kv, fmt="fp8_e4m3", group=128, index=slots, x_index=pages)
+# Per channel over tokens (a V cache): quantize the transposed view.
+ce.quantize(v.transpose(-1, -2), qv.transpose(-1, -2), sv, fmt="int8", group=16)
+```
+
+Only quantize tokens that hold data (pass their rows with `index=`); keep an
+incomplete group in full precision until it fills. Results follow the
+recipes in `copyengine/_quant.py` on every device; torch code computing the
+same formula another way may differ in the last bit.

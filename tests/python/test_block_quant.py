@@ -101,7 +101,7 @@ def test_block_strided_and_indexed(dev):
     if dev == "cuda":
         torch.cuda.synchronize()
     codes, sc = _quant.quantize_block(stack[pages].cpu(), block, fmt)
-    check_codes(fmt, qs[slots], codes)
+    check_codes(fmt, qs.view(torch.uint8)[slots], codes)  # byte view: old torch cannot index fp8 on the CPU
     assert same_float(ss[slots], sc)
 
 

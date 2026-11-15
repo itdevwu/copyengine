@@ -79,7 +79,7 @@ Hash128 fingerprint(const Op& op) {
     // Index tables: host values are part of the plan; GPU table pointers are per call.
     for (const auto& ix : op.tile_index)
       if (ix) h.add(std::span<const i64>(*ix));
-    for (int v : {t.g, t.upr, t.fmt, t.xdt, t.scale_byte, t.quantize}) h.add(static_cast<uint64_t>(v));
+    for (int v : {t.g, t.upr, t.fmt, t.xdt, t.scale_byte, t.quantize, t.static_scale}) h.add(static_cast<uint64_t>(v));
     h.add(std::bit_cast<uint32_t>(t.eps)), h.add(std::bit_cast<uint32_t>(t.gs));
   }
   if (op.opaque && op.form) {  // the structure, not this call's table pointers: new indices hit the same plan
@@ -274,7 +274,8 @@ Plan build_plan(const std::vector<Op>& ops) {
         const cv::TileK* a = g.ops.empty() ? nullptr : ops[g.ops[0]].tile.get();
         const cv::TileK* b = op.tile.get();
         if (!a || !b) return a == b;
-        return a->fmt == b->fmt && a->quantize == b->quantize && a->g == b->g && a->xdt == b->xdt &&
+        return a->fmt == b->fmt && a->quantize == b->quantize && a->static_scale == b->static_scale && a->g == b->g &&
+               a->xdt == b->xdt &&
                a->scale_byte == b->scale_byte && a->eps == b->eps && a->gs == b->gs;
       };
       auto it = std::find_if(groups.begin(), groups.end(), [&](const Group& g) {

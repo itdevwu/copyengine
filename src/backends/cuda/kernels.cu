@@ -524,6 +524,20 @@ __device__ __forceinline__ void tile_unit_warp(const cv::TileK& t, long long u, 
     return;
   }
   auto xv = [&](int k) { return cv::val_float(cv::load(cv::addr(cv::x_at(t, a, k)), t.xdt)); };
+  if (Q && t.static_scale) {  // the given scale (and zero point): read, not computed
+    const float s = t.scale_byte ? 0.0f : cv::rd<float>(cv::addr(a.s));
+    const uint8_t sb = t.scale_byte ? cv::rd<uint8_t>(cv::addr(a.s)) : 0;
+    const uint8_t z = f == QFmt::uint4 ? cv::rd<uint8_t>(cv::addr(a.z)) : 0;
+    const cv::UnitQ p = cv::unit_from_scale(f, s, sb, z, t.gs);
+    if constexpr (cv::qfmt_packed(f)) {
+      for (int i = lane; i < t.g / 2; i += 32)
+        cv::wr<uint8_t>(cv::addr(cv::q_at(t, a, 2 * i)),
+                        static_cast<uint8_t>(cv::quant_elem(f, xv(2 * i), p) | (cv::quant_elem(f, xv(2 * i + 1), p) << 4)));
+    } else {
+      for (int k = lane; k < t.g; k += 32) cv::wr<uint8_t>(cv::addr(cv::q_at(t, a, k)), cv::quant_elem(f, xv(k), p));
+    }
+    return;
+  }
   if constexpr (Q) {
     constexpr bool range = f == QFmt::uint4;
     constexpr int kCache = 8;  // values per lane kept in registers (units up to 256)

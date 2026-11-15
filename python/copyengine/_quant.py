@@ -96,6 +96,33 @@ def quantize(x, g, fmt, eps=EPS, gs=1.0):
     return q.reshape(-1), (None if scale is None else scale.reshape(-1)), (None if bits is None else bits.reshape(-1))
 
 
+def quantize_static(x, g, fmt, scale=None, bits=None, gs=1.0):
+    """Codes from a given scale per unit: float32 `scale` (scaled formats,
+    INT4), the scale byte `bits` (MX: E8M0, NVFP4: E4M3), uint4's zero point
+    in `bits`. The same per-value formulas as `quantize`."""
+    xf = x.float().reshape(-1, g)
+    if fmt.startswith("mx"):
+        div = bits.reshape(-1, 1).view(torch.float8_e8m0fnu).float()
+    elif fmt == "nvfp4":
+        sf = bits.reshape(-1, 1).view(torch.float8_e4m3fn).float()
+        div = sf * gs
+    else:
+        div = scale.reshape(-1, 1)
+    v = xf / div
+    if fmt == "int8":
+        q = torch.where(v.isnan(), 0.0, torch.round(v).clamp(-127, 127)).to(torch.int8).view(torch.uint8)
+    elif fmt == "int4":
+        q = _pack((torch.where(v.isnan(), 0.0, torch.round(v).clamp(-8, 7)).to(torch.int32) & 0xF).to(torch.uint8))
+    elif fmt == "uint4":
+        w = torch.round(v) + bits.reshape(-1, 1).float()
+        q = _pack(torch.where(w.isnan(), 0.0, w.clamp(0, 15)).to(torch.uint8))
+    elif fmt == "nvfp4":
+        q = _pack(torch.where(sf == 0, 0, e2m1(v.clamp(-6, 6))).to(torch.uint8))
+    else:
+        q = v.clamp(-QMAX[fmt], QMAX[fmt]).to(_fp8(fmt)).view(torch.uint8)
+    return q.reshape(-1)
+
+
 def dequantize(q, scale, bits, g, fmt, gs=1.0):
     """float32 values from codes (as `quantize` returns them) and the unit's
     scale (float32), scale bytes, or uint4's zero points (`bits`)."""
@@ -138,6 +165,13 @@ def native_quantize(x, q, scale, zero, fmt, g, eps, gs, x_index=None, index=None
         _write_rows(zero, index, bits)
     elif bits is not None:
         _write_rows(_scale_out(scale, fmt), index, bits)
+
+
+def native_quantize_static(x, q, scale, zero, fmt, g, gs, x_index=None, index=None):
+    sc = _rows(_scale_out(scale, fmt), index)
+    s = sc if scale.dtype == torch.float32 else None
+    bits = _rows(zero, index) if fmt == "uint4" else (None if s is not None else sc)
+    _write_rows(q.view(torch.uint8), index, quantize_static(_rows(x, x_index), g, fmt, s, bits, gs))
 
 
 def native_dequantize(q, scale, zero, out, fmt, g, gs, x_index=None, index=None):

@@ -187,3 +187,39 @@ def test_out_of_range_gpu_index_raises_at_synchronize():
         e.synchronize()
     e.quantize(x, q, scale, fmt="fp8_e4m3", group=128, index=torch.tensor([0, 1, 3, 2], device="cuda"))
     e.synchronize()  # cleared
+
+
+@pytest.mark.parametrize("dev", DEVS)
+@pytest.mark.parametrize("fmt,g", FORMATS)
+def test_static_scale(dev, fmt, g):
+    # Scales from a calibration (here: a dynamic pass), reused for new data;
+    # and one scale broadcast to every unit.
+    lead, D = (4, 3), 2 * g
+    gs = 0.02 if fmt == "nvfp4" else 1.0
+    x0, x1 = data(lead, D, torch.float32, dev, seed=1), data(lead, D, torch.float32, dev, seed=2)
+    q, scale, zero = outputs(fmt, lead, D, g, dev)
+    ce.quantize(x0, q, scale, zero, fmt=fmt, group=g, global_scale=gs)
+    for e in engines():
+        q1 = torch.zeros_like(q)
+        e.quantize(x1, q1, scale, zero, fmt=fmt, group=g, global_scale=gs, static=True)
+        if dev == "cuda":
+            torch.cuda.synchronize()
+        sb = scale.cpu().view(torch.uint8) if scale.element_size() == 1 else None
+        bits = zero.cpu() if fmt == "uint4" else sb
+        want = _quant.quantize_static(x1.cpu(), g, fmt, scale.cpu() if sb is None else None, bits, gs)
+        got = q1.cpu().view(torch.uint8).reshape(-1)
+        if fmt in Q_DTYPE and fmt != "int8":
+            nan = got.view(Q_DTYPE[fmt]).float().isnan()
+            assert torch.equal(nan, want.view(Q_DTYPE[fmt]).float().isnan()) and torch.equal(got[~nan], want[~nan])
+        else:
+            assert torch.equal(got, want)
+    if fmt in ("fp8_e4m3", "int8"):  # one scale for everything: a broadcast (stride 0) scale tensor
+        one = torch.full((1, 1), 0.05, device=dev).expand(*lead, D // g)
+        q2 = torch.zeros_like(q)
+        ce.quantize(x1, q2, one, fmt=fmt, group=g, static=True)
+        if dev == "cuda":
+            torch.cuda.synchronize()
+        want = _quant.quantize_static(x1.cpu(), g, fmt, torch.full((x1.numel() // g,), 0.05))
+        got = q2.cpu().view(torch.uint8).reshape(-1)
+        nan = got.view(torch.uint8) == 0x7F if fmt == "fp8_e4m3" else torch.zeros_like(got, dtype=torch.bool)
+        assert torch.equal(got[~nan], want[~nan])

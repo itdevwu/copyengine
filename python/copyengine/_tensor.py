@@ -73,7 +73,8 @@ class Lazy:
         return self.permute(p)
 
     def index_select(self, dim: int, index):
-        t = device_table(index)
+        b = self._base
+        t = device_table(index, host_ok=b.is_cuda or b.endpoint.pinned)
         if t is not None:  # stays on the GPU: the copy kernel reads it
             return self._with(select_device(self._access, dim, t), ("index_select", dim, t))
         idx = index_array(index)
@@ -104,9 +105,15 @@ class Lazy:
         return View(b.obj, b.endpoint, self._access, b.is_cuda, b.device_index)
 
 
-def device_table(index):
-    """A CUDA index tensor as a 1-D contiguous int64 tensor on its GPU (no
-    sync, nothing leaves the device), or None for host indices."""
+def device_table(index, host_ok: bool = False):
+    """An index read when the copy runs: a CUDA index tensor as a 1-D
+    contiguous int64 tensor on its GPU (no sync, nothing leaves the device),
+    or, with `host_ok` while a step plan traces, the pinned buffer holding a
+    host index argument's values. None: the values are taken now."""
+    from . import _plan
+    buf = _plan.param_for(index) if host_ok else None
+    if buf is not None:
+        return buf
     if not (is_tensor(index) and index.is_cuda):
         return None
     if index.dim() > 1:
@@ -118,14 +125,14 @@ def device_table(index):
 
 
 def select_device(access, dim: int, t):
-    return access.index_select_device(dim, t.data_ptr(), t.numel(), t.device.index)
+    return access.index_select_device(dim, t.data_ptr(), t.numel(), t.device.index if t.is_cuda else -1)
 
 
 def device_index(idx, device) -> "torch.Tensor":
     """`idx` as an int64 tensor on `device`, sent from pinned memory without
     making the host wait (what a torch user would do with host indices)."""
-    if is_tensor(idx):  # a device table: already there
-        return idx.to(device, non_blocking=True)
+    if is_tensor(idx):  # a device table: already there; a host one (a plan's buffer, reused): copied now
+        return idx.to(device, non_blocking=idx.is_cuda)
     t = torch.from_numpy(idx)
     if device.type == "cuda":
         return t.pin_memory().to(device, non_blocking=True)
@@ -301,6 +308,8 @@ def current_stream(*views: View) -> int:
 
 def index_array(index) -> np.ndarray:
     """Host int64 copy of an index (a CUDA index tensor costs a device sync)."""
+    from . import _plan
+    _plan.note_values()  # a traced step whose copies depend on index values
     if is_tensor(index):
         index = index.detach().to("cpu", torch.int64).numpy()
     return np.ascontiguousarray(index, dtype=np.int64).reshape(-1)

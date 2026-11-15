@@ -78,7 +78,7 @@ Hash128 fingerprint(const Op& op) {
     for (int k = 0; k < f.rank; ++k)
       h.add(static_cast<uint64_t>(f.shape[k])), h.add(static_cast<uint64_t>(f.ss[k])), h.add(static_cast<uint64_t>(f.ds[k]));
     for (i64 v : {f.s_base, f.d_base, static_cast<i64>(f.stab_dim), static_cast<i64>(f.dtab_dim), f.stab_step,
-                  f.dtab_step, f.sbound, f.dbound})
+                  f.dtab_step, f.sbound, f.dbound, static_cast<i64>(f.stab_host), static_cast<i64>(f.dtab_host)})
       h.add(static_cast<uint64_t>(v));
   }
   return h.done();
@@ -92,6 +92,40 @@ static std::pair<i64, i64> extent_of(i64 base, const std::array<i64, Form::kMaxR
     lo += std::min<i64>(0, span), hi += std::max<i64>(0, span);
   }
   return {lo, hi};
+}
+
+Runs lower_form(const Form& f, const int64_t* stab, const int64_t* dtab) {
+  Runs r;
+  if (f.rank == 0) {
+    r.src.push_back(f.s_base), r.dst.push_back(f.d_base), r.len.push_back(1);
+    return r;
+  }
+  const int in = f.rank - 1;
+  const bool whole = f.ss[in] == 1 && f.ds[in] == 1 && in != f.stab_dim && in != f.dtab_dim;
+  const int outer = whole ? in : f.rank;  // dimensions walked one index at a time
+  const i64 len = whole ? f.shape[in] : 1;
+  std::array<i64, Form::kMaxRank> i{};
+  i64 count = 1;
+  for (int k = 0; k < outer; ++k) count *= f.shape[k];
+  for (i64 n = 0; n < count; ++n) {
+    i64 s = f.s_base, d = f.d_base;
+    for (int k = 0; k < outer; ++k) {
+      i64 is = i[k], id = i[k];
+      if (k == f.stab_dim) {
+        is = stab[i[k] * f.stab_step];
+        if (is < 0 || is >= f.sbound) fail(Errc::invalid_argument, "a host index table held an index out of range");
+      }
+      if (k == f.dtab_dim) {
+        id = dtab[i[k] * f.dtab_step];
+        if (id < 0 || id >= f.dbound) fail(Errc::invalid_argument, "a host index table held an index out of range");
+      }
+      s += is * f.ss[k], d += id * f.ds[k];
+    }
+    if (!r.empty() && r.src.back() + r.len.back() == s && r.dst.back() + r.len.back() == d) r.len.back() += len;
+    else r.src.push_back(s), r.dst.push_back(d), r.len.push_back(len);
+    for (int k = outer - 1; k >= 0 && ++i[k] == f.shape[k]; --k) i[k] = 0;
+  }
+  return r;
 }
 
 std::pair<i64, i64> Form::src_extent() const {

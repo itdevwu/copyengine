@@ -53,7 +53,7 @@ Read [patterns](references/patterns.md) for code. In short:
 | Ragged / CSR segments | `ce.segments(src, dst, src_off, dst_off, length)` |
 | One copy per layer from Python lists of tensors (0.3+) | `ce.copy_many(dsts, srcs)` instead of a `copy_` loop |
 | The same copies every step, same buffers | `plan = eng.freeze()` once, then `plan.run()` (also inside `torch.cuda.graph`) |
-| The same step every iteration, new CUDA index tensors (0.3+) | `step = ce.plan(fn)` once, then `step(*args)`; all buffers are arguments |
+| The same step every iteration, new index tensors or host index arrays (0.3+) | `step = ce.plan(fn)` once, then `step(*args)`; all buffers are arguments |
 | Copies should overlap compute | `with ce.scope(stream="copy") as h:` ... `h.wait()` before use |
 | Copies must not take SMs from compute | `ce.Engine(max_sms=N)` |
 | Background offload must leave PCIe / memory bandwidth to other work (0.3+) | `with ce.scope(stream="copy", bandwidth=8e9) as h:` |

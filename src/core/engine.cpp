@@ -353,10 +353,12 @@ struct Engine::Impl {
       if (sdev) {
         if (f.stab_dim >= 0 || !stab) return nullptr;
         f.stab_dim = f.rank, f.stab_step = st[k].dev.step, f.sbound = st[k].dev.bound, *stab = st[k].dev.ptr;
+        f.stab_host = st[k].dev.host();
       }
       if (ddev) {
         if (f.dtab_dim >= 0 || !dtab) return nullptr;
         f.dtab_dim = f.rank, f.dtab_step = dt[k].dev.step, f.dbound = dt[k].dev.bound, *dtab = dt[k].dev.ptr;
+        f.dtab_host = dt[k].dev.host();
       }
       f.shape[f.rank] = st[k].size, f.ss[f.rank] = st[k].stride, f.ds[f.rank] = dt[k].stride;
       f.numel *= st[k].size;
@@ -548,12 +550,22 @@ struct Engine::Impl {
   void enqueue_device_stmt(const Endpoint& src, const Endpoint& dst, const Stmt& stmt, const Elementwise& fn,
                            const Hints& hints, uintptr_t strm, Clock::time_point t0) {
     if (hints.has_valid) fail(Errc::unsupported, "valid_src with device indices");
-    if (src.device.kind != DeviceKind::cuda || !(src.device == dst.device))
-      fail(Errc::unsupported, "device indices need both tensors on the GPU that holds the indices");
+    bool on_gpu = false, on_host = false;
     for (const Access* a : {&stmt.src, &stmt.dst})
       for (const Term& t : a->terms())
-        if (t.dev.ptr && t.dev.device != src.device.index)
-          fail(Errc::unsupported, "device indices on another GPU than the tensors");
+        if (t.dev.ptr) (t.dev.host() ? on_host : on_gpu) = true;
+    const bool scuda = src.device.kind == DeviceKind::cuda, dcuda = dst.device.kind == DeviceKind::cuda;
+    if (on_gpu) {
+      if (!scuda || !(src.device == dst.device))
+        fail(Errc::unsupported, "device indices need both tensors on the GPU that holds the indices");
+      for (const Access* a : {&stmt.src, &stmt.dst})
+        for (const Term& t : a->terms())
+          if (t.dev.ptr && !t.dev.host() && t.dev.device != src.device.index)
+            fail(Errc::unsupported, "device indices on another GPU than the tensors");
+    }
+    if (on_host && !scuda && !dcuda) fail(Errc::unsupported, "host index tables need a GPU on one side");
+    if (scuda && dcuda && !(src.device == dst.device))
+      fail(Errc::unsupported, "host index tables between two GPUs");
     Op op;
     std::shared_ptr<const Form> form = make_form(src, dst, stmt, &op.stab, &op.dtab);
     if (!form)
@@ -564,9 +576,9 @@ struct Engine::Impl {
     const i64 s0 = static_cast<i64>(src.base) / ss, d0 = static_cast<i64>(dst.base) / ds;
     if (slo < s0 || shi >= s0 + src.nbytes / ss) fail(Errc::invalid_argument, "source access out of bounds");
     if (dlo < d0 || dhi >= d0 + dst.nbytes / ds) fail(Errc::invalid_argument, "destination access out of bounds");
-    exec_for({src.device, src.dtype, false}, {dst.device, dst.dtype, false});
-    op.src = {src.device, src.dtype, false};
-    op.dst = {dst.device, dst.dtype, false};
+    exec_for({src.device, src.dtype, src.pinned}, {dst.device, dst.dtype, dst.pinned});
+    op.src = {src.device, src.dtype, src.pinned};
+    op.dst = {dst.device, dst.dtype, dst.pinned};
     op.fn = fn;
     op.ctx = hints.ctx;
     op.src_lo = static_cast<int64_t>(src.base), op.src_hi = static_cast<int64_t>(src.base) + src.nbytes;

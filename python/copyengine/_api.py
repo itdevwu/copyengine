@@ -438,7 +438,9 @@ class Engine:
             if self._indexed(_torch_ops.gather_, out, src, dim, index, (out, src, dim)):
                 return out
         s = view(src)
-        idx = device_table(index) if s.is_cuda else None
+        idx = device_table(index, host_ok=s.is_cuda or (is_tensor(out) and out.is_cuda))
+        if idx is not None and idx.is_cuda and not s.is_cuda:
+            idx = None  # GPU indices need the source on the GPU
         if idx is not None:
             sacc = select_device(s.access, dim, idx)
         else:
@@ -465,7 +467,9 @@ class Engine:
                 and self._indexed(_torch_ops.scatter_, dst, src, dim, index, (dst, src, dim))):
             return dst
         d, s = view(dst, writable=True), view(src)
-        idx = device_table(index) if d.is_cuda else None
+        idx = device_table(index, host_ok=d.is_cuda or s.is_cuda)
+        if idx is not None and idx.is_cuda and not d.is_cuda:
+            idx = None  # GPU indices need the destination on the GPU
         if idx is not None:  # duplicates are not detected on the device (undefined, as in torch)
             dacc = select_device(d.access, dim, idx)
         else:

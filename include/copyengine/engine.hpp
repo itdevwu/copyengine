@@ -23,8 +23,9 @@ enum class Strategy : uint8_t {
   fused,          // CUDA: structured statements (strides, broadcast) evaluated by one kernel
   native,         // each op through the frontend's own implementation (torch's copy_): the baseline
   paced,          // CUDA: a bandwidth-limited group in chunks, a GPU pacing kernel before each (QoS)
+  lowered,        // CUDA: host index tables expanded into DMA descriptors at each run
 };
-inline constexpr int kNumStrategies = 10;
+inline constexpr int kNumStrategies = 11;
 std::string_view strategy_name(Strategy s);
 Strategy parse_strategy(std::string_view name);
 

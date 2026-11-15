@@ -94,6 +94,7 @@ struct TileSpec {
   };
   int fmt = 0;              // ce::cv::QFmt
   bool quantize = true;     // else dequantize
+  bool static_scale = false;  // quantize with the given scale / zero point (read, not written)
   int g = 1;                // values per unit
   float eps = 1e-12f, gs = 1.0f;
   std::array<int64_t, 3> rows{1, 1, 1};

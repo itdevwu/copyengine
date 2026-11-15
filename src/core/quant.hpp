@@ -160,6 +160,26 @@ CE_HD UnitQ unit_params(QFmt f, float amax, float lo, float hi, float eps, float
   return u;
 }
 
+// Static quantization: the unit's parameters from a given scale (float32;
+// for MX / NVFP4 the stored scale byte in `bits`) and uint4's zero point.
+CE_HD UnitQ unit_from_scale(QFmt f, float scale, uint8_t bits, uint8_t zero, float gs) {
+  UnitQ u;
+  u.scale = scale;
+  if (qfmt_mx(f)) {
+    u.bits = bits;
+    u.div = f8e8m0_to_float(bits);
+  } else if (f == QFmt::nvfp4) {
+    u.bits = bits;
+    const float sf = f8e4m3_to_float(bits);
+    u.zero_all = sf == 0.0f;
+    u.div = mul_rn(sf, gs);
+  } else {
+    u.div = scale;
+    u.bits = zero;
+  }
+  return u;
+}
+
 // One value's code: a byte, or a nibble for the packed formats.
 CE_HD uint8_t quant_elem(QFmt f, float x, const UnitQ& u) {
   switch (f) {

@@ -24,6 +24,7 @@ struct TileK {
   int xdt = 1;         // x's dtype (convert.hpp codes: f32, f16, bf16)
   int scale_byte = 0;  // the scale is stored as a byte (MX, NVFP4)
   int quantize = 1;    // else dequantize
+  int static_scale = 0;  // quantize with the given scale (and zero point): they are read, not written
   float eps = 1e-12f, gs = 1.0f;
   // Gathers / scatters: the first row dimension of x (xi), or of the
   // quantized side q, s, z (ci), read through an int64 index table (0: none),
@@ -81,6 +82,19 @@ CE_HD void tile_unit(const TileK& t, long long u) {
   const QFmt f = static_cast<QFmt>(t.fmt);
   const UnitAt a = unit_at(t, u);
   if (a.bad) return;  // host tables are checked when queued
+  if (t.quantize && t.static_scale) {
+    const float s = t.scale_byte ? 0.0f : rd<float>(addr(a.s));
+    const uint8_t sb = t.scale_byte ? rd<uint8_t>(addr(a.s)) : 0;
+    const uint8_t z = f == QFmt::uint4 ? rd<uint8_t>(addr(a.z)) : 0;
+    const UnitQ p = unit_from_scale(f, s, sb, z, t.gs);
+    for (int k = 0; k < t.g; ++k) {
+      const uint8_t c = quant_elem(f, val_float(load(addr(x_at(t, a, k)), t.xdt)), p);
+      uint8_t* qb = static_cast<uint8_t*>(addr(q_at(t, a, k)));
+      if (qfmt_packed(f)) *qb = static_cast<uint8_t>((k & 1) ? ((*qb & 0x0Fu) | (c << 4)) : ((*qb & 0xF0u) | c));
+      else *qb = c;
+    }
+    return;
+  }
   if (t.quantize) {
     float s = 0.0f;
     uint8_t bits = 0;

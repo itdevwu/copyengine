@@ -215,6 +215,7 @@ NB_MODULE(_core, m) {
       .def(nb::init<>())
       .def_rw("fmt", &ce::TileSpec::fmt)
       .def_rw("quantize", &ce::TileSpec::quantize)
+      .def_rw("static_scale", &ce::TileSpec::static_scale)
       .def_rw("g", &ce::TileSpec::g)
       .def_rw("eps", &ce::TileSpec::eps)
       .def_rw("gs", &ce::TileSpec::gs)

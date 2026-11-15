@@ -677,6 +677,7 @@ struct Engine::Impl {
     k->xe = t.x.step, k->qe = t.q.step, k->se = t.scale.step, k->ze = zero ? t.zero.step : 0;
     k->g = t.g, k->upr = static_cast<int>(t.upr), k->fmt = t.fmt, k->xdt = static_cast<int>(xd);
     k->scale_byte = byte_scale, k->quantize = t.quantize, k->eps = t.eps, k->gs = t.gs;
+    k->static_scale = t.quantize && t.static_scale;
     // Index tables: host values live with the op (the executor reads them, or
     // uploads them for a kernel); GPU ones are this call's pointer.
     std::shared_ptr<std::vector<int64_t>> hx, hc;
@@ -706,8 +707,9 @@ struct Engine::Impl {
     body->rd->start.push_back(rd.first), body->rd->end.push_back(rd.second);
     body->wr->start.push_back(wr.first), body->wr->end.push_back(wr.second);
     op.body = std::move(body);
-    op.extras.push_back({dev, sr.first, sr.second, t.quantize});
-    if (zero) op.extras.push_back({dev, zr.first, zr.second, t.quantize});
+    const bool writes_scale = t.quantize && !t.static_scale;
+    op.extras.push_back({dev, sr.first, sr.second, writes_scale});
+    if (zero) op.extras.push_back({dev, zr.first, zr.second, writes_scale});
     op.tile = std::move(k);
     op.tile_index[0] = std::move(hx), op.tile_index[1] = std::move(hc);
     op.tile_dev_index = t.x_index.dev || t.index.dev;
@@ -717,7 +719,7 @@ struct Engine::Impl {
     Hasher kh;
     kh.add(fingerprint_sides(op));
     kh.add(uint64_t{0x711E});
-    kh.add(static_cast<uint64_t>(t.fmt) | (uint64_t{t.quantize} << 8));
+    kh.add(static_cast<uint64_t>(t.fmt) | (uint64_t{t.quantize} << 8) | (uint64_t{t.static_scale} << 9));
     kh.add(static_cast<uint64_t>(lg2(op.tile->units() * t.g)));
     op.key = kh.done();
     op.native = hints.native;

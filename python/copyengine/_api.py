@@ -394,16 +394,18 @@ class Engine:
     # ---- quantization while copying (docs/design/v0.4.md) ------------------------------
 
     def quantize(self, x, q, scale, zero=None, *, fmt: str, group: Optional[int] = None, eps: float = 1e-12,
-                 global_scale: float = 1.0, x_index=None, index=None, ctx: str = "") -> None:
+                 global_scale: float = 1.0, static: bool = False, x_index=None, index=None, ctx: str = "") -> None:
         """Quantize `x` per unit of `group` values along its last dimension into
         `q` and `scale` (and `zero` for uint4), bit for bit as the format's
         recipe (copyengine._quant). Shapes: x [..., D]; q [..., D] (packed
         formats: [..., D / 2], two values per byte); scale and zero [..., D / group].
         `x_index` gathers the rows of x along its first dimension (pages to
         quantize); `index` scatters into the rows of q, scale and zero (cache
-        blocks). Index tensors on the GPU stay there.
+        blocks). Index tensors on the GPU stay there. `static=True` quantizes
+        with the given `scale` (and `zero`) instead of computing them; a
+        scale broadcast with `expand` serves every unit.
         """
-        self._tile(True, x, q, scale, zero, fmt, group, eps, global_scale, ctx, x_index, index)
+        self._tile(True, x, q, scale, zero, fmt, group, eps, global_scale, ctx, x_index, index, static)
 
     def dequantize(self, q, scale, out, zero=None, *, fmt: str, group: Optional[int] = None,
                    global_scale: float = 1.0, x_index=None, index=None, ctx: str = "") -> None:
@@ -411,7 +413,8 @@ class Engine:
         `index` gathers rows of q / scale / zero, `x_index` scatters into out."""
         self._tile(False, out, q, scale, zero, fmt, group, 1e-12, global_scale, ctx, x_index, index)
 
-    def _tile(self, quantize, x, q, scale, zero, fmt, group, eps, gs, ctx, x_index=None, index=None) -> None:
+    def _tile(self, quantize, x, q, scale, zero, fmt, group, eps, gs, ctx, x_index=None, index=None,
+              static=False) -> None:
         from . import _quant
         if fmt not in _quant.FMT:
             raise ValueError(f"unknown format {fmt!r}; one of {sorted(_quant.FMT)}")
@@ -470,6 +473,7 @@ class Engine:
 
         spec = _core.TileSpec()
         spec.fmt, spec.quantize, spec.g, spec.eps, spec.gs = _quant.FMT[fmt], quantize, g, float(eps), float(gs)
+        spec.static_scale = bool(static)
         spec.rows = list(lead) + [1] * (3 - len(lead))
         spec.upr = D // g
         sides = {}
@@ -484,7 +488,9 @@ class Engine:
                 spec.set_index(x_side, ix[0], ix[1], ix[2])
         xi = None if xt is None else xt[3]  # moved to the tensors' device only if the baseline runs
         ci = None if ct is None else ct[3]
-        if quantize:
+        if quantize and static:
+            native = (_quant.native_quantize_static, x, q, scale, zero, fmt, g, gs, xi, ci)
+        elif quantize:
             native = (_quant.native_quantize, x, q, scale, zero, fmt, g, eps, gs, xi, ci)
         else:
             native = (_quant.native_dequantize, q, scale, zero, x, fmt, g, gs, xi, ci)

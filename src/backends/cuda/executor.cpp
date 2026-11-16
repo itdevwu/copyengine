@@ -1473,13 +1473,16 @@ class CudaExecutor final : public Executor {
 
   // ---- 2-D blocks through tensor maps (sm90+) ---------------------------------------------
 
-  // Mirrors kernels.cu TmaBlock: a source and a destination tensor map, the
-  // block (bytes x rows) and the box.
-  struct alignas(64) TmaBlock {
-    CUtensorMap src, dst;
+  // Mirrors kernels.cu TmaBlock: a source and a destination tensor map (their
+  // bytes: CUtensorMap's own alignment differs between CUDA headers, 64 or
+  // 128), the block (bytes x rows) and the box. 128-byte aligned, 384 bytes.
+  struct alignas(128) TmaBlock {
+    unsigned char src[128], dst[128];
     int width, height, bw, bh;
   };
-  static_assert(sizeof(CUtensorMap) == 128 && sizeof(TmaBlock) % 64 == 0, "TmaBlock mirrors kernels.cu");
+  static_assert(sizeof(CUtensorMap) == 128 && sizeof(TmaBlock) == 384 && offsetof(TmaBlock, dst) == 128 &&
+                    offsetof(TmaBlock, width) == 256,
+                "TmaBlock mirrors kernels.cu");
   static constexpr int kTmaBox = 8192;  // kernels.cu: bytes per box
 
   // What the hardware takes: 16-byte aligned addresses and pitches, widths up
@@ -1500,14 +1503,18 @@ class CudaExecutor final : public Executor {
     return rows;  // 2-D work: 1-D runs are the row-wise bulk copy's
   }
 
-  bool encode_tma(CUtensorMap* m, i64 addr, i64 w, i64 h, i64 pitch, int bw, int bh) {
+  bool encode_tma(unsigned char* out, i64 addr, i64 w, i64 h, i64 pitch, int bw, int bh) {
+    CUtensorMap map;
+    CUtensorMap* m = &map;
     const cuuint64_t dims[2] = {static_cast<cuuint64_t>(w), static_cast<cuuint64_t>(h)};
     const cuuint64_t strides[1] = {static_cast<cuuint64_t>(h > 1 ? pitch : ((w + 15) & ~i64{15}))};
     const cuuint32_t box[2] = {static_cast<cuuint32_t>(bw), static_cast<cuuint32_t>(bh)}, el[2] = {1, 1};
-    return d_->cuTensorMapEncodeTiled(m, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2, reinterpret_cast<void*>(addr), dims,
-                                      strides, box, el, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE,
-                                      CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
-                                      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) == CUDA_SUCCESS;
+    const bool ok = d_->cuTensorMapEncodeTiled(m, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2, reinterpret_cast<void*>(addr), dims,
+                                               strides, box, el, CU_TENSOR_MAP_INTERLEAVE_NONE,
+                                               CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+                                               CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) == CUDA_SUCCESS;
+    std::memcpy(out, &map, sizeof(map));
+    return ok;
   }
 
   // The group's blocks as tensor map pairs; empty if the driver refuses one.
@@ -1518,8 +1525,8 @@ class CudaExecutor final : public Executor {
       b.width = static_cast<int>(r.width[i]), b.height = static_cast<int>(r.height[i]);
       b.bw = static_cast<int>(std::min<i64>(256, (r.width[i] + 15) & ~i64{15}));
       b.bh = static_cast<int>(std::clamp<i64>(kTmaBox / b.bw, 1, 256));
-      if (!encode_tma(&b.src, r.src[i] + sadd, r.width[i], r.height[i], r.src_pitch[i], b.bw, b.bh) ||
-          !encode_tma(&b.dst, r.dst[i] + dadd, r.width[i], r.height[i], r.dst_pitch[i], b.bw, b.bh))
+      if (!encode_tma(b.src, r.src[i] + sadd, r.width[i], r.height[i], r.src_pitch[i], b.bw, b.bh) ||
+          !encode_tma(b.dst, r.dst[i] + dadd, r.width[i], r.height[i], r.dst_pitch[i], b.bw, b.bh))
         return {};
     }
     return v;
@@ -1560,8 +1567,12 @@ class CudaExecutor final : public Executor {
       for (size_t i = 0; i < sbytes; ++i) in[i] = static_cast<uint8_t>(i * 131 + 7);
       check(d_->cuMemcpyHtoDAsync(a, in.data(), sbytes, s.side), "cuMemcpyHtoDAsync");
       check(d_->cuMemsetD8Async(b, 0, dbytes, s.side), "cuMemsetD8Async");
-      Rects r;
-      r.push(static_cast<i64>(a), static_cast<i64>(b), width, rows, sp, dp);
+      Rects r;  // three blocks (a table of several: its layout must match the kernel's)
+      for (i64 k = 0, row = 0; k < 3; ++k) {
+        const i64 h = k == 2 ? rows - row : rows / 3;
+        r.push(static_cast<i64>(a) + row * sp, static_cast<i64>(b) + row * dp, width, h, sp, dp);
+        row += h;
+      }
       const std::vector<TmaBlock> v = tma_blocks(r);
       if (v.empty()) {
         d_->cuMemFree(a), d_->cuMemFree(b);
@@ -1570,7 +1581,7 @@ class CudaExecutor final : public Executor {
       Slot& sl = upload(s, v.data(), v.size() * sizeof(TmaBlock), s.side);
       CUfunction f = function(s, "ce_bytes_tma2d");
       CUdeviceptr t = sl.dev.ptr;
-      int n = 1;
+      int n = static_cast<int>(v.size());
       void* args[] = {&t, &n};
       check(d_->cuLaunchKernel(f, 1, 1, 1, 32, 1, 1, 0, s.side, args, nullptr), "cuLaunchKernel ce_bytes_tma2d");
       check(d_->cuEventRecord(sl.done, s.side), "cuEventRecord");

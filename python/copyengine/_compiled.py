@@ -51,7 +51,7 @@ def _meta(t):
     if not isinstance(t, torch.Tensor):
         return None
     shape, stride = tuple(t.shape), tuple(t.stride())
-    if not all(isinstance(v, int) for v in shape + stride):
+    if _symbolic(shape) or _symbolic(stride):  # (isinstance(v, int) would ask Dynamo for a constant)
         return False
     return (shape, stride, str(t.dtype).replace("torch.", ""), t.device.type, t.device.index or 0)
 
@@ -213,10 +213,55 @@ def available() -> bool:
     return _torch_ops.copy_ is not None and hasattr(torch.ops.copyengine, "quantize_")
 
 
+def _symbolic(v) -> bool:
+    """Outside Dynamo: whether `v` holds symbolic sizes. (While Dynamo traces,
+    symbolic ints pass for ints: see static().)"""
+    if isinstance(v, (tuple, list)):
+        return any(_symbolic(x) for x in v)
+    return isinstance(v, (torch.SymInt, torch.SymFloat, torch.SymBool))
+
+
+# Whether a value is a constant while Dynamo traces (static sizes), asked of
+# the compiler itself: traced code cannot tell a symbolic int from an int, and
+# a constant-result function given one breaks the graph. comptime runs in the
+# compiler at this point of the trace and leaves its answer for _static_now(),
+# a constant of the graph (no guard on the answer's storage).
+_STATIC = {"v": True}
+
+
+def _probe_static(ctx):
+    _STATIC["v"] = ctx.get_local("v").is_python_constant()
+
+
+def _static_now():
+    return _STATIC["v"]
+
+
+def static(v) -> bool:
+    """While tracing: `v` (sizes, tuples of them) has no symbolic part."""
+    if torch is None or not compiling():
+        return not _symbolic(v)
+    from torch._dynamo.comptime import comptime
+    comptime(_probe_static)
+    return _static_now()
+
+
+if torch is not None:
+    _static_now = torch._dynamo.assume_constant_result(_static_now)
+
+
 def decide(kind, tensors, extra=()):
     """While tracing: 'torch' to emit the torch equivalent (torch.compile's code
-    is as fast), else 'ce'."""
-    return _decide(kind, tuple(_meta(t) for t in tensors), tuple(extra))
+    is as fast), else 'ce'. Symbolic sizes (dynamic shapes) take 'ce' here,
+    before anything symbolic reaches the constant-result function (Dynamo
+    cannot make constants of them: the graph would break)."""
+    if os.environ.get("CE_COMPILE_BASELINE", "1") in ("0", "off", "false"):
+        return "ce"
+    metas = tuple(_meta(t) for t in tensors)
+    extra = tuple(extra)
+    if not static((metas, extra)) or any(m is False for m in metas):
+        return "ce"
+    return _decide(kind, metas, extra)
 
 
 class TracedLazy:
@@ -308,6 +353,32 @@ def _shape_after(shape, op):
     return tuple(s)  # flip
 
 
+def _view_stride(shape, stride, new):
+    """Strides of `new` as a view of (shape, stride), or None: torch's computeStride."""
+    numel = 1
+    for n in shape:
+        numel *= n
+    if numel == 0:
+        return [1] * len(new)
+    out = [0] * len(new)
+    view_d = len(new) - 1
+    chunk = stride[-1] if stride else 1
+    tensor_numel, view_numel = 1, 1
+    for d in range(len(shape) - 1, -1, -1):
+        tensor_numel *= shape[d]
+        if d == 0 or (shape[d - 1] != 1 and stride[d - 1] != tensor_numel * chunk):
+            while view_d >= 0 and (view_numel < tensor_numel or new[view_d] == 1):
+                out[view_d] = view_numel * chunk
+                view_numel *= new[view_d]
+                view_d -= 1
+            if view_numel != tensor_numel:
+                return None
+            if d > 0:
+                chunk = stride[d - 1]
+                tensor_numel, view_numel = 1, 1
+    return out if view_d == -1 else None
+
+
 def _view(t, op):
     """A recorded op applied as a torch view; None where torch has no view for it."""
     name = op[0]
@@ -326,9 +397,15 @@ def _view(t, op):
         return t.unsqueeze(op[1])
     if name == "expand":
         return t.expand(op[1])
-    if name == "reshape":
-        v = t.view(op[1]) if t.is_contiguous() else None
-        return v
+    if name == "reshape":  # a view wherever torch's view would be one (not only contiguous tensors)
+        new = list(op[1])
+        if -1 in new:
+            known = 1
+            for n in new:
+                if n != -1:
+                    known *= n
+            new[new.index(-1)] = t.numel() // known if known else 0
+        return t.view(new) if _view_stride(list(t.shape), list(t.stride()), new) is not None else None
     return None
 
 

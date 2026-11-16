@@ -96,3 +96,38 @@ def test_rearrange_in_a_compiled_region(monkeypatch):
     torch.compile(f)(idx)
     torch.cuda.synchronize()
     assert torch.equal(out, einops.rearrange(kv, "(blk tok) h d -> blk h tok d", tok=16)[idx])
+
+
+@pytest.mark.parametrize("dev", DEVS)
+def test_ce_rearrange_and_repeat_match_einops(dev):
+    kv = torch.randn(8 * 16, 4, 32, device=dev)
+    out = torch.empty(8, 4, 16, 32, device=dev)
+    ce.copy_(out, ce.rearrange(ce.lazy(kv), "(blk tok) h d -> blk h tok d", tok=16))
+    out2 = torch.empty(8 * 16, 2, 4, 32, device=dev)
+    ce.copy_(out2, ce.repeat(ce.lazy(kv), "n h d -> n r h d", r=2))
+    if dev == "cuda":
+        torch.cuda.synchronize()
+    assert torch.equal(out, einops.rearrange(kv, "(blk tok) h d -> blk h tok d", tok=16))
+    assert torch.equal(out2, einops.repeat(kv, "n h d -> n r h d", r=2))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not ce._compiled.available(), reason="needs CUDA and torch ops")
+def test_ce_rearrange_in_a_compiled_region_is_one_graph(monkeypatch):
+    # einops' own functions may be graph nodes (allow_in_graph) that a lazy
+    # view cannot enter; ce.rearrange computes the view ops as a constant.
+    monkeypatch.setenv("CE_COMPILE_BASELINE", "0")
+    kv = torch.randn(8 * 16, 4, 32, device="cuda")
+    out = torch.empty(3, 4, 16, 32, device="cuda")
+
+    def f(idx):
+        ce.copy_(out, ce.rearrange(ce.lazy(kv), "(blk tok) h d -> blk h tok d", tok=16).index_select(0, idx))
+        return idx
+
+    idx = torch.tensor([5, 1, 7], device="cuda")
+    torch._dynamo.reset()
+    ex = torch._dynamo.explain(f)(idx)
+    assert ex.graph_count == 1 and ex.graph_break_count == 0
+    torch._dynamo.reset()
+    torch.compile(f)(idx)
+    torch.cuda.synchronize()
+    assert torch.equal(out, einops.rearrange(kv, "(blk tok) h d -> blk h tok d", tok=16)[idx])

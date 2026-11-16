@@ -4,6 +4,7 @@ import json as _json
 
 from . import _core
 from . import _einops  # einops on ce.lazy views (when einops is installed)
+from ._einops import rearrange, repeat
 from ._api import (
     Elementwise,
     Lazy,
@@ -45,7 +46,7 @@ from ._core import (
 __all__ = [
     "ABI_VERSION", "Access", "BackendError", "CopyEngineError", "Elementwise", "Engine", "FrozenPlan", "Pending",
     "NeedsMaterialize", "Rects", "Runs", "Stmt", "Unsupported", "UnsafeCopy", "__version__", "barrier",
-    "compiled_stats", "copy_", "copy_many", "default_engine", "dequantize", "quantize", "gather", "hardware_fingerprint", "indices", "lazy", "Lazy", "lower", "plan", "probe", "scatter_",
+    "compiled_stats", "copy_", "copy_many", "default_engine", "dequantize", "quantize", "gather", "hardware_fingerprint", "indices", "lazy", "Lazy", "lower", "plan", "probe", "rearrange", "repeat", "scatter_",
     "scope", "segments", "stats",
 ]
 

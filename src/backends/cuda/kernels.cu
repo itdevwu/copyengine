@@ -296,14 +296,17 @@ extern "C" __global__ void __launch_bounds__(32) ce_bytes_bulk(const Chunk* __re
 // one per row segment. Loads past the block fill zeros, stores past it are
 // clipped by the hardware, so edge boxes need no special case.
 
-struct alignas(64) TmaMap {
-  unsigned long long w[16];  // a CUtensorMap
+// The layout is fixed here and in the executor (not CUtensorMap's alignment,
+// which differs between CUDA headers): 128-byte aligned, 384 bytes.
+struct alignas(128) TmaMap {
+  unsigned long long w[16];  // a CUtensorMap's bytes
 };
-struct alignas(64) TmaBlock {
+struct alignas(128) TmaBlock {
   TmaMap src, dst;
   int width, height;  // bytes, rows
   int bw, bh;         // the box
 };
+static_assert(sizeof(TmaMap) == 128 && sizeof(TmaBlock) == 384, "TmaBlock mirrors the executor's");
 
 extern "C" __global__ void __launch_bounds__(32) ce_bytes_tma2d(const TmaBlock* __restrict__ blocks, int n) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900

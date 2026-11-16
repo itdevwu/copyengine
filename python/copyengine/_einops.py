@@ -15,9 +15,70 @@ concatenation raise.
 from __future__ import annotations
 
 try:
+    import einops
     import einops._backends as _eb
 except ImportError:  # pragma: no cover - einops is optional
-    _eb = None
+    einops = _eb = None
+
+
+class _Recorder:
+    """Shapes and view ops only: what einops does to a lazy view, recorded."""
+
+    def __init__(self, shape, ops=()):
+        self.shape, self.ops = tuple(shape), ops
+
+    def _with(self, *op):
+        from ._compiled import _shape_after
+        return _Recorder(_shape_after(self.shape, op), self.ops + (op,))
+
+    def reshape(self, *shape):
+        shape = shape[0] if len(shape) == 1 and isinstance(shape[0], (list, tuple)) else shape
+        return self._with("reshape", tuple(shape))
+
+    def permute(self, *dims):
+        dims = dims[0] if len(dims) == 1 and isinstance(dims[0], (list, tuple)) else dims
+        return self._with("permute", tuple(dims))
+
+    def unsqueeze(self, dim):
+        return self._with("unsqueeze", dim)
+
+    def expand(self, *shape):
+        shape = shape[0] if len(shape) == 1 and isinstance(shape[0], (list, tuple)) else shape
+        return self._with("expand", tuple(shape))
+
+
+def _ops(fn, pattern, shape, axes):
+    """The view ops einops' `fn` makes of `pattern` on a view of `shape`."""
+    return getattr(einops, fn)(_Recorder(shape), pattern, **dict(axes)).ops
+
+
+try:  # inside torch.compile regions: a constant of the graph (einops itself may not be traceable there)
+    import torch as _torch
+    _const_ops = _torch._dynamo.assume_constant_result(_ops)
+except Exception:  # pragma: no cover - without torch
+    _const_ops = _ops
+
+
+def _apply(fn, x, pattern, axes):
+    if einops is None:
+        raise ImportError("copyengine.rearrange / repeat need einops")
+    from . import _compiled
+    if _compiled.compiling() and isinstance(x, _compiled.TracedLazy) and _compiled.static((x.shape, tuple(axes.values()))):
+        for op in _const_ops(fn, pattern, tuple(x.shape), tuple(sorted(axes.items()))):
+            x = x._with(*op)
+        return x
+    return getattr(einops, fn)(x, pattern, **axes)
+
+
+def rearrange(x, pattern: str, **axes):
+    """``einops.rearrange`` for lazy views, also inside torch.compile regions
+    (where einops' own functions may be graph nodes no lazy view can enter)."""
+    return _apply("rearrange", x, pattern, axes)
+
+
+def repeat(x, pattern: str, **axes):
+    """``einops.repeat`` for lazy views (see :func:`rearrange`)."""
+    return _apply("repeat", x, pattern, axes)
 
 
 if _eb is not None:
@@ -28,7 +89,7 @@ if _eb is not None:
         def __init__(self):
             from ._compiled import TracedLazy
             from ._tensor import Lazy
-            self._types = (Lazy, TracedLazy)
+            self._types = (Lazy, TracedLazy, _Recorder)
 
         def is_appropriate_type(self, tensor):
             return isinstance(tensor, self._types)

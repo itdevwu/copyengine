@@ -6,6 +6,10 @@ change incompatibly only in a new minor (0.x) or major release.
 
 ## Unreleased
 
+- `ce.rearrange` / `ce.repeat`: einops' patterns on lazy views, also inside
+  torch.compile regions, where einops' own functions may be graph nodes a
+  lazy view cannot enter.
+
 - Inside torch.compile regions copyengine is measured against what
   torch.compile makes of the same operation: per call kind and layout, the
   torch equivalent compiled by Inductor (admitted only with the same bits)

@@ -61,7 +61,8 @@ Inside a `torch.compile`d function, `ce.copy_`, `ce.copy_many`,
 `ce.scatter_`, `ce.quantize` and `ce.dequantize` are one graph node each
 (no graph break; CUDA graphs work); other forms (host index lists, a lazy
 `flip`) break the graph and run eagerly with the same results. Scopes stay
-outside compiled regions. There each call is measured once per layout
+outside compiled regions; there, write einops patterns on lazy views with
+`ce.rearrange` / `ce.repeat` (same signature as einops). There each call is measured once per layout
 against torch.compile's own code for it and keeps whichever is faster
 (`ce.compiled_stats()["baselines"]` says which and why), so adding ce
 inside a compiled model never makes it slower than compiling it alone. When unsure, measure both on the real step;

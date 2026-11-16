@@ -232,3 +232,49 @@ def test_warm_when_the_model_is_warm():
     st = ce.compiled_stats()
     whys = [d["why"] for d in st["last"]["decisions"]]
     assert whys and all(w.startswith("locked") for w in whys), whys
+
+
+@ops
+def test_dynamic_shapes_keep_the_graph(monkeypatch):
+    # Symbolic sizes never reach the compiled-baseline decision (a constant of
+    # the graph): such calls take copyengine's op, in one graph.
+    monkeypatch.delenv("CE_COMPILE_BASELINE")
+    for n in (16, 24):
+        x = torch.randn(n, 32, device=DEV)
+        dst = torch.empty(n, 32, device=DEV, dtype=torch.float16)
+        kv = torch.randn(n, 8, 64, device=DEV)
+        idx = torch.arange(4, device=DEV)
+        out = torch.empty(4, 8, 64, device=DEV)
+
+        def f(x, dst, kv, idx, out):
+            ce.copy_(dst, x * 2)
+            ce.gather(kv, idx, 0, out=out)
+            return dst
+
+        torch._dynamo.reset()
+        for t in (x, dst, kv):
+            torch._dynamo.mark_dynamic(t, 0)
+        ex = torch._dynamo.explain(f)(x, dst, kv, idx, out)
+        assert ex.graph_count == 1 and ex.graph_break_count == 0, [str(r.reason)[:200] for r in ex.break_reasons]
+        torch.compile(f, dynamic=True)(x, dst, kv, idx, out)
+        torch.cuda.synchronize()
+        assert torch.equal(dst, (x * 2).to(torch.float16)) and torch.equal(out, kv[idx])
+
+
+@ops
+def test_reshape_of_a_split_tensor_stays_in_the_graph():
+    # v of a fused QKV projection: not contiguous (rows skip q and k), yet its
+    # reshape is a view: no graph break.
+    qkv = torch.randn(4, 16, 3 * 64, device=DEV)
+    o = torch.empty(4, 2, 16, 32, device=DEV)
+
+    def f(qkv, o):
+        v = qkv[..., 128:]
+        ce.copy_(o, ce.lazy(v).reshape(4, 16, 2, 32).permute(0, 2, 1, 3))
+        return o
+
+    assert breaks(f, qkv, o) == 0
+    torch._dynamo.reset()
+    torch.compile(f)(qkv, o)
+    torch.cuda.synchronize()
+    assert torch.equal(o, qkv[..., 128:].reshape(4, 16, 2, 32).permute(0, 2, 1, 3))

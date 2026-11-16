@@ -79,16 +79,28 @@ Read [patterns](references/patterns.md) for code. In short:
 | Quantize / dequantize while copying, one scale | `ce.copy_(dst, src, fn=ce.Elementwise(scale=..., clamp=(lo, hi)))` |
 | Quantize per group (FP8 / INT8 / INT4 / MXFP8 / NVFP4), scales computed or given | `ce.quantize(x, q, scale, fmt=..., group=...)`, `ce.dequantize(q, scale, out, ...)`; `x_index=` / `index=` gather pages and write cache blocks |
 | Ragged / CSR segments | `ce.segments(src, dst, src_off, dst_off, length)` |
-| One copy per layer from Python lists of tensors | `ce.copy_many(dsts, srcs)` instead of a `copy_` loop |
+| One copy per layer from Python lists of the same tensors every step | `ce.copy_many(dsts, srcs)` instead of a `copy_` loop |
 | The same copies every step, same buffers | `plan = eng.freeze()` once, then `plan.run()` (also inside `torch.cuda.graph`) |
-| The same step every iteration, new index tensors or host index arrays | `step = ce.plan(fn)` once, then `step(*args)`; all buffers are arguments |
+| The same step every iteration, new index tensors or host index arrays (paged pools) | `step = eng.plan(fn)` once, then `step(*args)`; pass whole pools and the indices, not views picked per step |
 | Copies should overlap compute | `with ce.scope(stream="copy") as h:` ... `h.wait()` before use |
 | Copies must not take SMs from compute | `ce.Engine(max_sms=N)` |
 | Background offload must leave PCIe / memory bandwidth to other work | `with ce.scope(stream="copy", bandwidth=8e9) as h:` |
 
 Use one `ce.Engine()` per thread (the module-level functions already do).
 Index tensors may stay on the GPU (no sync): `ce.gather`, `ce.scatter_` and
-`ce.lazy(...).index_select` read them there.
+`ce.lazy(...).index_select` read them there. Host indices (lists, numpy
+arrays) are as good in a step plan; do not turn them into CUDA tensors per
+step with `torch.tensor(ids, device="cuda")`, which waits for that copy.
+
+Block ids that change every step: index the pools, do not slice them.
+`ce.copy_many([pool[i] for i in ids], ...)` makes new views each step: each
+call is planned anew, and `copy_many` keeps torch's `_foreach_copy_` where
+that is faster (`stats()["copy_many"]`), so it gains little. Pass the pools
+and the ids to a step plan instead (planned once, replayed with new ids):
+`ce.lazy(pool)[ids]` (see [patterns](references/patterns.md)). Host pools may
+be pinned or pageable; pinned is faster. Layer slices of one block-major pool
+(`pool[:, a:b]`) are fine as destinations: copies into disjoint slices run
+together.
 
 ## Warm up, then serve without exploring
 
@@ -103,6 +115,12 @@ eng.load_profile(open("ce_profile.json").read())   # with CE_EXPLORE=0 to never 
 ```
 
 A profile is valid only on the same hardware and copyengine version.
+
+Exploring includes one run of torch's own copy per new pattern (the baseline
+copyengine must beat): a few milliseconds once, then never again for that
+pattern. Patterns are bucketed by sizes in powers of two, so warm up with the
+block counts serving will see (n = 1, 2, 4, 8, ...) and check that every
+decision's `why` reads "locked" before taking traffic.
 
 ## Prove it
 
@@ -130,3 +148,13 @@ A profile is valid only on the same hardware and copyengine version.
 - A copy with no torch equivalent (lazy gather, segments) must run once before
   a CUDA graph capture.
 - `CE_DISABLE=1` turns copyengine's choices off for an instant rollback.
+
+## SM limits for background work
+
+`ce.Engine(max_sms=N)` bounds the SMs a background engine's kernels take;
+DMA copies take none but share memory bandwidth (`bandwidth=` paces them).
+The right N depends on the foreground: compute-bound work (prefill) tolerates
+more than bandwidth-bound work (decode), which a quantizing background slows
+through memory traffic even on few SMs. Measure the foreground with the
+background running at a few settings (e.g. N = 16, 8, 4) and pick the
+largest N that keeps it within budget; the default is no limit.

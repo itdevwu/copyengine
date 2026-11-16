@@ -48,6 +48,21 @@ Read `why` in the decisions:
   Fix the shim (below) for loops of many small copies.
 - Host overhead dominates tiny copies (a few us each): batch them in one scope,
   or `freeze()` a fixed set and `plan.run()` it.
+- Buckets ending in `|churn` and a growing `st["churn_flushes"]`: the same
+  copies keep arriving at new addresses (views of a pool picked per call), so
+  each call is planned anew. Pass the pools and the indices to a step plan
+  (`eng.plan`, `ce.lazy(pool)[ids]`). `st["copy_many"]` says, per call
+  layout, whether copy_many kept copyengine (`true`) or torch's
+  `_foreach_copy_` (`false`); `freeze()` refuses right after a call torch ran.
+- A step plan that always runs plainly says why in
+  `plan._layouts[...]["traces"][i].plain`, e.g. memory that is neither an
+  argument nor a tensor the step names (reached through a dict or another
+  object): pass it as an argument.
+- `st["last"]["waves"]` above 1: copies in the flush depend on one another
+  (their footprints overlap), so they run in that many rounds; disjoint
+  copies, slices of one pool included, run in one.
+- A spike of a few ms the first time a pattern runs is the one sample of
+  torch's own copy (the baseline); warm up with the sizes serving will see.
 - A CUDA index tensor stays on the GPU (no sync); a `ValueError` at
   `synchronize()` means one of its indices was out of range.
 
@@ -60,7 +75,8 @@ Read `why` in the decisions:
 - `UnsafeCopy`: the explicit API refuses duplicate scatter indices or a source
   overlapping its destination (an intercepted `copy_` leaves those to torch).
 - `NeedsMaterialize`: a `reshape` of a lazy view that no strides express;
-  materialize with torch first or restructure the view.
+  materialize with torch first or restructure the view. Lazy views take
+  `[...]` indexing and `.slice` / `.narrow`.
 - "a scope open on another thread": one engine per thread (module-level
   functions already use a per-thread engine).
 - Shim warning at import, or compile errors: the shim is compiled for the

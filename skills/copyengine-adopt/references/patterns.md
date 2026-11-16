@@ -31,8 +31,9 @@ out.copy_(cache[ids].permute(0, 2, 1, 3).to(torch.float16))
 ce.copy_(out, ce.lazy(cache).index_select(0, ids).permute(0, 2, 1, 3))
 ```
 
-`ce.lazy` views support `index_select`, `slice`, `select`, `permute`,
-`transpose`, `flip`, `unsqueeze`, `expand`, `reshape`. `ids` should be a host
+`ce.lazy` views support `index_select`, `slice`, `narrow`, `select`, `permute`,
+`transpose`, `flip`, `unsqueeze`, `expand`, `reshape`, and indexing like a
+tensor (`ce.lazy(x)[:, a:b]`, integers, `...`, `None`, one index array). `ids` should be a host
 list or CPU tensor. Writing through a lazy destination scatters:
 `ce.copy_(ce.lazy(cache).index_select(0, ids), new_rows)`.
 
@@ -72,6 +73,36 @@ plan.run()                            # each step; also inside torch.cuda.graph
 
 A frozen plan replays the same buffers, layouts and indices: re-freeze when
 they change.
+
+## Paged pools, block ids changing every step: a step plan
+
+```python
+import numpy as np
+import torch
+import copyengine as ce
+
+L, B, n = 4, 64, 8
+host = [torch.randn(B, 16, 128).pin_memory() for _ in range(L)]   # per layer [blocks, ...]
+dev = [torch.empty(B, 16, 128, device="cuda") for _ in range(L)]
+eng = ce.Engine()
+
+def load(devs, hosts, dev_ids, host_ids):
+    with eng.scope():
+        for d, h in zip(devs, hosts):
+            eng.copy_(ce.lazy(d)[dev_ids], ce.lazy(h)[host_ids])
+
+step = eng.plan(load)                  # traced once per argument layout
+rng = np.random.default_rng(0)
+for _ in range(100):
+    step(dev, host, rng.permutation(B)[:n], rng.permutation(B)[:n])  # replays, new ids each call
+torch.cuda.synchronize()
+```
+
+Every tensor the copies touch is an argument or a tensor the step names (a
+closure variable, a global, `self.<attr>` of a bound method; checked before
+each replay). Index arguments may be numpy arrays, lists of ints, CPU or CUDA
+int64 tensors. Do not build `[pool[i] for i in ids]` views per step: each
+call is a new set of addresses.
 
 ## Overlap with compute
 

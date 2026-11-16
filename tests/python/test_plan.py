@@ -42,7 +42,18 @@ def test_new_shapes_and_buffers_trace_again():
             assert torch.equal(out, torch.stack([c[ids] for c in caches]))
 
 
-def test_memory_outside_the_arguments_runs_plainly():
+def _until_traced(p, call, check, limit=500):
+    for _ in range(limit):  # until the engine settled and the step was traced
+        call()
+        torch.cuda.synchronize()
+        check()
+        lay = next(iter(p._layouts.values()))
+        if lay["traces"]:
+            return lay["traces"][0]
+    raise AssertionError("never traced")
+
+
+def test_a_tensor_the_step_names_replays_while_it_is_the_same_view():
     src = torch.randn(64, 32, device=DEV)  # captured, not passed
 
     def step(out, ids):
@@ -50,15 +61,71 @@ def test_memory_outside_the_arguments_runs_plainly():
 
     p = ce.Engine().plan(step)
     out = torch.empty(8, 32, device=DEV)
-    for _ in range(500):  # until the engine settled and the step was traced
-        ids = torch.randperm(64, device=DEV)[:8]
-        p(out, ids)
+    box = {}
+
+    def call():
+        box["ids"] = torch.randperm(64, device=DEV)[:8]
+        p(out, box["ids"])
+
+    tr = _until_traced(p, call, lambda: torch.equal(out, src[box["ids"]]) or pytest.fail("wrong copy"))
+    assert tr.plain is None and tr.consts, tr.plain
+    for _ in range(5):  # replays
+        call()
         torch.cuda.synchronize()
-        assert torch.equal(out, src[ids])
-        if next(iter(p._layouts.values()))["traces"]:
-            break
-    tr = next(iter(p._layouts.values()))["traces"][0]
-    assert tr.plain and "not an argument" in tr.plain
+        assert torch.equal(out, src[box["ids"]])
+    # The name now holds another tensor (and then a view of the same storage at
+    # another offset): the guard traces again instead of replaying old addresses.
+    for new in (torch.randn(64, 32, device=DEV), None):
+        src = new if new is not None else torch.randn(80, 32, device=DEV)[16:]
+        for _ in range(40):
+            call()
+            torch.cuda.synchronize()
+            assert torch.equal(out, src[box["ids"]])
+
+
+def test_a_list_the_step_names_is_guarded_per_element():
+    pools = [torch.randn(64, 32, device=DEV) for _ in range(3)]
+
+    def step(out, ids):
+        for k, pool in enumerate(pools):
+            ce.gather(pool, ids, 0, out=out[k])
+
+    p = ce.Engine().plan(step)
+    out = torch.empty(3, 8, 32, device=DEV)
+    box = {}
+
+    def call():
+        box["ids"] = torch.randperm(64, device=DEV)[:8]
+        p(out, box["ids"])
+
+    def want():
+        return torch.stack([q[box["ids"]] for q in pools])
+
+    tr = _until_traced(p, call, lambda: torch.equal(out, want()) or pytest.fail("wrong copy"))
+    assert tr.plain is None and len(tr.consts) == 3
+    pools[1] = torch.randn(64, 32, device=DEV)  # replaced in place in the list
+    for _ in range(40):
+        call()
+        torch.cuda.synchronize()
+        assert torch.equal(out, want())
+
+
+def test_memory_reached_through_other_objects_runs_plainly():
+    holder = {"src": torch.randn(64, 32, device=DEV)}  # not a name the step uses for a tensor
+
+    def step(out, ids):
+        ce.gather(holder["src"], ids, 0, out=out)
+
+    p = ce.Engine().plan(step)
+    out = torch.empty(8, 32, device=DEV)
+    box = {}
+
+    def call():
+        box["ids"] = torch.randperm(64, device=DEV)[:8]
+        p(out, box["ids"])
+
+    tr = _until_traced(p, call, lambda: torch.equal(out, holder["src"][box["ids"]]) or pytest.fail("wrong copy"))
+    assert tr.plain and "neither an argument" in tr.plain
 
 
 def test_intercepted_copies_in_the_step_are_planned_too():
@@ -126,7 +193,12 @@ def test_a_temporary_kept_alive_is_not_composed():
         if tr is not None:
             break
         kept.clear() if len(kept) > 4 else None
-    assert tr is not None and tr.plain and "not an argument" in tr.plain
+    # Still alive and named by the step (in `kept`): a guarded constant, not a temporary to compose away.
+    assert tr is not None and tr.plain is None and tr.consts
+    for _ in range(5):
+        p(src, dst)
+        torch.cuda.synchronize()
+        assert torch.equal(dst, src[::2])
 
 
 def test_a_temporary_read_before_it_is_written_is_not_composed():
@@ -146,3 +218,34 @@ def test_a_temporary_read_before_it_is_written_is_not_composed():
         if tr is not None:
             break
     assert tr is None or tr.plain is not None
+
+
+@pytest.mark.parametrize("h2d", [True, False], ids=["h2d", "d2h"])
+def test_pageable_host_pools_replay_with_host_indices(h2d):
+    import numpy as np
+
+    host = [torch.randn(32, 4, 64) for _ in range(3)]  # pageable
+    dev = [torch.zeros(32, 4, 64, device=DEV) for _ in range(3)]
+    e = ce.Engine()
+
+    def step(devs, hosts, di, hi):
+        with e.scope():
+            for d, h in zip(devs, hosts):
+                if h2d:
+                    e.copy_(ce.lazy(d).index_select(0, di), ce.lazy(h).index_select(0, hi))
+                else:
+                    e.copy_(ce.lazy(h).index_select(0, hi), ce.lazy(d).index_select(0, di))
+
+    p = e.plan(step)
+    rng = np.random.default_rng(1)
+    for k in range(120):
+        di, hi = rng.permutation(32)[:5], rng.permutation(32)[:5]
+        p(dev, host, di, hi)
+        torch.cuda.synchronize()
+        for d, h in zip(dev, host):
+            if h2d:
+                assert torch.equal(d[di].cpu(), h[hi]), k
+            else:
+                assert torch.equal(h[hi], d[di].cpu()), k
+    tr = next(iter(p._layouts.values()))["traces"][0]
+    assert tr.plain is None and tr.params, tr.plain

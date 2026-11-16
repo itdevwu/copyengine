@@ -8,8 +8,11 @@ parameters (a replay reads the new ones): CUDA int64 tensors directly, host
 indices (numpy arrays, lists of ints, CPU integer tensors) through a pinned
 buffer the plan refills each call, when the step passes them straight to a ce
 index API. Every other tensor the copies touch must be the same buffer (else
-the step is traced again). A replay is kept only if it beats running the step
-as plain code (paired, end to end).
+the step is traced again): an argument, or a tensor the step reaches by name
+(a closure variable, a global, an attribute of a bound method's object; one
+level of lists), which is checked before each replay to be the same view
+(address, dtype, shape, strides), else the step is traced again. A replay is
+kept only if it beats running the step as plain code (paired, end to end).
 """
 
 from __future__ import annotations
@@ -158,7 +161,7 @@ def _describe(x):
 class _Trace:
     """One frozen layout: identities it needs, index tensors it rebinds."""
 
-    __slots__ = ("frozen", "ident", "tables", "params", "vguard", "site", "plain")
+    __slots__ = ("frozen", "ident", "tables", "params", "vguard", "consts", "site", "plain")
 
     def __init__(self):
         self.frozen = None
@@ -166,6 +169,7 @@ class _Trace:
         self.tables: list = []  # (leaf index, traced pointer, bytes): device index parameters
         self.params: list = []  # (leaf index, pinned buffer): host index parameters, refilled each call
         self.vguard: list = []  # (leaf index, values): host indices whose values the plan depends on
+        self.consts: list = []  # (getter, view signature): tensors reached by name, not as arguments
         self.site = None        # replay-or-plain decision (a _Site)
         self.plain = None       # why this layout always runs plainly (None: it replays)
 
@@ -196,6 +200,14 @@ class StepPlan:
             if tr is None:
                 self._warm(lay, args, kw, leaves)
                 return
+        if tr.consts and not all(_sig_now(get) == sig for get, sig in tr.consts):
+            # A tensor the step reaches by name is another one now: trace again.
+            for lay in self._layouts.values():
+                if tr in lay["traces"]:
+                    lay["traces"].remove(tr)
+            self._last = None
+            self(*args, **kw)
+            return
         self._last = (leaves, tr)
         if tr.plain is not None:
             self._step(*args, **kw)
@@ -283,12 +295,13 @@ class StepPlan:
             if lay["warm"] < _Site.SETTLE:
                 return  # the engine is still tuning this step
             tr.frozen = e._e.freeze(rebindable=True)
-            if self._unbound(tr, leaves):
+            caps = _captured(self._step)
+            if self._unbound(tr, leaves, caps):
                 # Copies through tensors the step allocated and dropped: compose them away.
                 # The engine's own references (torch's copies, its baseline) go first.
                 tr.frozen = None
                 e._e.release_payloads()
-                dead = _dead_temporaries(self._unbound_of(e._e.freeze(rebindable=True).allocations, leaves))
+                dead = _dead_temporaries(self._unbound_of(e._e.freeze(rebindable=True).allocations, leaves, caps))
                 composed = e._e.freeze_composed(dead, rebindable=True) if dead else None
                 tr.frozen = composed if composed is not None else e._e.freeze(rebindable=True)
             for i in cands:
@@ -296,7 +309,7 @@ class StepPlan:
                     tr.params.append((i, params[id(leaves[i])]))
                 else:  # not a parameter (or the step derived indices from values): guarded by value
                     tr.vguard.append((i, _values(leaves[i])))
-            tr.plain = self._bind(tr, leaves)
+            tr.plain = self._bind(tr, leaves, caps)
             tr.site = _Site("replay")
             tr.site.settled = _Site.SETTLE  # the engine already settled while tracing
         lay["warm"] = 0
@@ -315,18 +328,20 @@ class StepPlan:
         return storages
 
     @staticmethod
-    def _unbound(tr: _Trace, leaves):
-        """The frozen copies' allocations that are no argument: (kind, index, lo, hi)."""
-        return StepPlan._unbound_of(tr.frozen.allocations, leaves)
+    def _unbound(tr: _Trace, leaves, caps=()):
+        """The frozen copies' allocations that are no argument nor reached by name: (kind, index, lo, hi)."""
+        return StepPlan._unbound_of(tr.frozen.allocations, leaves, caps)
 
     @staticmethod
-    def _unbound_of(allocations, leaves):
+    def _unbound_of(allocations, leaves, caps=()):
         storages = StepPlan._storages(leaves)
+        named = _cap_storages(caps)
         return [(kind, index, lo, hi) for kind, index, lo, hi in allocations
-                if storages.get((kind == 1, index if kind == 1 else 0, lo)) is None]
+                if storages.get((kind == 1, index if kind == 1 else 0, lo)) is None
+                and (kind == 1, index if kind == 1 else 0, lo) not in named]
 
     @staticmethod
-    def _bind(tr: _Trace, leaves):
+    def _bind(tr: _Trace, leaves, caps=()):
         """Maps the frozen copies' memory to the arguments; why not replayable, or None."""
         storages = {}
         for i, x in enumerate(leaves):
@@ -344,14 +359,76 @@ class StepPlan:
         for p in tables:
             if not any(lo <= p < hi for lo, hi in table_ranges):
                 return "an index tensor the copies read is not an argument (or was converted inside the step)"
+        named = _cap_storages(caps)
         for kind, index, lo, hi in tr.frozen.allocations:
-            hit = storages.get((kind == 1, index if kind == 1 else 0, lo))
+            where = (kind == 1, index if kind == 1 else 0, lo)
+            hit = storages.get(where)
+            if hit is None and where in named:
+                for get, t in named[where]:  # reached by name: the same view at each replay
+                    tr.consts.append((get, _sig(t)))
+                continue
             if hit is None:
-                return ("the copies touch memory that is not an argument (a tensor allocated inside the step, "
-                        "or taken from outside it): pass it as an argument")
+                return ("the copies touch memory that is neither an argument nor a tensor the step names (a "
+                        "tensor allocated inside the step, or reached through other objects): pass it as an "
+                        "argument")
             if (hit[0], lo) not in tr.ident:
                 tr.ident.append((hit[0], lo))
         return None
+
+
+def _captured(step):
+    """Tensors the step reaches by name: (getter, tensor) for its closure
+    variables, the globals and (for a bound method) its object's attributes it
+    names, and the tensors of lists or tuples held there."""
+    out = []
+    fn = getattr(step, "__func__", step)
+    code = getattr(fn, "__code__", None)
+    if code is None:
+        return out
+
+    def add(get):
+        try:
+            v = get()
+        except Exception:
+            return
+        if _is_tensor(v):
+            out.append((get, v))
+        elif isinstance(v, (list, tuple)):
+            for j, x in enumerate(v):
+                if _is_tensor(x):
+                    out.append((lambda g=get, j=j: g()[j], x))
+
+    for cell in fn.__closure__ or ():
+        add(lambda c=cell: c.cell_contents)
+    names = set(code.co_names)
+    glb = getattr(fn, "__globals__", {})
+    for n in names & glb.keys():
+        add(lambda n=n: glb[n])
+    obj = getattr(step, "__self__", None)
+    attrs = getattr(obj, "__dict__", None)
+    if isinstance(attrs, dict):
+        for n in names & attrs.keys():
+            add(lambda n=n: attrs[n])
+    return out
+
+
+def _cap_storages(caps):
+    named = {}
+    for get, t in caps:
+        named.setdefault((t.device.type == "cuda", t.device.index or 0, t.untyped_storage().data_ptr()), []).append((get, t))
+    return named
+
+
+def _sig(t):
+    return (t.data_ptr(), t.dtype, tuple(t.shape), t.stride(), t.device)
+
+
+def _sig_now(get):
+    try:
+        t = get()
+    except Exception:
+        return None
+    return _sig(t) if _is_tensor(t) else None
 
 
 def _same_leaf(a, b) -> bool:

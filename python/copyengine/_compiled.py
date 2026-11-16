@@ -304,6 +304,13 @@ class TracedLazy:
         shape = shape[0] if len(shape) == 1 and isinstance(shape[0], (list, tuple)) else shape
         return self._with("reshape", tuple(shape))
 
+    def narrow(self, dim, start, length):
+        return self._with("slice", dim, start, start + length, 1)
+
+    def __getitem__(self, key):
+        from ._tensor import apply_index
+        return apply_index(self, key)
+
     def eager(self):
         """The same view as a `copyengine.Lazy` (after a graph break)."""
         from ._tensor import lazy

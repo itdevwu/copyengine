@@ -61,6 +61,9 @@ struct Form {
   // Lowest / highest element index touched on each side.
   std::pair<i64, i64> src_extent() const;
   std::pair<i64, i64> dst_extent() const;
+  // The bytes each side may touch (see affine_bytes): a table dimension spans its bound.
+  Intervals src_bytes() const;
+  Intervals dst_bytes() const;
   bool same_structure(const Form& o) const {
     return rank == o.rank && shape == o.shape && ss == o.ss && ds == o.ds && sdt == o.sdt && ddt == o.ddt &&
            stab_dim == o.stab_dim && dtab_dim == o.dtab_dim && stab_step == o.stab_step &&
@@ -73,6 +76,17 @@ struct Form {
 // innermost dimension stays one run where it is contiguous on both sides.
 // An index outside its bound is an error.
 Runs lower_form(const Form& f, const int64_t* stab, const int64_t* dtab);
+
+// Footprints. Every op's footprint on a tensor is the image of its access over
+// its units, an index whose values the host does not know ranging over its
+// whole bound: { base + sum_k i_k * stride_k + [0, width) : 0 <= i_k < shape_k }
+// in bytes. This returns that set as disjoint sorted intervals, exactly while
+// it takes at most kFootprintCap intervals once dimensions that continue one
+// another are merged, else its hull (which contains it). Dependencies use
+// nothing else, so the set must contain every byte the op may touch.
+constexpr size_t kFootprintCap = size_t{1} << 14;
+Intervals affine_bytes(i64 base, std::span<const i64> shape, std::span<const i64> stride, i64 width,
+                       size_t cap = kFootprintCap);
 
 
 // An op's runs and their lazily computed byte intervals. Shared by every
@@ -118,10 +132,13 @@ struct Op {
   // reads spans at most twice the bytes it holds, what it writes is dense,
   // and no index tables (rows could be anywhere). Set when queued.
   bool tile_host = false, tile_staged_ok = false;
+  // A further tensor of the op (a tile op's scale, zero point): its allocation
+  // range [lo, hi) and its footprint (what dependencies use).
   struct Extra {
     Device device;
     int64_t lo = 0, hi = 0;  // absolute bytes
     bool write = false;
+    std::shared_ptr<const Intervals> bytes;
   };
   std::vector<Extra> extras;
   Hash128 fp;  // content fingerprint
@@ -166,6 +183,9 @@ struct Group {
   // filled at plan time
   std::vector<Strategy> candidates;
   std::string bucket;
+  // Planned for a flush of churn (the same copies at new addresses each call):
+  // this group runs about once, so a strategy's setup is part of its cost.
+  bool churn = false;
   // Backend-built tables (chunk lists, copy lists) per strategy, reused on
   // every plan-cache hit and frozen replay so the hot path does no planning.
   mutable std::array<std::shared_ptr<void>, kNumStrategies> exec_cache;

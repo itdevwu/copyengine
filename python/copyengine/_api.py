@@ -43,6 +43,14 @@ _STRIDED = torch.strided if torch is not None else None
 # dtypes torch's stable ABI cannot pass to a custom op yet: these take the Python path.
 _NOT_STABLE = (torch.float8_e8m0fnu, torch.float4_e2m1fn_x2) if torch is not None else ()
 
+
+def _stable(t) -> bool:
+    """A tensor the C++ copy_many op takes."""
+    return type(t) is _Tensor and t.layout is _STRIDED and t.dtype not in _NOT_STABLE
+
+
+_IS_CPU = __import__("operator").attrgetter("is_cpu")
+
 def _torch_f8e4m3_saturates() -> bool:
     """Whether the installed torch saturates float -> float8_e4m3fn beyond the
     format (+-448, torch 2.13 on) instead of returning NaN (up to 2.12).
@@ -230,6 +238,8 @@ class Engine:
         self._async_depth = 0          # open scope(stream=...)s
         self._set_depth(0)        # scope depth as seen from Python: whether queued copies need references held
         self._sites: dict = {}    # outermost scope call site -> _Site (intercept or not)
+        self._many_sites: dict = {}  # copy_many call layout -> _Site (copyengine or torch._foreach_copy_)
+        self._torch_at = None  # engine flush count when a site last ran torch's copies instead (see freeze)
         self._scope_kind = None   # the outermost open scope's interception (inner scopes share it)
 
     # ---- scope ----------------------------------------------------------------
@@ -387,6 +397,11 @@ class Engine:
                 return
             return _eager_call(Engine.copy_many, self, dsts, srcs, ctx=ctx)
         op = _torch_ops.copy_many_
+        if (dsts and op is not None and not ctx and self._depth == 0 and self._force is None
+                and not self._opts.disable and type(dsts[0]) is _Tensor and type(srcs[0]) is _Tensor):
+            from . import _plan
+            if _plan.tracing_engine() is None and self._copy_many_site(dsts, srcs, op):
+                return
 
         def stable(t):
             return type(t) is _Tensor and t.layout is _STRIDED and t.dtype not in _NOT_STABLE
@@ -394,13 +409,84 @@ class Engine:
         # Pairs the C++ op takes go in one call; the rest pair by pair (same scope, one plan).
         fast = [] if op is None or ctx else [i for i in range(len(dsts)) if stable(dsts[i]) and stable(srcs[i])]
         rest = sorted(set(range(len(dsts))) - set(fast))
+        self._copy_many_ce(dsts, srcs, op, fast, rest, ctx)
+
+    # The baseline of a copy_many call: torch's own batched copy, with copy_many's
+    # contract (host-side copies complete on return).
+    def _copy_many_torch(self, dsts, srcs) -> None:
+        self._torch_at = self._e.flushes
+        torch._foreach_copy_(dsts if type(dsts) is list else list(dsts), srcs if type(srcs) is list else list(srcs),
+                             non_blocking=True)
+        if not self._opts.allow_async and torch.cuda.is_initialized():
+            if any(map(_IS_CPU, dsts)) or any(map(_IS_CPU, srcs)):
+                torch.cuda.current_stream().synchronize()
+
+    def _copy_many_site(self, dsts, srcs, op) -> bool:
+        """copy_many at the top level: copyengine against torch._foreach_copy_ on
+        the same pairs, per call layout, paired and timed end to end (the scope
+        sites' rule); ties keep torch. False: not handled here (pairs the C++
+        op does not take), the caller runs them through copyengine."""
+        d0, s0 = dsts[0], srcs[0]
+        key = (len(dsts), d0.device, s0.device, d0.dtype, s0.dtype, d0.is_pinned(), s0.is_pinned())
+        site = self._many_sites.get(key)
+        if site is None:
+            site = self._many_sites[key] = _Site("ce")
+        kind, timed = site.choose()
+        if kind is None and not timed:  # decided: torch's copies, nothing else to check
+            try:
+                self._copy_many_torch(dsts, srcs)
+            except TypeError:  # not all tensors (rejected before anything is copied)
+                return False
+            return True
+        if not all(map(_stable, dsts)) or not all(map(_stable, srcs)):
+            return False
+        cuda = torch.cuda.is_available() and torch.cuda.is_initialized()
+        if timed and cuda and torch.cuda.is_current_stream_capturing():
+            kind, timed = ("ce" if site.decided is not False else None), False
+        if not timed:
+            if kind is None:
+                self._copy_many_torch(dsts, srcs)
+            else:
+                self._copy_many_ce(dsts, srcs, op, range(len(dsts)), [], "")
+            return True
+        runs0, ev0 = self._e.tuning_runs, None
+        if timed is True and cuda:
+            cur = torch.cuda.current_stream()
+            if cur.query() or site.skips >= _Site.MAX_SKIPS:
+                ev0 = torch.cuda.Event(enable_timing=True)
+                ev0.record()
+            else:
+                site.skips += 1
+                timed = "skip"
+        t0 = time.perf_counter()
+        if kind is None:
+            self._copy_many_torch(dsts, srcs)
+        else:
+            self._copy_many_ce(dsts, srcs, op, range(len(dsts)), [], "")
+        host = time.perf_counter() - t0
+        quiet = self._e.tuning_runs == runs0
+        if timed == "warm":
+            site.warmed(quiet)
+        elif timed is True and quiet:
+            end = None
+            if ev0 is not None:
+                end = torch.cuda.Event(enable_timing=True)
+                end.record()
+            site.sample(kind is not None, host, ev0, end)
+        return True
+
+    def _copy_many_ce(self, dsts, srcs, op, fast, rest, ctx) -> None:
         with self._lock:
             self._e.begin_scope()
             self._set_depth(self._depth + 1)
             try:
                 if fast:
                     try:
-                        op([dsts[i] for i in fast], [srcs[i] for i in fast], self._handle)
+                        if isinstance(fast, range):  # every pair
+                            op(dsts if type(dsts) is list else list(dsts), srcs if type(srcs) is list else list(srcs),
+                               self._handle)
+                        else:
+                            op([dsts[i] for i in fast], [srcs[i] for i in fast], self._handle)
                     except RuntimeError as e:
                         raise _torch_ops.translate(e) from None
                 for i in rest:
@@ -721,6 +807,11 @@ class Engine:
     def freeze(self) -> "FrozenPlan":
         """Replayable copy of the last flush (no planning, no checks on replay)."""
         with self._lock:
+            if self._torch_at is not None and self._torch_at == self._e.flushes:
+                raise RuntimeError(
+                    "freeze: the last copies ran as torch's own (that call site measured faster with torch), so "
+                    "copyengine has nothing new to freeze; issue them through copyengine first, e.g. "
+                    "`with eng.scope(): eng.copy_many(dsts, srcs)`, then freeze")
             return FrozenPlan(self, self._e.freeze(), list(self._held))
 
     def stats(self) -> dict:
@@ -728,6 +819,9 @@ class Engine:
         # Per outermost scope call site: whether it intercepts (None: still deciding).
         out["scopes"] = [{"site": f"{code.co_filename}:{line}", "intercept": st.decided}
                          for (code, line), st in self._sites.items()]
+        # Per copy_many call layout: copyengine (True) or torch._foreach_copy_ (False); None: deciding.
+        out["copy_many"] = [{"pairs": k[0], "dst": str(k[1]), "src": str(k[2]), "copyengine": st.decided}
+                            for k, st in self._many_sites.items()]
         return out
 
     def dump_profile(self) -> str:
@@ -906,6 +1000,8 @@ class _Scope:
         self.kind, self.timed = e._interception(self.site, self.bandwidth > 0)
         if e._depth == 1:
             e._scope_kind = self.kind
+            if self.kind is None:  # torch's copies run, copyengine queues nothing
+                e._torch_at = e._e.flushes
         if self.timed:
             self.runs0 = e._e.tuning_runs
             if self.timed is True and torch is not None and torch.cuda.is_available() and torch.cuda.is_initialized():

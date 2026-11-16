@@ -135,6 +135,11 @@ if(CE_BUILD_TESTS)
   target_include_directories(ce_test_convert PRIVATE src)
   target_compile_options(ce_test_convert PRIVATE -ffp-contract=off)
   add_test(NAME convert COMMAND ce_test_convert)
+  # Internal functions (the library's symbols are hidden): compiled in.
+  add_executable(ce_test_footprint tests/cpp/test_footprint.cpp src/core/plan.cpp src/core/ir.cpp)
+  target_link_libraries(ce_test_footprint PRIVATE copyengine::copyengine)
+  target_include_directories(ce_test_footprint PRIVATE src ${CMAKE_CURRENT_BINARY_DIR}/src)
+  add_test(NAME footprint COMMAND ce_test_footprint)
 endif()
 
 if(CE_BUILD_PYTHON)

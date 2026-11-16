@@ -57,6 +57,12 @@
   every device; torch's own arithmetic differs across devices and forms.
 - Ops carry absolute element indices (address / itemsize); pure copies are
   normalized to bytes. Dependencies and merging rely on this.
+- An op's footprint on each tensor it touches (element copies, tile ops'
+  data, scales and zero points alike) is the image of its access over its
+  units, an index the host does not know ranging over its whole bound
+  (`affine_bytes` in `src/core/plan.hpp`): exact intervals, or a hull that
+  contains them. Dependencies use nothing else, so a footprint contains every
+  byte the op may touch; tests check it against brute force.
 - Every Executor strategy must be correct for any group it is offered.
   `passthrough` (each op as submitted) is always correct, but it is measured
   only when its call count is bounded: it is never a multi-second baseline.

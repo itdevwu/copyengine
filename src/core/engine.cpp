@@ -151,6 +151,15 @@ struct Engine::Impl {
   std::vector<Alloc> q_reads, q_writes;  // allocations the queue reads / writes
   std::vector<PendingSample> samples;
   int64_t native_ops = 0;  // ops run natively at interception
+  // Plan churn: flushes that miss the plan cache with the same structure (op
+  // classes in order) as several before them are the same copies at new
+  // addresses each call (views of a pool picked per call). Their groups run
+  // about once, so a strategy's setup (tables built and uploaded) is part of
+  // its cost there: they are tuned in buckets of their own, setup runs
+  // included, instead of never sampling (a setup run is no sample otherwise).
+  static constexpr int kChurnMisses = 4;
+  Lru<int> churn{256};
+  int64_t churn_flushes = 0;
   std::map<std::string, int64_t, std::less<>> declined;  // intercepted copies left to the frontend, by reason
   bool last_capture = false;  // the last flush was recorded into a CUDA graph
   HostExecutor host;
@@ -623,6 +632,13 @@ struct Engine::Impl {
     return {lo, hi + width};
   }
 
+  // The bytes of that layout (affine_bytes): its exact footprint, not the hull.
+  static Intervals tile_bytes(const TileSpec& t, const TileSpec::Side& s, int64_t count, int64_t width) {
+    const i64 shape[5] = {t.rows[0], t.rows[1], t.rows[2], t.bh, count};
+    const i64 stride[5] = {s.row_stride[0], s.row_stride[1], s.row_stride[2], t.bh > 1 ? s.pitch : 0, s.step};
+    return affine_bytes(static_cast<i64>(s.ep.base) + s.offset, shape, stride, width);
+  }
+
   void enqueue_tile(const TileSpec& t, const Hints& hints, uintptr_t strm, Clock::time_point t0) {
     using cv::QFmt;
     const auto f = static_cast<QFmt>(t.fmt);
@@ -750,15 +766,20 @@ struct Engine::Impl {
     const auto& dst_ep = t.quantize ? t.q.ep : t.x.ep;
     op.src_lo = static_cast<int64_t>(src_ep.base), op.src_hi = op.src_lo + src_ep.nbytes;
     op.dst_lo = static_cast<int64_t>(dst_ep.base), op.dst_hi = op.dst_lo + dst_ep.nbytes;
+    // Footprints: each tensor's layout over the units, an indexed first row
+    // dimension over its whole bound (tx, tc).
     auto body = std::make_shared<OpBody>();
-    const auto rd = t.quantize ? xr : qr, wr = t.quantize ? qr : xr;
-    body->rd = std::make_unique<Intervals>(), body->wr = std::make_unique<Intervals>();
-    body->rd->start.push_back(rd.first), body->rd->end.push_back(rd.second);
-    body->wr->start.push_back(wr.first), body->wr->end.push_back(wr.second);
+    Intervals xb = tile_bytes(tx, t.x, vals, static_cast<int64_t>(itemsize(xd)));
+    Intervals qb = tile_bytes(tc, t.q, packed ? vals / 2 : vals, 1);
+    body->rd = std::make_unique<Intervals>(t.quantize ? std::move(xb) : std::move(qb));
+    body->wr = std::make_unique<Intervals>(t.quantize ? std::move(qb) : std::move(xb));
     op.body = std::move(body);
     const bool writes_scale = t.quantize && !t.static_scale;
-    op.extras.push_back({t.scale.ep.device, sr.first, sr.second, writes_scale});
-    if (zero) op.extras.push_back({t.zero.ep.device, zr.first, zr.second, writes_scale});
+    op.extras.push_back({t.scale.ep.device, sr.first, sr.second, writes_scale,
+                         std::make_shared<const Intervals>(tile_bytes(tc, t.scale, t.upr, byte_scale ? 1 : 4))});
+    if (zero)
+      op.extras.push_back({t.zero.ep.device, zr.first, zr.second, writes_scale,
+                           std::make_shared<const Intervals>(tile_bytes(tc, t.zero, t.upr, 1))});
     op.tile = std::move(k);
     op.tile_index[0] = std::move(hx), op.tile_index[1] = std::move(hc);
     op.tile_host_ptr[0] = by_ptr[0], op.tile_host_ptr[1] = by_ptr[1];
@@ -932,7 +953,7 @@ struct Engine::Impl {
     } else {
       calls = ex.run(s, g, ops, strm);
     }
-    if (measure && !had_cache && g.exec_cache[static_cast<int>(s)] != nullptr) {
+    if (measure && !had_cache && !g.churn && g.exec_cache[static_cast<int>(s)] != nullptr) {
       ex.release(a);
       tuner.discard(g.bucket, s);
     } else if (measure) {
@@ -1013,6 +1034,8 @@ struct Engine::Impl {
     const Hash128 key = h.done();
     const std::shared_ptr<const Plan>* found = plans.find(key);
     const bool hit = found != nullptr;
+    const bool churned_now = !hit && churned(ops);
+    churn_flushes += churned_now;
     std::shared_ptr<const Plan> pp;
     double plan_us = 0;
     if (hit) {
@@ -1026,6 +1049,7 @@ struct Engine::Impl {
         if (g.bandwidth > 0) g.candidates = {Strategy::paced};
         else if (!capturing) g.candidates = tuner.shortlist(exec_for(g.src, g.dst).candidates(g));
         g.bucket = bucket_key(g, static_cast<int>(g.ops.size()));
+        if (churned_now) g.churn = true, g.bucket += "|churn";
       }
       if (opt.log_plan) log(*p, ops.size());
       if (!capturing) {
@@ -1089,6 +1113,16 @@ struct Engine::Impl {
     bury(std::move(last_ops));
     last_ops = std::make_shared<std::vector<Op>>(std::move(ops));
     last_ran = std::move(ran);
+  }
+
+  // A plan-cache miss: is it one more of a structure that keeps missing?
+  bool churned(const std::vector<Op>& ops) {
+    if (capturing || recording || opt.disable || opt.prior_only) return false;
+    Hasher h;
+    for (const Op& op : ops) h.add(op.key.a), h.add(op.key.b);
+    const Hash128 k = h.done();
+    const int* seen = churn.find(k);
+    return churn.insert(k, seen ? *seen + 1 : 1) > kChurnMisses;
   }
 
   void synchronize() {
@@ -1321,6 +1355,7 @@ std::string Engine::stats_json() const {
       .set("plan_hits", m.plan_hits)
       .set("plan_us", m.total_plan_us)
       .set("native_ops", m.native_ops)
+      .set("churn_flushes", m.churn_flushes)
       .set("declined", std::move(declined))
       .set("kept", static_cast<uint64_t>(m.kept.size()))  // in-flight copies whose buffers are held
       .set("plans", static_cast<uint64_t>(m.plans.size()))

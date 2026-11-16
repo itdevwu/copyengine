@@ -141,6 +141,17 @@ Runs lower_form(const Form& f, const int64_t* stab, const int64_t* dtab) {
   return r;
 }
 
+static Intervals form_bytes(i64 base, std::array<i64, Form::kMaxRank> shape, const std::array<i64, Form::kMaxRank>& stride,
+                            int rank, int tab_dim, i64 bound, DType dt) {
+  const i64 sz = static_cast<i64>(itemsize(dt));
+  if (tab_dim >= 0) shape[tab_dim] = bound;  // any index within its bound
+  std::array<i64, Form::kMaxRank> sb{};
+  for (int k = 0; k < rank; ++k) sb[k] = stride[k] * sz;
+  return affine_bytes(base * sz, std::span<const i64>(shape.data(), rank), std::span<const i64>(sb.data(), rank), sz);
+}
+Intervals Form::src_bytes() const { return form_bytes(s_base, shape, ss, rank, stab_dim, sbound, sdt); }
+Intervals Form::dst_bytes() const { return form_bytes(d_base, shape, ds, rank, dtab_dim, dbound, ddt); }
+
 std::pair<i64, i64> Form::src_extent() const {
   auto sh = shape;
   if (stab_dim >= 0) sh[stab_dim] = sbound;  // any index within its bound
@@ -152,6 +163,56 @@ std::pair<i64, i64> Form::dst_extent() const {
   return extent_of(d_base, sh, ds, rank);
 }
 
+// ---- footprints --------------------------------------------------------------------
+
+Intervals affine_bytes(i64 base, std::span<const i64> shape, std::span<const i64> stride, i64 width, size_t cap) {
+  Intervals out;
+  if (width <= 0) return out;
+  struct Dim {
+    i64 n, s;
+  };
+  std::vector<Dim> dims;
+  for (size_t k = 0; k < shape.size(); ++k) {
+    if (shape[k] <= 0) return out;  // no units: nothing touched
+    if (shape[k] == 1 || stride[k] == 0) continue;
+    i64 s = stride[k];
+    if (s < 0) base += (shape[k] - 1) * s, s = -s;  // the same set, walked upwards
+    dims.push_back({shape[k], s});
+  }
+  std::sort(dims.begin(), dims.end(), [](const Dim& a, const Dim& b) { return a.s < b.s; });
+  // Dimensions whose step does not exceed the block so far extend it without a
+  // gap: the block stays one interval, exactly.
+  i64 len = width;
+  size_t k = 0;
+  for (; k < dims.size() && dims[k].s <= len; ++k) len += (dims[k].n - 1) * dims[k].s;
+  // The rest place copies of the block: enumerate them while they are few.
+  i64 count = 1, span = 0;
+  bool many = false;
+  for (size_t j = k; j < dims.size(); ++j) {
+    span += (dims[j].n - 1) * dims[j].s;
+    many = many || dims[j].n > static_cast<i64>(cap) || (count *= dims[j].n) > static_cast<i64>(cap);
+  }
+  if (many) {
+    out.start.push_back(base), out.end.push_back(base + span + len);
+    return out;
+  }
+  std::vector<i64> off(static_cast<size_t>(count)), lens(static_cast<size_t>(count), len);
+  std::vector<i64> idx(dims.size() - k, 0);
+  i64 at = base;
+  for (i64 n = 0; n < count; ++n) {
+    off[static_cast<size_t>(n)] = at;
+    for (size_t j = idx.size(); j-- > 0;) {
+      const Dim& d = dims[k + j];
+      if (++idx[j] < d.n) {
+        at += d.s;
+        break;
+      }
+      at -= (d.n - 1) * d.s, idx[j] = 0;
+    }
+  }
+  return interval_union(off, lens);
+}
+
 // ---- safety ----------------------------------------------------------------------
 
 const Runs& Op::runs() const {
@@ -161,26 +222,15 @@ const Runs& Op::runs() const {
 
 const Intervals& Op::read() const {
   const Runs& r = runs();
-  if (opaque && !body->rd) {  // the indices are not known on the host: every element an index may reach
-    const auto [lo, hi] = form->src_extent();
-    const i64 sz = static_cast<i64>(itemsize(src.dtype));
-    auto iv = std::make_unique<Intervals>();
-    iv->start.push_back(lo * sz), iv->end.push_back((hi + 1) * sz);
-    body->rd = std::move(iv);
-  }
+  if (opaque && !body->rd)  // the indices are not known on the host: every element an index may reach
+    body->rd = std::make_unique<Intervals>(form->src_bytes());
   if (!body->rd) body->rd = std::make_unique<Intervals>(interval_union(r.src, r.len, itemsize(src.dtype)));
   return *body->rd;
 }
 
 const Intervals& Op::write() const {
   const Runs& r = runs();
-  if (opaque && !body->wr) {  // exact when the destination has no table; else its whole bound
-    const auto [lo, hi] = form->dst_extent();
-    const i64 sz = static_cast<i64>(itemsize(dst.dtype));
-    auto iv = std::make_unique<Intervals>();
-    iv->start.push_back(lo * sz), iv->end.push_back((hi + 1) * sz);
-    body->wr = std::move(iv);
-  }
+  if (opaque && !body->wr) body->wr = std::make_unique<Intervals>(form->dst_bytes());
   if (!body->wr) body->wr = std::make_unique<Intervals>(interval_union(r.dst, r.len, itemsize(dst.dtype)));
   return *body->wr;
 }
@@ -220,8 +270,12 @@ std::vector<int> waves(const std::vector<Op>& ops) {
     auto& w = by_dev[{int(op.dst.device.kind), op.dst.device.index}];
     const Intervals& wr = op.write();
     for (size_t i = 0; i < wr.start.size(); ++i) w.push_back({wr.start[i], wr.end[i], k, true});
-    for (const Op::Extra& x : op.extras)  // a tile op's scale / zero point
-      by_dev[{int(x.device.kind), x.device.index}].push_back({x.lo, x.hi, k, x.write});
+    for (const Op::Extra& x : op.extras) {  // a tile op's scale / zero point
+      auto& v = by_dev[{int(x.device.kind), x.device.index}];
+      if (!x.bytes) v.push_back({x.lo, x.hi, k, x.write});
+      else
+        for (size_t i = 0; i < x.bytes->start.size(); ++i) v.push_back({x.bytes->start[i], x.bytes->end[i], k, x.write});
+    }
   }
   // (pred, succ) pairs with pred < succ, possibly repeated.
   std::vector<std::pair<int, int>> edges;

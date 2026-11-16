@@ -74,7 +74,10 @@ class Lazy:
 
     def index_select(self, dim: int, index):
         b = self._base
-        t = device_table(index, host_ok=b.is_cuda or b.endpoint.pinned)
+        # A step plan's host index parameter on any base: pinned or GPU memory
+        # (the statement kernel reads it), or pageable memory (DMA expanded per
+        # call); where the engine cannot take it the plan traces with values.
+        t = device_table(index, host_ok=True)
         if t is not None:  # stays on the GPU: the copy kernel reads it
             return self._with(select_device(self._access, dim, t), ("index_select", dim, t))
         idx = index_array(index)
@@ -100,9 +103,71 @@ class Lazy:
         shape = shape[0] if len(shape) == 1 and isinstance(shape[0], (list, tuple)) else shape
         return self._with(self._access.reshape(list(shape)), ("reshape", tuple(shape)))
 
+    def narrow(self, dim: int, start: int, length: int):
+        return self.slice(dim, start, start + length)
+
+    def __getitem__(self, key):
+        return apply_index(self, key)
+
     def as_view(self) -> View:
         b = self._base
         return View(b.obj, b.endpoint, self._access, b.is_cuda, b.device_index)
+
+
+def apply_index(x, key):
+    """``x[key]`` as torch indexes a tensor, with the ops a lazy view has: integers
+    (select), slices with a positive step, ``...``, ``None`` (unsqueeze) and one
+    1-D integer index (index_select at its position). Boolean masks and several
+    index arrays are refused (their result depends on the values)."""
+    try:
+        import torch
+    except ImportError:  # numpy only
+        torch = None
+
+    def tensor(k):
+        return torch is not None and isinstance(k, torch.Tensor)
+
+    key = key if isinstance(key, tuple) else (key,)
+    if sum(k is Ellipsis for k in key) > 1:
+        raise IndexError("an index can only have a single ellipsis ('...')")
+    used = sum(1 for k in key if k is not None and k is not Ellipsis)
+    rank = len(x.shape)
+    if used > rank:
+        raise IndexError(f"too many indices for a view of {rank} dimensions: {used}")
+    skip, arrays, d = rank - used, 0, 0
+    for k in key:
+        if k is Ellipsis:
+            d += skip
+        elif k is None:
+            x = x.unsqueeze(d)
+            d += 1
+        elif isinstance(k, slice):
+            step = 1 if k.step is None else k.step
+            if step <= 0:
+                raise ValueError("step must be greater than zero")
+            if not (k.start is None and k.stop is None and step == 1):
+                start, stop = k.start, k.stop
+                if (start is not None and start < 0) or (stop is not None and stop < 0):
+                    start, stop, _ = slice(start, stop).indices(x.shape[d])
+                x = x.slice(d, start, stop, step)
+            d += 1
+        elif isinstance(k, bool) or (tensor(k) and k.dtype == torch.bool) or (
+                isinstance(k, np.ndarray) and k.dtype == np.bool_):
+            raise TypeError("boolean masks are not supported: the result's size would depend on the values")
+        elif isinstance(k, (int, np.integer)) or (tensor(k) and k.dim() == 0):
+            i = int(k)
+            x = x.select(d, i + x.shape[d] if i < 0 else i)
+        elif isinstance(k, (list, tuple, np.ndarray)) or tensor(k):
+            arrays += 1
+            if arrays > 1:
+                raise TypeError("only one index array per view (use index_select on each dimension)")
+            if (k.dim() if tensor(k) else np.asarray(k).ndim) != 1:
+                raise TypeError("index arrays must be 1-D")
+            x = x.index_select(d, k)
+            d += 1
+        else:
+            raise TypeError(f"unsupported index {type(k).__name__}")
+    return x
 
 
 def device_table(index, host_ok: bool = False):

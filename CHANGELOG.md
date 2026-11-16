@@ -6,6 +6,30 @@ change incompatibly only in a new minor (0.x) or major release.
 
 ## Unreleased
 
+- Dependencies between copies use each op's exact footprint on every tensor
+  it touches (an index the host does not know spanning its bound) instead of
+  its hull: copies and quantizations into disjoint column slices of one pool
+  (a block-major host pool `[blocks, layer bytes]`, say) run together instead
+  of one after another; overlapping ones stay ordered.
+
+- Copies that keep arriving at new addresses (views of a pool picked per
+  call, `copy_many([pool[i] for i in ids], ...)`) settle: their plans are
+  tuned in buckets of their own with each strategy's setup counted (before,
+  setup runs were no samples, so such copies explored and synchronized
+  forever; `stats()["churn_flushes"]` counts them). `copy_many` is measured
+  against `torch._foreach_copy_` per call layout and keeps the faster
+  (`stats()["copy_many"]`); `freeze()` after a call torch ran refuses
+  instead of freezing an older flush. A step plan over the pool and the
+  indices plans such copies once.
+
+- Step plans replay copies with host indices into and out of pageable host
+  memory (before: refused), and accept tensors the step names instead of
+  taking them as arguments (closure variables, globals, attributes of a bound
+  method's object), checked to be the same views before each replay.
+
+- Lazy views index like tensors: `ce.lazy(t)[:, a:b]`, integers, `...`,
+  `None`, one index array; and `narrow`.
+
 - Quantization kernels launch as many warps as have work: a warp handles
   several small groups (MX, NVFP4, the 128-value formats), and the grid used
   to count one warp per group, most of them idle.

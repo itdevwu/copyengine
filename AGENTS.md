@@ -13,6 +13,12 @@
 - `src/backends/cuda`: driver loader (dlopen + `cuGetProcAddress` at the
   header's `CUDA_VERSION`), probe, executor, and `kernels.cu` (AOT fatbin,
   embedded by `cmake/embed.cmake`).
+- Everything the CUDA executor writes for the kernels to read is defined once,
+  in `src/backends/cuda/abi.hpp` (and `src/core/tile.hpp`), included by both:
+  fixed-width types, device addresses as `uint64_t`, driver objects (a
+  `CUtensorMap`) as bytes, `static_assert`s on sizes and offsets. The kernels
+  are admitted only if their layout fingerprint (`ce_layout`) equals the
+  executor's.
 - `src/core/convert.hpp` is shared verbatim by host code and CUDA kernels;
   host and device conversions must stay bit-identical (no FMA: host files use
   `-ffp-contract=off`, kernels `--fmad=false`).

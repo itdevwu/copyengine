@@ -48,6 +48,34 @@ struct TileK {
 
 CE_HD void* addr(long long a) { return reinterpret_cast<void*>(static_cast<uintptr_t>(a)); }
 
+// The kernels' vector path: values per chunk `w` (8 where the unit allows,
+// from 32 values: two adjacent 4-value accesses; else 4) and threads per unit,
+// a power of two dividing the warp (or the whole warp, looping, for long
+// units): a warp's loads cover whole units, contiguous. tpu 0: no vector path.
+// Here so the executor sizes launches from the same shape the kernels use.
+struct VecShape {
+  int w, tpu;
+};
+CE_HD VecShape tile_shape(const TileK& t) {
+  if (!t.vec) return {4, 0};
+  auto fit = [](int per) { return per >= 32 ? 32 : ((per & (per - 1)) == 0 ? per : 0); };
+  if (t.g % 8 == 0 && t.g >= 32)  // at least 4 threads per unit (fewer spread a load over many units)
+    if (const int tpu = fit(t.g >> 3)) return {8, tpu};
+  return {4, fit(t.g >> 2)};
+}
+
+// Warps with work in a launch for `t`: a box or a scalar-path unit takes a
+// warp; the vector path puts 32 / tpu units on one. A larger grid only has
+// blocks that load the descriptor and leave.
+CE_HD long long tile_warps(const TileK& t) {
+  const long long units = t.rows[0] * t.rows[1] * t.rows[2] * t.upr;
+  if (t.bh > 1) return units;
+  const VecShape v = tile_shape(t);
+  if (!v.tpu) return units;
+  const long long upw = 32 / v.tpu;
+  return (units + upw - 1) / upw;
+}
+
 // Byte offsets of unit u's row in each tensor, and its index in the row;
 // `bad`: an index table held an index out of range (the unit is skipped).
 struct UnitAt {

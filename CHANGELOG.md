@@ -6,6 +6,15 @@ change incompatibly only in a new minor (0.x) or major release.
 
 ## Unreleased
 
+- Quantization kernels launch as many warps as have work: a warp handles
+  several small groups (MX, NVFP4, the 128-value formats), and the grid used
+  to count one warp per group, most of them idle.
+
+- The structures the CUDA executor passes to the kernels are defined once,
+  for both compilers, with their sizes and offsets checked; the kernels are
+  admitted only if their layout matches the executor's (a `CUtensorMap`'s
+  alignment differs between CUDA headers).
+
 - `ce.rearrange` / `ce.repeat`: einops' patterns on lazy views, also inside
   torch.compile regions, where einops' own functions may be graph nodes a
   lazy view cannot enter.

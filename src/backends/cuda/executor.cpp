@@ -10,6 +10,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "backends/cuda/abi.hpp"
 #include "backends/cuda/driver.hpp"
 #include "copyengine/frontend.hpp"
 #include "backends/host/host.hpp"
@@ -24,10 +25,10 @@ namespace {
 
 using cuda::Driver;
 
-// Mirrors the kernel's chunk: rows x width elements at constant pitches.
-struct Chunk {
-  long long src, dst, width, rows, spitch, dpitch;
-};
+// The structures the kernels read (abi.hpp: one definition for both sides).
+using cuabi::Base;
+using cuabi::Chunk;
+using cuabi::StmtDesc;
 
 // Packs (src, dst, len) parts, in order, into kernel chunks: consecutive parts
 // of equal length at constant pitches (any src pitch, including 0) share a
@@ -76,19 +77,6 @@ struct Raw {
   size_t bytes;
 };
 
-// Mirror the kernel's structured-statement parameters (kernels.cu).
-struct StmtDesc {
-  int rank, sdt, ddt, mode;
-  int vec;  // destination elements per thread (innermost dim)
-  unsigned numel;
-  unsigned shape[6];
-  unsigned magic[6], shift[6];  // division by shape[k] as multiply + shift (see kernels.cu)
-  long long ss[6], ds[6];
-  // device index tables (Base::stab / dtab): dimension, step and bound per side; -1: none
-  int stab_dim, dtab_dim;
-  long long stab_step, dtab_step, sbound, dbound;
-  unsigned long long err;  // device word set when an index is out of its bound
-};
 
 // Magic number and shift such that n / d == (umulhi(n, magic) + n) >> shift
 // for every n < 2^31 (the divider PyTorch's IntDivider uses).
@@ -99,10 +87,6 @@ void int_divider(unsigned d, unsigned* magic, unsigned* shift) {
   *magic = static_cast<unsigned>(((uint64_t{1} << 32) * ((uint64_t{1} << s) - d)) / d + 1);
 }
 
-struct Base {
-  long long src, dst;
-  unsigned long long stab, dtab;  // this statement's device index tables (0: none)
-};
 
 struct BaseEntry {
   std::shared_ptr<void> table;    // DevTable holding the bases
@@ -826,6 +810,22 @@ class CudaExecutor final : public Executor {
     }
     s.kernels = true;  // provisionally, so the verification can launch
     try {
+      {  // the tables' layout as the kernels see it (abi.hpp): else nothing they read is right
+        CUdeviceptr out = 0;
+        check(d_->cuMemAlloc(&out, 8), "cuMemAlloc");
+        CUfunction f = function(s, "ce_layout");
+        void* args[] = {&out};
+        unsigned long long got = 0;
+        check(d_->cuLaunchKernel(f, 1, 1, 1, 1, 1, 1, 0, s.side, args, nullptr), "cuLaunchKernel ce_layout");
+        check(d_->cuMemcpyDtoHAsync(&got, out, 8, s.side), "cuMemcpyDtoHAsync");
+        check(d_->cuStreamSynchronize(s.side), "cuStreamSynchronize");
+        d_->cuMemFree(out);
+        if (got != cuabi::layout_fingerprint()) {
+          s.kernels = false;
+          s.kernel_error = "kernel admission: the kernels' table layout differs from the executor's (abi.hpp)";
+          return;
+        }
+      }
       {  // the float8_e4m3fn overflow mode of the installed torch (convert.hpp)
         CUdeviceptr g = 0;
         size_t sz = 0;
@@ -1341,13 +1341,9 @@ class CudaExecutor final : public Executor {
     }
   };
 
-  static constexpr int kPutWords = 480;  // as in kernels.cu
+  static constexpr int kPutWords = cuabi::kPutWords;
   static constexpr size_t kCaptureArena = 256 << 10;  // bytes of bases CUDA graph captures may record per device
-  struct Put {
-    CUdeviceptr dst;
-    int n;
-    unsigned long long w[kPutWords];
-  };
+  using Put = cuabi::Put;  // abi.hpp
 
   // A batch's bases for one CUDA graph capture, written by ce_put nodes so
   // replays read the bases recorded at capture time. They live in an arena
@@ -1453,7 +1449,7 @@ class CudaExecutor final : public Executor {
   // Pure device copies through shared memory: the chunk table of `kernel`,
   // one warp per block (the shared buffers are per block).
   static constexpr int64_t kBulkMinBytes = 1 << 20;
-  static constexpr int kBulkBufs = 4;          // kernels.cu: kBufs
+  static constexpr int kBulkBufs = cuabi::kBulkBufs;
   static constexpr int kBulkBlocksPerSm = 8;
   int64_t bulk(Dev& s, const Group& g, CUstream st) {
     auto& slot = g.exec_cache[static_cast<int>(Strategy::bulk)];
@@ -1473,17 +1469,9 @@ class CudaExecutor final : public Executor {
 
   // ---- 2-D blocks through tensor maps (sm90+) ---------------------------------------------
 
-  // Mirrors kernels.cu TmaBlock: a source and a destination tensor map (their
-  // bytes: CUtensorMap's own alignment differs between CUDA headers, 64 or
-  // 128), the block (bytes x rows) and the box. 128-byte aligned, 384 bytes.
-  struct alignas(128) TmaBlock {
-    unsigned char src[128], dst[128];
-    int width, height, bw, bh;
-  };
-  static_assert(sizeof(CUtensorMap) == 128 && sizeof(TmaBlock) == 384 && offsetof(TmaBlock, dst) == 128 &&
-                    offsetof(TmaBlock, width) == 256,
-                "TmaBlock mirrors kernels.cu");
-  static constexpr int kTmaBox = 8192;  // kernels.cu: bytes per box
+  using TmaBlock = cuabi::TmaBlock;  // abi.hpp
+  static_assert(sizeof(CUtensorMap) == sizeof(TmaBlock::src), "a tensor map's bytes");
+  static constexpr int kTmaBox = cuabi::kTmaBox;
 
   // What the hardware takes: 16-byte aligned addresses and pitches, widths up
   // to 2^32, and the box from the width (up to 256 bytes) and kTmaBox.
@@ -1697,11 +1685,12 @@ class CudaExecutor final : public Executor {
 
   void launch_tiles(Dev& s, const Group& g, const std::vector<Op>& ops, CUdeviceptr table, CUstream st) {
     long long most = 0;
-    for (int k : g.ops) most = std::max(most, ops[k].tile->units());
+    for (int k : g.ops) most = std::max(most, cv::tile_warps(*ops[k].tile));
     launch_tiles(s, *ops[g.ops[0]].tile, table, static_cast<int>(g.ops.size()), most, st);
   }
 
-  // `count` TileKs at `table`, of t0's format and direction (a group shares them).
+  // `count` TileKs at `table`, of t0's format and direction (a group shares
+  // them); `most`: the most warps one of them has work for (cv::tile_warps).
   void launch_tiles(Dev& s, const cv::TileK& t0, CUdeviceptr table, int count, long long most, CUstream st) {
     const std::string name = std::string(t0.quantize ? "ce_tile_q" : "ce_tile_d") + std::to_string(t0.fmt);
     CUfunction f = function(s, name);
@@ -1911,7 +1900,7 @@ class CudaExecutor final : public Executor {
           else if (slot != kNoIndex) slot += static_cast<size_t>(p.a);  // host values: from row a on
           else tab += p.a * 8;                                          // a GPU table
         }
-        r.units = std::max(r.units, t.units());
+        r.units = std::max(r.units, cv::tile_warps(t));  // (warps, for the launch)
         v.push_back(t);
         vat.push_back(o);
       }
@@ -2229,7 +2218,7 @@ class CudaExecutor final : public Executor {
     for (size_t i = 0; i < g.forms.size(); ++i) {
       FusedBatch& b = P.batches[batch_of[i]];
       Base& base = b.bases[seen[batch_of[i]]++];
-      long long& link = P.h2d ? base.src : base.dst;
+      int64_t& link = P.h2d ? base.src : base.dst;
       const i64 byte = static_cast<i64>(link) * b.link_size;
       const size_t k = static_cast<size_t>(std::upper_bound(iv.start.begin(), iv.start.end(), byte) - iv.start.begin()) - 1;
       link = (off[k] + (byte - iv.start[k])) / b.link_size;

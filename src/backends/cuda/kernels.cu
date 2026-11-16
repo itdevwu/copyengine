@@ -8,14 +8,13 @@
 //
 // Build with --fmad=false: conversions must match the host backend bit for bit.
 
+#include "backends/cuda/abi.hpp"
 #include "core/convert.hpp"
 #include "core/tile.hpp"
 
 namespace {
 
-struct Chunk {
-  long long src, dst, width, rows, spitch, dpitch;
-};
+using Chunk = ce::cuabi::Chunk;  // abi.hpp: the executor's layout
 
 using namespace ce::cv;
 
@@ -144,7 +143,7 @@ __device__ __forceinline__ void bytes_one(Chunk c, int lane) {
 // pitches) take the plain warp copy. Other architectures: the plain copy (the
 // executor only offers this kernel where it was admitted).
 
-constexpr int kBufs = 4;  // segments in flight per block
+constexpr int kBufs = ce::cuabi::kBulkBufs;  // segments in flight per block
 
 struct Segs {  // the segments of one chunk
   const Chunk& c;
@@ -296,21 +295,11 @@ extern "C" __global__ void __launch_bounds__(32) ce_bytes_bulk(const Chunk* __re
 // one per row segment. Loads past the block fill zeros, stores past it are
 // clipped by the hardware, so edge boxes need no special case.
 
-// The layout is fixed here and in the executor (not CUtensorMap's alignment,
-// which differs between CUDA headers): 128-byte aligned, 384 bytes.
-struct alignas(128) TmaMap {
-  unsigned long long w[16];  // a CUtensorMap's bytes
-};
-struct alignas(128) TmaBlock {
-  TmaMap src, dst;
-  int width, height;  // bytes, rows
-  int bw, bh;         // the box
-};
-static_assert(sizeof(TmaMap) == 128 && sizeof(TmaBlock) == 384, "TmaBlock mirrors the executor's");
+using TmaBlock = ce::cuabi::TmaBlock;  // abi.hpp
 
 extern "C" __global__ void __launch_bounds__(32) ce_bytes_tma2d(const TmaBlock* __restrict__ blocks, int n) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-  constexpr int kTmaBox = 8192;  // bytes per box (bw x bh), two per block; the executor sizes boxes to it
+  constexpr int kTmaBox = ce::cuabi::kTmaBox;  // bytes per box (bw x bh), two per block
   __shared__ alignas(128) unsigned char buf[2][kTmaBox];
   __shared__ alignas(8) unsigned long long bar[2];
   if (threadIdx.x != 0) return;
@@ -398,28 +387,11 @@ extern "C" __global__ void ce_pace(unsigned long long* next, unsigned long long 
 // consecutive elements of the innermost dimension (the host checks it divides
 // that dimension, which is contiguous and vec-aligned on the destination) and
 // stores them as one access.
-struct StmtDesc {
-  int rank, sdt, ddt, mode;  // mode 0: raw element copy, 1: cast, 2: apply fn
-  int vec;
-  unsigned numel;
-  unsigned shape[6];
-  unsigned magic[6], shift[6];  // n / shape[k] == (umulhi(n, magic) + n) >> shift, for n < 2^31
-  long long ss[6], ds[6];
-  // Device index tables: on dimension stab_dim (dtab_dim) the index is read
-  // from Base::stab (dtab), step int64s apart, and must lie in [0, bound);
-  // an index outside it skips the element and sets *err. -1: no table.
-  int stab_dim, dtab_dim;
-  long long stab_step, dtab_step, sbound, dbound;
-  unsigned long long* err;
-};
+using StmtDesc = ce::cuabi::StmtDesc;  // abi.hpp
 
-struct Base {
-  long long src, dst;
-  const long long* stab;
-  const long long* dtab;
-};
+using Base = ce::cuabi::Base;  // abi.hpp
 
-constexpr int kPutWords = 480;  // ce_put's parameters stay under the 4 KB limit
+constexpr int kPutWords = ce::cuabi::kPutWords;  // ce_put's parameters stay under the 4 KB limit
 
 __device__ __forceinline__ void element(const void* sp, void* dp, const StmtDesc& D, const Fn& fn) {
   if (D.mode == 0) {
@@ -473,18 +445,18 @@ __device__ __forceinline__ void stmt_body(const Base* __restrict__ bases, long l
       r = q;
       long long is = i, id = i;
       if (k == D.stab_dim) {
-        is = B.stab[static_cast<long long>(i) * D.stab_step];
+        is = reinterpret_cast<const long long*>(B.stab)[static_cast<long long>(i) * D.stab_step];
         skip |= is < 0 || is >= D.sbound;
       }
       if (k == D.dtab_dim) {
-        id = B.dtab[static_cast<long long>(i) * D.dtab_step];
+        id = reinterpret_cast<const long long*>(B.dtab)[static_cast<long long>(i) * D.dtab_step];
         skip |= id < 0 || id >= D.dbound;
       }
       so += is * D.ss[k];
       dof += id * D.ds[k];
     }
     if (skip) {
-      atomicOr(D.err, 1ull);
+      atomicOr(reinterpret_cast<unsigned long long*>(D.err), 1ull);
       continue;
     }
     if (D.vec == 1) {
@@ -519,14 +491,15 @@ __device__ __forceinline__ void stmt_body(const Base* __restrict__ bases, long l
 // Writes words carried in the kernel's parameters to device memory: inside a
 // CUDA graph capture the values become part of the kernel node, so no host
 // buffer has to outlive the capture (pinned allocation is illegal there).
-struct Put {
-  unsigned long long* dst;
-  int n;
-  unsigned long long w[kPutWords];
-};
+using Put = ce::cuabi::Put;  // abi.hpp
+
+// The layout fingerprint of the structures above as this compilation sees them
+// (abi.hpp): the executor admits the kernels only if it equals its own.
+extern "C" __global__ void ce_layout(unsigned long long* out) { *out = ce::cuabi::layout_fingerprint(); }
 
 extern "C" __global__ void ce_put(Put p) {
-  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < p.n; i += gridDim.x * blockDim.x) p.dst[i] = p.w[i];
+  auto* dst = reinterpret_cast<unsigned long long*>(p.dst);
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < p.n; i += gridDim.x * blockDim.x) dst[i] = p.w[i];
 }
 
 extern "C" __global__ void ce_stmt(const Base* __restrict__ bases, long long count, StmtDesc D, Fn fn, long long sadd,
@@ -840,22 +813,6 @@ __device__ __forceinline__ void store4(long long p, int dt, const float v[4]) {
       make_uint2(h[0] | (static_cast<uint32_t>(h[1]) << 16), h[2] | (static_cast<uint32_t>(h[3]) << 16));
 }
 
-// Values per chunk W (8 where the unit allows, from 32 values: two adjacent 4-value
-// accesses, twice the bytes in flight per thread at about the same
-// registers; else 4) and threads per unit: a power of two dividing the warp
-// (or the whole warp, looping, for long units). A warp's loads cover whole
-// units, contiguous. tpu 0: the vector path does not apply.
-struct VecShape {
-  int w, tpu;
-};
-__device__ __forceinline__ VecShape tile_shape(const cv::TileK& t) {
-  if (!t.vec) return {4, 0};
-  auto fit = [](int per) { return per >= 32 ? 32 : ((per & (per - 1)) == 0 ? per : 0); };
-  if (t.g % 8 == 0 && t.g >= 32)  // at least 4 threads per unit (fewer spread a load over many units)
-    if (const int tpu = fit(t.g >> 3)) return {8, tpu};
-  return {4, fit(t.g >> 2)};
-}
-
 template <int W>
 __device__ __forceinline__ void loadw(long long p, int dt, float* v) {
   const long long step = 4LL * (dt == cv::kF32 ? 4 : 2);
@@ -1096,7 +1053,7 @@ __device__ __forceinline__ void tile_kernel(const cv::TileK* __restrict__ tiles,
         continue;
       }
     }
-    if (const VecShape v = tile_shape(t); v.tpu) {
+    if (const cv::VecShape v = cv::tile_shape(t); v.tpu) {
       // NVFP4's units are 16 values: its kernels hold only the 4-wide path.
       if constexpr (F != static_cast<int>(cv::QFmt::nvfp4)) {
         if (v.w == 8) {

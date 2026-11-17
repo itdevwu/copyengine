@@ -196,9 +196,9 @@ struct Engine::Impl {
     Kept k;
     std::vector<int> devs;
     for (const Op& op : ops) {
-      const bool host = op.src.device.kind == DeviceKind::host || op.dst.device.kind == DeviceKind::host;
+      const bool host_side = op.src.device.kind == DeviceKind::host || op.dst.device.kind == DeviceKind::host;
       const bool cuda_side = op.src.device.kind == DeviceKind::cuda || op.dst.device.kind == DeviceKind::cuda;
-      if (!op.native || !host || !cuda_side || !(op.host_async || opt.allow_async)) continue;
+      if (!op.native || !host_side || !cuda_side || !(op.host_async || opt.allow_async)) continue;
       k.payloads.push_back(op.native);
       const int dev = op.src.device.kind == DeviceKind::cuda ? op.src.device.index : op.dst.device.index;
       if (std::find(devs.begin(), devs.end(), dev) == devs.end()) devs.push_back(dev);
@@ -396,7 +396,7 @@ struct Engine::Impl {
   // One op in online_every still goes through the queue and the tuner, which
   // keeps re-checking the decision (it stands for the runs that skipped it).
   bool native_now(Op& op) {
-    if (!op.native || opt.prior_only || recording) return false;
+    if (!op.native || opt.prior_only || !opt.force.empty() || recording) return false;
     if (opt.disable) return true;
     if (merges_with_tail(op)) return false;
     auto it = keys.find(op.key);
@@ -736,9 +736,9 @@ struct Engine::Impl {
         const long long row2 = t.upr * unit;
         return (t.rows[2] == 1 || r[2] == row2) && (t.rows[1] == 1 || r[1] == t.rows[2] * row2);
       };
-      bool f = t.bh == 1 && flat(k->xr, t.g * k->xe) && flat(k->qr, qv * k->qe) && flat(k->sr, k->se);
-      if (zero) f = f && flat(k->zr, k->ze);
-      k->flat = f;
+      bool is_flat = t.bh == 1 && flat(k->xr, t.g * k->xe) && flat(k->qr, qv * k->qe) && flat(k->sr, k->se);
+      if (zero) is_flat = is_flat && flat(k->zr, k->ze);
+      k->flat = is_flat;
     }
     // Index tables: host values live with the op (the executor reads them, or
     // uploads them for a kernel); GPU ones are this call's pointer.
@@ -771,8 +771,13 @@ struct Engine::Impl {
     auto body = std::make_shared<OpBody>();
     Intervals xb = tile_bytes(tx, t.x, vals, static_cast<int64_t>(itemsize(xd)));
     Intervals qb = tile_bytes(tc, t.q, packed ? vals / 2 : vals, 1);
-    body->rd = std::make_unique<Intervals>(t.quantize ? std::move(xb) : std::move(qb));
-    body->wr = std::make_unique<Intervals>(t.quantize ? std::move(qb) : std::move(xb));
+    if (t.quantize) {
+      body->rd = std::make_unique<Intervals>(std::move(xb));
+      body->wr = std::make_unique<Intervals>(std::move(qb));
+    } else {
+      body->rd = std::make_unique<Intervals>(std::move(qb));
+      body->wr = std::make_unique<Intervals>(std::move(xb));
+    }
     op.body = std::move(body);
     const bool writes_scale = t.quantize && !t.static_scale;
     op.extras.push_back({t.scale.ep.device, sr.first, sr.second, writes_scale,
@@ -808,12 +813,12 @@ struct Engine::Impl {
       // in the staging budget: a row (or, where rows interleave, the whole
       // op) must fit in half of it.
       const auto al = [](int64_t b) { return (b + 255) & ~int64_t{255}; };
-      bool host = false, ok = true, c_host = false, c_dev = false, split = t.rows[0] > 1;
+      bool any_host = false, ok = true, c_host = false, c_dev = false, split = t.rows[0] > 1;
       int64_t row_bytes = 0, whole_bytes = 0;
       for (const S& s : ss) {
         if (&s.index == &t.index && s.index.used()) (s.side.ep.device.kind == DeviceKind::host ? c_host : c_dev) = true;
         if (s.side.ep.device.kind != DeviceKind::host) continue;
-        host = true;
+        any_host = true;
         const auto e1 = tile_extent(t1, s.side, s.count, s.width);
         const int64_t span1 = e1.second - e1.first;
         int64_t span = s.e.second - s.e.first, need = t.rows[0] * t.rows[1] * t.rows[2] * s.count * s.width;
@@ -829,8 +834,8 @@ struct Engine::Impl {
         ok = ok && (s.input ? span <= 2 * need : span == need);
       }
       ok = ok && !(c_host && c_dev) && (split ? row_bytes : whole_bytes) <= opt.staging_budget / 2;
-      op.tile_host = host;
-      op.tile_staged_ok = host && ok && dev.kind == DeviceKind::cuda;
+      op.tile_host = any_host;
+      op.tile_staged_ok = any_host && ok && dev.kind == DeviceKind::cuda;
     }
     op.tile_dev_index = t.x_index.dev || t.index.dev;
     op.opaque = true;
@@ -1079,6 +1084,7 @@ struct Engine::Impl {
       if (capturing) p = {capture_choice(g, ops, opt.disable ? std::optional<Strategy>(c.baseline) : std::nullopt), false};
       else if (g.bandwidth > 0) p = {Strategy::paced, false};
       else if (!opt.disable) p = tuner.pick(g.bucket, c, runs);
+      if (!capturing && !opt.force.empty() && g.bandwidth == 0) p = forced(g, ops, p);
       if (!capturing && ops.size() == 1 && plan.groups.size() == 1 && !p.measure &&
           (opt.disable || g.bandwidth > 0 || tuner.locked(g.bucket)))
         memo = {true, ops.front().fp, pp, p.strategy, 0};
@@ -1115,9 +1121,27 @@ struct Engine::Impl {
     last_ran = std::move(ran);
   }
 
+  // Engine options' `force` (tests): that strategy where the executor offers it.
+  Tuner::Pick forced(const Group& g, const std::vector<Op>& ops, Tuner::Pick p) {
+    const Strategy f = parse_strategy(opt.force);
+    if (f == Strategy::native) {
+      if (std::all_of(g.ops.begin(), g.ops.end(), [&](int k) { return ops[k].native != nullptr; })) return {f, false};
+      return {p.strategy, false};
+    }
+    const std::vector<Strategy> all = exec_for(g.src, g.dst).candidates(g);
+    const auto has = [&](Strategy s) { return std::find(all.begin(), all.end(), s) != all.end(); };
+    if (has(f)) return {f, false};
+    // Elsewhere the most conservative choice, so a failure belongs to the forced strategy.
+    if (std::all_of(g.ops.begin(), g.ops.end(), [&](int k) { return ops[k].native != nullptr; }))
+      return {Strategy::native, false};
+    for (Strategy s : {Strategy::runs, Strategy::batch, Strategy::staged, Strategy::lowered, Strategy::tile})
+      if (has(s)) return {s, false};
+    return {all.empty() ? p.strategy : all.front(), false};
+  }
+
   // A plan-cache miss: is it one more of a structure that keeps missing?
   bool churned(const std::vector<Op>& ops) {
-    if (capturing || recording || opt.disable || opt.prior_only) return false;
+    if (capturing || recording || opt.disable || opt.prior_only || !opt.force.empty()) return false;
     Hasher h;
     for (const Op& op : ops) h.add(op.key.a), h.add(op.key.b);
     const Hash128 k = h.done();
@@ -1178,7 +1202,9 @@ Engine::~Engine() {
     Locked lk(*impl_);
     impl_->flush();
     impl_->synchronize();
-  } catch (...) {
+  } catch (const std::exception& e) {  // a destructor cannot throw: say what was lost
+    std::fprintf(stderr, "[copyengine] engine destroyed with copies that failed: %s\n", e.what());
+  } catch (...) {  // NOLINT(bugprone-empty-catch): reported above when it is a std::exception
   }
   // Plans own device tables freed through the executor: drop them while it
   // still exists (members would otherwise outlive it and leak the memory).

@@ -94,6 +94,33 @@
 - Intercepted `copy_` keeps the caller's `non_blocking` semantics; explicit
   `ce.copy_` returns with host-side copies complete.
 
+## Review checklist
+
+Most defects so far came from deciding on a related property instead of the
+one the decision depends on. Check every change, and every new feature before
+it merges, against these:
+
+1. **The property itself.** A decision checks what it depends on, not a
+   proxy: the same storage, not the same Python object; mapped for kernels at
+   that address, not pinned; every row start aligned (base and outer strides),
+   not the base; the values, not the address that held them.
+2. **Where and when memory is touched.** For every access: on which stream,
+   or on the CPU, at call time or at execution time; and what orders it after
+   the work that writes those bytes. torch's own copy is stream-ordered only
+   for pinned, same-dtype, non-blocking copies; otherwise it touches host
+   memory on the CPU when called.
+3. **Lifetimes.** What asynchronous work or a replay will use later is owned
+   (held), not referenced by a pointer: index tensors, storages, staging,
+   tables.
+4. **Cache keys and replays.** A key covers every input its builder reads; a
+   replay verifies every assumption it was built on, or owns it.
+5. **Admission.** The verified test object has the properties of the objects
+   it admits (allocation kind, mapping, alignment, context).
+6. **Baselines.** No result depends on which side wins a measurement: a
+   baseline is offered only where its bits equal copyengine's.
+7. **Bounds.** Narrowing conversions, overflow, zero and empty sizes, grid and
+   parameter limits.
+
 ## Scope
 
 - Commit code, and the design document of what the current version builds
@@ -108,6 +135,10 @@
   and runs pytest (CUDA tests skip without a GPU).
 - GPU work runs inside `just docker-shell`.
 - `python bench/bench_torch.py` compares against torch on a GPU.
+- `just tidy` (clang-tidy, also in CI), `just fuzz` (random copy programs
+  against torch, every strategy forced) and `just sanitize`
+  (compute-sanitizer) run before a pre-release; a feature merges after a
+  review against the checklist above.
 
 ## Branches, commits and releases
 

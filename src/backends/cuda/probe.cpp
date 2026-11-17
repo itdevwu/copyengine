@@ -272,7 +272,7 @@ Json bench(const Dev& x, bool have_batch) {
       srcs[i] = reinterpret_cast<CUdeviceptr>(static_cast<uint8_t*>(pinned) + i * seg);
       dsts[i] = a + ((i * 7919) % count) * 2 * seg;  // scattered, non-overlapping
     }
-    const double bytes = double(count) * seg;
+    const double bytes = double(count) * static_cast<double>(seg);
     Json row = Json::object().set("segment_bytes", static_cast<uint64_t>(seg)).set("segments", static_cast<uint64_t>(count));
     double loop = time_s(x, [&] {
       for (size_t i = 0; i < count; ++i)

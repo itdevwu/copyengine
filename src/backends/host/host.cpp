@@ -220,9 +220,9 @@ int64_t HostExecutor::run(Strategy s, const Group& g, const std::vector<Op>& ops
       pool_.parallel_for(static_cast<int64_t>(tasks.size()), [&](int64_t i) {
         const Task& t = tasks[i];
         for (i64 h = t.row0; h < t.row1; ++h) {
-          const i64 s = R.src[t.r] + h * R.src_pitch[t.r] + t.col0, d = R.dst[t.r] + h * R.dst_pitch[t.r] + t.col0;
-          host_copy(reinterpret_cast<const void*>(addr(s, g.src.dtype)), g.src.dtype,
-                    reinterpret_cast<void*>(addr(d, g.dst.dtype)), g.dst.dtype, t.col1 - t.col0, g.fn);
+          const i64 sa = R.src[t.r] + h * R.src_pitch[t.r] + t.col0, da = R.dst[t.r] + h * R.dst_pitch[t.r] + t.col0;
+          host_copy(reinterpret_cast<const void*>(addr(sa, g.src.dtype)), g.src.dtype,
+                    reinterpret_cast<void*>(addr(da, g.dst.dtype)), g.dst.dtype, t.col1 - t.col0, g.fn);
         }
       });
       return static_cast<int64_t>(tasks.size());

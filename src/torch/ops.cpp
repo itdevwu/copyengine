@@ -310,7 +310,9 @@ void check_index(const Tensor& index, const Tensor& on) {
 void indexed(Tensor dst, Tensor src, int side, int64_t dim, Tensor index, int64_t engine) {
   STD_TORCH_CHECK(g_api && g_api->copy_indexed, "[copyengine:3] copyengine._torch is not bound to copyengine._core");
   check_index(index, side == 0 ? src : dst);
-  if (dim < 0) dim += side == 0 ? src.dim() : dst.dim();
+  const int64_t rank = side == 0 ? src.dim() : dst.dim();
+  if (dim < 0) dim += rank;
+  STD_TORCH_CHECK(dim >= 0 && dim < rank, "[copyengine:0] dim out of range");
   const ce::Endpoint de = endpoint(dst), se = endpoint(src);
   std::shared_ptr<ce::NativeOp> native;
   if (dst.scalar_type() == src.scalar_type()) {
@@ -326,7 +328,7 @@ void indexed(Tensor dst, Tensor src, int side, int64_t dim, Tensor index, int64_
   std::string err;
   const int rc = g_api->copy_indexed(engine_of(engine), se, de, ss.data(), st.data(),
                                      static_cast<int>(ss.size()), src.storage_offset(), ds.data(), dt.data(),
-                                     static_cast<int>(ds.size()), dst.storage_offset(), side, dim,
+                                     static_cast<int>(ds.size()), dst.storage_offset(), side, static_cast<int>(dim),
                                      reinterpret_cast<uintptr_t>(index.data_ptr()), index.numel(),
                                      static_cast<int>(index.get_device_index()), {}, std::move(native), 0,
                                      current_stream(de.device.index), &err);

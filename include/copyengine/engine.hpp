@@ -41,6 +41,10 @@ struct EngineOptions {
   // and are recorded for the next warmup.
   bool explore = true;
   bool prior_only = false;               // testing: run the prior's first candidate, never measure
+  // testing: run this strategy (by name) for every group where the executor
+  // offers it, the prior's first candidate elsewhere; never measure. Lets
+  // tests exercise each strategy on each layout (the fuzzer does).
+  std::string force;
   int tune_trials = 5;                   // samples per speculative candidate before the A/B
   int tune_topk = 3;                     // speculative candidates explored
   int ab_pairs = 20;                     // paired samples before an A/B decision

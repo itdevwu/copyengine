@@ -279,6 +279,7 @@ NB_MODULE(_core, m) {
       .def_rw("staging_budget", &ce::EngineOptions::staging_budget)
       .def_rw("explore", &ce::EngineOptions::explore)
       .def_rw("prior_only", &ce::EngineOptions::prior_only)
+      .def_rw("force", &ce::EngineOptions::force)
       .def_rw("tune_trials", &ce::EngineOptions::tune_trials)
       .def_rw("tune_topk", &ce::EngineOptions::tune_topk)
       .def_rw("ab_pairs", &ce::EngineOptions::ab_pairs)
@@ -378,9 +379,9 @@ NB_MODULE(_core, m) {
       .def_prop_ro("handle", [](ce::Engine& e) { return reinterpret_cast<uintptr_t>(&e); })
       .def("fence", [](ce::Engine& e, const std::vector<std::tuple<std::string, int, uintptr_t, uintptr_t>>& reads,
                        const std::vector<std::tuple<std::string, int, uintptr_t, uintptr_t>>& writes) {
-        auto conv = [](const auto& v) {
+        auto conv = [](const auto& ranges) {
           std::vector<ce::Range> out;
-          for (auto& [kind, index, lo, hi] : v)
+          for (auto& [kind, index, lo, hi] : ranges)
             out.push_back({kind == "cuda" ? ce::Device{ce::DeviceKind::cuda, index} : ce::Device{ce::DeviceKind::host, 0},
                            lo, hi});
           return out;
@@ -420,7 +421,7 @@ NB_MODULE(_core, m) {
   m.def("shared_engine_profile", [] { return ce::frontend_api()->shared_engine()->dump_profile(); });
   m.def("shared_engine_load_profile", [](const std::string& p) { ce::frontend_api()->shared_engine()->load_profile(p); });
   // torch's float8_e4m3fn overflow mode (convert.hpp): set once at import, before any copy.
-  m.def("_set_f8e4m3_saturate", [](bool v) { ce::cv::f8e4m3_saturate = v ? 1 : 0; });
+  m.def("_set_f8e4m3_saturate", [](bool on) { ce::cv::f8e4m3_saturate = on ? 1 : 0; });
   m.def("_f8e4m3_saturate", [] { return ce::cv::f8e4m3_saturate != 0; });
   // Address of the FrontendApi table handed to copyengine._torch.
   m.def("_frontend_api", [] { return reinterpret_cast<uintptr_t>(ce::frontend_api()); });
@@ -456,8 +457,8 @@ NB_MODULE(_core, m) {
       std::memcpy(&s, scale.c_str() + u * 4, 4);
       const float factor = ce::cv::unit_scale(f, s, static_cast<uint8_t>(bits.c_str()[u]), gs);
       for (int i = 0; i < group; ++i) {
-        const float v = ce::cv::dequantize_at(qp + u * per, 1, i, f, factor, static_cast<uint8_t>(bits.c_str()[u]));
-        std::memcpy(y.data() + (u * static_cast<size_t>(group) + static_cast<size_t>(i)) * 4, &v, 4);
+        const float val = ce::cv::dequantize_at(qp + u * per, 1, i, f, factor, static_cast<uint8_t>(bits.c_str()[u]));
+        std::memcpy(y.data() + (u * static_cast<size_t>(group) + static_cast<size_t>(i)) * 4, &val, 4);
       }
     }
     return nb::bytes(y.data(), y.size());

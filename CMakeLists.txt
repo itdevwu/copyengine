@@ -49,12 +49,17 @@ target_include_directories(copyengine
   PRIVATE src
 )
 option(CE_WERROR "treat compiler warnings as errors (CI)" OFF)
-target_compile_options(copyengine PRIVATE
-  $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra -Wpedantic -Werror=return-type>
-  $<$<AND:$<BOOL:${CE_WERROR}>,$<CXX_COMPILER_ID:GNU,Clang>>:-Werror>
-  # GCC 13 false positive on std::variant holding std::shared_ptr (core/json.hpp)
-  $<$<CXX_COMPILER_ID:GNU>:-Wno-maybe-uninitialized>
-)
+# Our own C++ (library, Python and torch extensions); third-party headers are SYSTEM.
+function(ce_warnings target)
+  target_compile_options(${target} PRIVATE
+    $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-Wall -Wextra -Wpedantic -Wconversion -Werror=return-type>
+    $<$<COMPILE_LANG_AND_ID:CXX,GNU>:-Wshadow=local>
+    $<$<AND:$<BOOL:${CE_WERROR}>,$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>>:-Werror>
+    # GCC 13 false positive on std::variant holding std::shared_ptr (core/json.hpp)
+    $<$<COMPILE_LANG_AND_ID:CXX,GNU>:-Wno-maybe-uninitialized>
+  )
+endfunction()
+ce_warnings(copyengine)
 set_target_properties(copyengine PROPERTIES C_VISIBILITY_PRESET hidden CXX_VISIBILITY_PRESET hidden)
 target_compile_definitions(copyengine PRIVATE CE_BUILDING_LIBRARY)
 
@@ -152,6 +157,7 @@ if(CE_BUILD_PYTHON)
   nanobind_add_module(_core STABLE_ABI NB_STATIC src/python/module.cpp)
   target_link_libraries(_core PRIVATE copyengine)
   target_include_directories(_core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)  # quant.hpp test hooks
+  ce_warnings(_core)
   install(TARGETS _core LIBRARY DESTINATION copyengine)
 
   # Interception shim sources, laid out as in the wheel: the runtime compiles
@@ -183,6 +189,7 @@ if(CE_BUILD_PYTHON)
       target_include_directories(copyengine_torch PRIVATE $<TARGET_PROPERTY:copyengine,INTERFACE_INCLUDE_DIRECTORIES>)
       # Only the stable ABI as of torch 2.10 may be used.
       target_compile_definitions(copyengine_torch PRIVATE TORCH_TARGET_VERSION=0x020A000000000000)
+      ce_warnings(copyengine_torch)
       target_link_libraries(copyengine_torch PRIVATE ${CE_TORCH_CPU} ${CE_TORCH_C10} ${CMAKE_DL_LIBS})
       set_target_properties(copyengine_torch PROPERTIES PREFIX "" OUTPUT_NAME "_torch_stable"
                             CXX_VISIBILITY_PRESET hidden)

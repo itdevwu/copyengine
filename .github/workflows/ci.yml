@@ -30,6 +30,17 @@ jobs:
       - run: pip install scikit-build-core nanobind pytest
       - run: CE_WERROR=ON just test
 
+  # clang-tidy over copyengine's own C++ (.clang-tidy); without a CUDA toolkit,
+  # so the CUDA backend is checked locally (`just tidy` in the dev image).
+  tidy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: taiki-e/install-action@just
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build clang-tidy
+      - run: just tidy
+
   # The CUDA backend and kernels against the newest CUDA 13 headers and nvcc
   # (entry points change shape across majors). Compiles only: CI has no GPU.
   cuda13:

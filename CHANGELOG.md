@@ -6,6 +6,10 @@ change incompatibly only in a new minor (0.x) or major release.
 
 ## Unreleased
 
+- An engine destroyed while its last copies failed says so on stderr
+  instead of discarding the error; a CUDA failure during cleanup no longer
+  terminates the process. The explicit indexed-copy op checks `dim`.
+
 - Dependencies between copies use each op's exact footprint on every tensor
   it touches (an index the host does not know spanning its bound) instead of
   its hull: copies and quantizations into disjoint column slices of one pool

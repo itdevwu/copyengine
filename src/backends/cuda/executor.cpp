@@ -1282,7 +1282,6 @@ class CudaExecutor final : public Executor {
     }
     s.grid_cap = static_cast<unsigned>(std::max(1, want));
     s.sm_limit = "soft: at most " + std::to_string(s.grid_cap) + " thread blocks per copy kernel";
-    std::string why;
     try {
       for (const char* sym : {"cuDeviceGetDevResource", "cuDevSmResourceSplitByCount", "cuDevResourceGenerateDesc",
                               "cuGreenCtxCreate", "cuGreenCtxStreamCreate"})
@@ -1335,9 +1334,12 @@ class CudaExecutor final : public Executor {
     std::weak_ptr<int> alive;  // the executor
     ~DevTable() {
       if (!mem.ptr || alive.expired()) return;
-      Dev& s = owner->devs_[device];
-      Push push(*owner->d_, s.ctx);
-      owner->dev_free(s, mem);
+      try {  // a destructor must not throw (std::terminate): after a sticky CUDA error the push fails
+        Dev& s = owner->devs_[device];
+        Push push(*owner->d_, s.ctx);
+        owner->dev_free(s, mem);
+      } catch (...) {  // NOLINT(bugprone-empty-catch): the memory is lost with the context
+      }
     }
   };
 
@@ -1822,7 +1824,7 @@ class CudaExecutor final : public Executor {
       const long long rows = ops[g.ops[i]].tile->rows[0];
       long long step = rows;
       if (split[i] && whole[i] > target)
-        step = std::max<long long>(1, static_cast<long long>(static_cast<double>(rows) * target / whole[i]));
+        step = std::max<long long>(1, static_cast<long long>(static_cast<double>(rows) * static_cast<double>(target) / static_cast<double>(whole[i])));
       for (long long a = 0; a < rows; a += step) {
         const long long b = std::min(rows, a + step);
         const size_t by = whole[i] && step == rows ? whole[i] : piece_bytes(i, a, b);
@@ -2334,7 +2336,7 @@ class CudaExecutor final : public Executor {
       Staging g;
       g.caller = st;
       check(d_->cuEventCreate(&g.done, CU_EVENT_DISABLE_TIMING), "cuEventCreate");
-      s.stagings.push_back(std::move(g));
+      s.stagings.push_back(g);
       return s.stagings.back();
     }
     Staging& g = *std::min_element(s.stagings.begin(), s.stagings.end(),

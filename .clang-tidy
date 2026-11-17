@@ -1,0 +1,19 @@
+# Static checks for copyengine's own C++ (`just tidy`). Bug-finding checks only;
+# style is left to clang-format.
+Checks: >
+  -*,
+  bugprone-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-narrowing-conversions,
+  -bugprone-implicit-widening-of-multiplication-result,
+  -bugprone-branch-clone,
+  -bugprone-signed-char-misuse,
+  -bugprone-macro-parentheses,
+  clang-analyzer-*,
+  -clang-analyzer-optin.performance.Padding,
+  cppcoreguidelines-slicing,
+  misc-dangling-handle,
+  performance-move-const-arg,
+  performance-unnecessary-copy-initialization
+WarningsAsErrors: ''
+HeaderFilterRegex: '(include/copyengine|src)/.*'

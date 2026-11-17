@@ -123,7 +123,9 @@ Tuner::Pick Tuner::pick(const std::string& bucket, const Choice& c, int64_t runs
   Entry& e = it != table_.end() ? it->second : table_[bucket];
   if (e.locked >= 0 && allowed(static_cast<Strategy>(e.locked), c)) {
     const auto locked = static_cast<Strategy>(e.locked);
-    if (cfg_.online_every <= 0 || (e.since += runs) < cfg_.online_every) return {locked, false};
+    if (cfg_.online_every <= 0) return {locked, false};
+    e.since += runs;
+    if (e.since < cfg_.online_every) return {locked, false};
     e.since = 0;
     // An online sample: mostly the locked side, every alt_every-th the other
     // finalist, if it was close enough to ever flip (a far slower one would

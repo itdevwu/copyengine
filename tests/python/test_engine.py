@@ -789,3 +789,22 @@ def test_copy_many_with_dtypes_the_op_does_not_take():
     assert e.stats()["last"]["ops"] == 3
     for d, s in zip(dsts, srcs):
         assert torch.equal(d.view(torch.uint8) if d.dtype == e8 else d, s.view(torch.uint8) if s.dtype == e8 else s)
+
+
+def test_forced_strategy_runs_where_offered():
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    src = torch.randn(64, 256, device="cuda")
+    dst = torch.empty(64, 128, device="cuda")
+    for name in ("runs", "kernel", "native"):
+        e = ce.Engine(_force=name)
+        dst.zero_()
+        with e.scope():
+            dst.copy_(src[:, ::2])
+        torch.cuda.synchronize()
+        assert torch.equal(dst, src[:, ::2]), name
+        assert e.stats()["last"]["decisions"][0]["strategy"] == name, (name, e.stats()["last"]["decisions"])
+    with pytest.raises(ValueError, match="unknown strategy"):
+        e = ce.Engine(_force="nope")
+        e.copy_(dst, src[:, ::2])

@@ -19,3 +19,6 @@ RUN if [ "$WITH_TORCH" = "1" ]; then \
     fi \
     && chmod -R a+rwX /opt/venv
 ENV PATH=/opt/venv/bin:$PATH
+
+# Static checks (`just tidy`); a layer of its own so the torch layer above stays cached.
+RUN apt-get update && apt-get install -y --no-install-recommends clang-tidy && rm -rf /var/lib/apt/lists/*

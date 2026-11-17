@@ -204,7 +204,8 @@ class Engine:
                  tune_topk: int = 3, ab_pairs: int = 20, ab_max_pairs: int = 50, online_every: int = 64,
                  allow_async: bool = False,
                  host_threads: int = 0, disable: bool = False, prior_only: bool = False, max_sms: int = 0,
-                 bandwidth: Optional[float] = None, _intercept: Optional[str] = None):
+                 bandwidth: Optional[float] = None, _intercept: Optional[str] = None,
+                 _force: Optional[str] = None):
         """``explore=False`` uses only a loaded profile (uncovered buckets take the
         baseline). ``max_sms`` bounds the SMs copy kernels may occupy per GPU (see
         ``stats()["cuda"]`` for whether it is enforced by a green context or by
@@ -216,6 +217,7 @@ class Engine:
         o.staging_budget = int(staging_budget_mb) << 20
         o.explore = explore
         o.prior_only = prior_only
+        o.force = _force or ""  # tests: this strategy wherever it is offered (no measurement)
         o.tune_trials = tune_trials
         o.tune_topk = tune_topk
         o.ab_pairs = ab_pairs

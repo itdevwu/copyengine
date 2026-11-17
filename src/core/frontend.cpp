@@ -109,7 +109,7 @@ size_t queued(const Engine& engine) { return engine.queued(); }
 void decline(Engine& engine, const char* reason) {
   try {
     engine.decline(reason);
-  } catch (...) {  // statistics only: never fails the copy
+  } catch (...) {  // NOLINT(bugprone-empty-catch): statistics only, never fails the copy
   }
 }
 

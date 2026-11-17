@@ -97,6 +97,19 @@ uintptr_t current_stream(int device) {
   return reinterpret_cast<uintptr_t>(s);
 }
 
+bool g_shutdown = false;  // torch may be gone at interpreter exit: then leave memory to the process
+
+// copyengine's StreamProvider: torch's current stream of a GPU (copies between two GPUs).
+bool provide_stream(int device, uintptr_t* stream) noexcept {
+  if (g_shutdown) return false;
+  try {
+    *stream = current_stream(device);
+    return true;
+  } catch (...) {  // no CUDA build, or an invalid device: copyengine reports it
+    return false;
+  }
+}
+
 // The baseline: the same copy through torch's own aten::copy_.
 class TorchCopy final : public ce::NativeOp {
  public:
@@ -163,7 +176,6 @@ void copy_fn_(Tensor dst, Tensor src, int64_t engine, double scale, double bias,
 // tensors: it counts in torch.cuda.memory_allocated() and torch's limits, and
 // freeing it never synchronizes. Tied to torch's current stream at allocation
 // (the core orders that stream after its own use before freeing).
-bool g_shutdown = false;  // torch may be gone at interpreter exit: then leave memory to the process
 
 uintptr_t torch_alloc(int device, size_t bytes, void** handle, uintptr_t* stream) {
   try {
@@ -182,6 +194,27 @@ uintptr_t torch_alloc(int device, size_t bytes, void** handle, uintptr_t* stream
     return reinterpret_cast<uintptr_t>(p);
   } catch (...) {
     return 0;
+  }
+}
+
+// copyengine's PeerEnabler: one byte copied by torch from GPU a to GPU b, so
+// torch enables a's access to b's memory as for its own copies (its allocator
+// then maps b's expandable segments for a as well).
+void enable_peer(int a, int b) noexcept {
+  if (g_shutdown) return;
+  try {
+    const int64_t size = 1, stride = 1;
+    AtenTensorHandle ta = nullptr, tb = nullptr;
+    if (aoti_torch_empty_strided(1, &size, &stride, aoti_torch_dtype_uint8(), aoti_torch_device_type_cuda(), a, &ta) !=
+        AOTI_TORCH_SUCCESS)
+      return;
+    Tensor src(ta);
+    if (aoti_torch_empty_strided(1, &size, &stride, aoti_torch_dtype_uint8(), aoti_torch_device_type_cuda(), b, &tb) !=
+        AOTI_TORCH_SUCCESS)
+      return;
+    Tensor dst(tb);
+    torch::stable::copy_(dst, src, false);
+  } catch (...) {  // copyengine's own admission still decides
   }
 }
 
@@ -466,6 +499,8 @@ extern "C" __attribute__((visibility("default"))) int copyengine_torch_bind(uint
   if (!a || a->version != ce::FrontendApi::kVersion) return 1;
   g_api = a;
   if (allocator && a->set_device_allocator) a->set_device_allocator(&kTorchAllocator);
+  if (a->set_stream_provider) a->set_stream_provider(&provide_stream);
+  if (a->set_peer_enabler) a->set_peer_enabler(&enable_peer);
   return 0;
 }
 

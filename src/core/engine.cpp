@@ -19,6 +19,7 @@
 #include "backends/host/host.hpp"
 #include "copyengine/error.hpp"
 #include "copyengine/probe.hpp"
+#include "copyengine/frontend.hpp"
 #include "core/json.hpp"
 #include "core/plan.hpp"
 #include "core/tuner.hpp"
@@ -452,10 +453,10 @@ struct Engine::Impl {
          "resources that are set up on first use; run it once before capturing");
   }
 
-  void note_pending(const Side& s, const Side& d, uintptr_t strm, bool host_wait) {
+  // `dev`: the GPU of `strm`.
+  void note_pending(const Side& s, const Side& d, uintptr_t strm, bool host_wait, int dev) {
     if (capturing) return;  // the graph's work, not the engine's
     if (s.device.kind == DeviceKind::host && d.device.kind == DeviceKind::host) return;
-    const int dev = s.device.kind == DeviceKind::cuda ? s.device.index : d.device.index;
     if (std::find(cuda_streams.begin(), cuda_streams.end(), std::make_pair(strm, dev)) == cuda_streams.end())
       cuda_streams.emplace_back(strm, dev);
     if (std::find(pending_at.begin(), pending_at.end(), std::make_pair(strm, dev)) == pending_at.end())
@@ -488,9 +489,9 @@ struct Engine::Impl {
       }
     if (dev != strm_dev) dev = -1;
     const uintptr_t was = stream;
-    if (dev >= 0) cuda->order(strm, was, dev);
+    if (dev >= 0) cuda->order(strm, dev, was, dev);
     flush();
-    if (dev >= 0) cuda->order(was, strm, dev);
+    if (dev >= 0) cuda->order(was, dev, strm, dev);
   }
 
   // torch's own copy keeps its buffers safe itself (it records events on pinned memory).
@@ -503,7 +504,7 @@ struct Engine::Impl {
     if (host_only && host_pending && !capturing) synchronize();  // host work may touch what CUDA work still uses
     before_cpu_native(op);
     op.native->run(strm, op.host_async);
-    note_pending(op.src, op.dst, strm, !op.host_async);
+    note_pending(op.src, op.dst, strm, !op.host_async, gpu_of(op));  // the stream given is the destination GPU's
     bury(std::move(op.native));
     ++native_ops;
     if (depth == 0) finish(strm);
@@ -611,17 +612,17 @@ struct Engine::Impl {
       // The GPU's tensors and the tables on one GPU; the other side may be
       // pinned host memory (the statement kernel reaches it zero-copy).
       if (!scuda && !dcuda) fail(Errc::unsupported, "device indices need a tensor on the GPU that holds them");
-      if (scuda && dcuda && !(src.device == dst.device))
-        fail(Errc::unsupported, "device indices with tensors on two GPUs");
       if ((!scuda && !src.pinned) || (!dcuda && !dst.pinned))
         fail(Errc::unsupported, "device indices with pageable host memory (pin it)");
       if ((!scuda && !src.mapped) || (!dcuda && !dst.mapped))  // only the statement kernel reads the indices
         fail(Errc::unsupported, "device indices with host memory kernels cannot reach at its address (pinned but "
                                 "not mapped there, e.g. cudaHostRegister'ed memory under WSL2): use pin_memory()");
-      const int gpu = scuda ? src.device.index : dst.device.index;
+      // Between two GPUs the kernel runs on the source GPU and reaches the
+      // other's memory (the executor offers it only where the pair admitted that).
       for (const Access* a : {&stmt.src, &stmt.dst})
         for (const Term& t : a->terms())
-          if (t.dev.ptr && !t.dev.host() && t.dev.device != gpu)
+          if (t.dev.ptr && !t.dev.host() && !(scuda && t.dev.device == src.device.index) &&
+              !(dcuda && t.dev.device == dst.device.index))
             fail(Errc::unsupported, "device indices on another GPU than the tensors");
     }
     if (on_host && !scuda && !dcuda) fail(Errc::unsupported, "host index tables need a GPU on one side");
@@ -1006,15 +1007,48 @@ struct Engine::Impl {
     });
   }
 
-  int64_t run_group(const Group& g, Strategy s, const std::vector<Op>& ops, uintptr_t strm, bool measure,
+  // A copy between two GPUs runs as torch's own: on the source GPU's current
+  // stream, after the work queued on the stream it was given (the
+  // destination's) and before that stream's later work. Not while capturing
+  // (only the captured stream may be used), for torch's own copy (it orders
+  // itself), or without a stream provider (the caller orders, see frontend.hpp).
+  struct PeerRun {
+    uintptr_t strm = 0;  // where the group runs
+    int dev = -1;        // its GPU
+    uintptr_t given = 0;
+    int given_dev = -1;  // >= 0: ordered with `given` before and after
+  };
+  PeerRun peer_run(const Group& g, Strategy s, uintptr_t strm) {
+    PeerRun r{strm, device_of(g)};
+    const bool two = g.src.device.kind == DeviceKind::cuda && g.dst.device.kind == DeviceKind::cuda &&
+                     g.src.device.index != g.dst.device.index;
+    if (!two || !cuda) return r;
+    r.given_dev = cuda->stream_device(strm, g.dst.device.index);
+    const StreamProvider p = stream_provider();
+    if (s == Strategy::native || capturing || !p) {
+      r.dev = r.given_dev, r.given_dev = -1;  // runs on the given stream: timed on its GPU
+      return r;
+    }
+    uintptr_t ss = 0;
+    if (!p(g.src.device.index, &ss))
+      fail(Errc::backend, "cannot tell the current stream of GPU " + std::to_string(g.src.device.index) +
+                              " (a copy between two GPUs is ordered with both)");
+    r.strm = ss, r.dev = g.src.device.index, r.given = strm;
+    cuda->order(ss, r.dev, strm, r.given_dev);
+    return r;
+  }
+
+  int64_t run_group(const Group& g, Strategy s, const std::vector<Op>& ops, uintptr_t given, bool measure,
                     FlushStats* st) {
     Executor& ex = exec_for(g.src, g.dst);
+    const PeerRun pr = peer_run(g, s, given);
+    const uintptr_t strm = pr.strm;
     if (&ex == &host && host_pending && !capturing) synchronize();  // host work may touch what CUDA work still uses
     // A native that reads host memory on the CPU waits for GPU work there now,
     // outside the measured window (torch alone would not pay for that wait).
     if (s == Strategy::native)
       for (int k : g.ops) before_cpu_native(ops[k]);
-    const int64_t a = measure ? ex.mark(strm, device_of(g)) : -1;
+    const int64_t a = measure ? ex.mark(strm, pr.dev) : -1;
     // Setup on a strategy's first run for this group (tables made resident,
     // descriptors built) is paid once, not per run: such a run is no sample.
     const bool had_cache = g.exec_cache[static_cast<int>(s)] != nullptr;
@@ -1035,11 +1069,12 @@ struct Engine::Impl {
       // through it. Counting it on one side only biased the A/B toward native.
       double submit = 0;
       for (int k : g.ops) submit += ops[k].enqueue_us;
-      const int64_t b = ex.mark(strm, device_of(g));
+      const int64_t b = ex.mark(strm, pr.dev);
       samples.push_back({g.bucket, s, us_since(t0) + submit, submit, a, b, &ex});
     }
+    if (pr.given_dev >= 0) cuda->order(pr.given, pr.given_dev, strm, pr.dev);  // the given stream's later work
     note_pending(g.src, g.dst, strm,
-                 std::any_of(g.ops.begin(), g.ops.end(), [&](int k) { return !ops[k].host_async; }));
+                 std::any_of(g.ops.begin(), g.ops.end(), [&](int k) { return !ops[k].host_async; }), pr.dev);
     if (st) {
       st->calls += calls;
       st->bytes += g.bytes();
@@ -1407,6 +1442,10 @@ Engine::~Engine() {
 void Engine::copy(const Endpoint& src, const Endpoint& dst, const Runs& runs, const Elementwise& fn,
                   const Hints& hints, uintptr_t stream) {
   const auto t0 = Clock::now();
+  if (enabling_peer() && hints.native) {  // the framework's own copy that enables peer access (frontend.hpp)
+    hints.native->run(stream, false);
+    return;
+  }
   Locked lk(*impl_);
   impl_->check_thread();
   impl_->enqueue(src, dst, runs, fn, hints, stream, t0);
@@ -1415,6 +1454,10 @@ void Engine::copy(const Endpoint& src, const Endpoint& dst, const Runs& runs, co
 void Engine::copy(const Endpoint& src, const Endpoint& dst, const Stmt& stmt, const Elementwise& fn,
                   const Hints& hints, uintptr_t stream) {
   const auto t0 = Clock::now();
+  if (enabling_peer() && hints.native) {  // the framework's own copy that enables peer access (frontend.hpp)
+    hints.native->run(stream, false);
+    return;
+  }
   Locked lk(*impl_);
   impl_->check_thread();
   impl_->enqueue_stmt(src, dst, stmt, fn, hints, stream, t0);

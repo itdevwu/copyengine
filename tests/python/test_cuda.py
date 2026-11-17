@@ -485,7 +485,7 @@ def test_fused_more_statements_than_one_grid_row():
 # ---- buffers of copies the host does not wait for -------------------------------------------
 
 
-def _reuse_pinned_after_free(start_copy, later, n=1 << 20):
+def _reuse_pinned_after_free(start_copy, later, n=1 << 20, info=lambda: None):
     """Start a copy from a pinned tensor while the GPU is busy, drop the tensor and
     let the engine move on to other (already planned) work: until the copy has
     run, torch must not hand that pinned memory to anyone else, and the copy
@@ -499,9 +499,9 @@ def _reuse_pinned_after_free(start_copy, later, n=1 << 20):
     start_copy(dst, src)
     del src
     later()
-    assert not torch.cuda.current_stream().query(), "the GPU finished too early for this test"
+    assert not torch.cuda.current_stream().query(), f"the GPU finished too early for this test: {info()}"
     junk = torch.empty(n, pin_memory=True)
-    assert junk.data_ptr() != p, "pinned memory of an in-flight copy was reused"
+    assert junk.data_ptr() != p, f"pinned memory of an in-flight copy was reused: {info()}"
     junk.fill_(-1.0)
     torch.cuda.synchronize()
     torch.testing.assert_close(dst.cpu(), want, rtol=0, atol=0)
@@ -528,12 +528,13 @@ def test_intercepted_non_blocking_keeps_pinned_sources_alive(intercept):
         with e.scope():
             d.copy_(s, non_blocking=True)
 
-    def later():  # a new flush replaces the last one's ops
-        a, b = torch.zeros(4, device=DEV), torch.ones(4, device=DEV)
+    a, b = torch.zeros(4, device=DEV), torch.ones(4, device=DEV)
+
+    def later():  # a new flush replaces the last one's ops (the same tensors: planned once, before the timed part)
         with e.scope():
             a.copy_(b)
 
-    _reuse_pinned_after_free(start, later)
+    _reuse_pinned_after_free(start, later, info=lambda: {k: e.stats()[k] for k in ("last", "kept", "sessions")})
 
 
 def test_sparse_tensors_take_the_general_path():

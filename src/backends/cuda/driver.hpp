@@ -26,6 +26,11 @@ namespace ce::cuda {
   X(cuCtxPushCurrent)           \
   X(cuCtxPopCurrent)            \
   X(cuCtxGetCurrent)            \
+  X(cuCtxGetDevice)             \
+  X(cuStreamGetCtx)             \
+  X(cuDeviceCanAccessPeer)      \
+  X(cuDeviceGetP2PAttribute)    \
+  X(cuCtxEnablePeerAccess)      \
   X(cuCtxGetStreamPriorityRange) \
   X(cuStreamCreate)             \
   X(cuStreamDestroy)            \

@@ -451,6 +451,38 @@ NB_MODULE(_core, m) {
   // torch's float8_e4m3fn overflow mode (convert.hpp): set once at import, before any copy.
   m.def("_set_f8e4m3_saturate", [](bool on) { ce::cv::f8e4m3_saturate = on ? 1 : 0; });
   m.def("_f8e4m3_saturate", [] { return ce::cv::f8e4m3_saturate != 0; });
+  // A StreamProvider in Python (torch.cuda's current streams), for when the torch
+  // extension (which provides one in C++) is not loaded. Called under the engine
+  // lock: it takes the GIL, which no thread holds while waiting for that lock.
+  m.def("_set_stream_provider", [](nb::callable f) {
+    static nb::callable* held = nullptr;  // for the process: providers are not unset
+    if (!held) held = new nb::callable(std::move(f));
+    else *held = std::move(f);
+    ce::set_stream_provider([](int device, uintptr_t* stream) noexcept -> bool {
+      if (!Py_IsInitialized()) return false;
+      nb::gil_scoped_acquire gil;
+      try {
+        *stream = nb::cast<uintptr_t>((*held)(device));
+        return true;
+      } catch (...) {
+        return false;
+      }
+    });
+  }, "provider"_a);
+  // A PeerEnabler in Python (a torch copy from GPU a to GPU b), likewise.
+  m.def("_set_peer_enabler", [](nb::callable f) {
+    static nb::callable* held = nullptr;
+    if (!held) held = new nb::callable(std::move(f));
+    else *held = std::move(f);
+    ce::set_peer_enabler([](int a, int b) noexcept {
+      if (!Py_IsInitialized()) return;
+      nb::gil_scoped_acquire gil;
+      try {
+        (*held)(a, b);
+      } catch (...) {
+      }
+    });
+  }, "enabler"_a);
   // Address of the FrontendApi table handed to copyengine._torch.
   m.def("_frontend_api", [] { return reinterpret_cast<uintptr_t>(ce::frontend_api()); });
 

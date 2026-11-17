@@ -48,12 +48,36 @@ struct DeviceAllocator {
 void set_device_allocator(const DeviceAllocator* a);
 const DeviceAllocator* device_allocator();
 
+// The framework's current stream of GPU `device` (torch's current CUDA
+// stream): a copy between two GPUs runs on the source GPU's, ordered after
+// the work queued on both GPUs' and before their later work, as torch's own
+// copy. Returns false when it cannot tell. Without a provider (the C ABI), a
+// copy between two GPUs runs on the stream it is given, ordered with nothing
+// else: the caller orders the other GPU's work.
+using StreamProvider = bool (*)(int device, uintptr_t* stream);
+void set_stream_provider(StreamProvider f);
+StreamProvider stream_provider();
+
+// Makes the framework give GPU `a` access to GPU `b`'s memory as for its own
+// copies (torch's copy from a to b enables it and maps b's expandable segments
+// for a), before copyengine's kernels on `a` touch b's memory. Without one (the
+// C ABI), memory from cuMemCreate must be mapped for `a` by the caller
+// (cuMemSetAccess); copyengine enables peer access for cuMemAlloc'ed memory.
+using PeerEnabler = void (*)(int a, int b);
+void set_peer_enabler(PeerEnabler f);
+PeerEnabler peer_enabler();
+// Runs the enabler. Its copy may be intercepted (a scope open on this
+// thread): while it runs, engines run intercepted copies as the framework's
+// own at once (enabling_peer()), so the framework's copy is what happens.
+void run_peer_enabler(int a, int b);
+bool enabling_peer();
+
 // Entry points for framework extensions (copyengine._torch). They receive this
 // table from copyengine._core, so the process holds one copy of the engine and
 // extensions need not link the core. Both sides come from the same build;
 // errors cross as codes because exception types do not cross shared objects.
 struct FrontendApi {
-  static constexpr uint32_t kVersion = 7;
+  static constexpr uint32_t kVersion = 8;
   enum Flags : uint32_t {
     kHostAsync = 1,  // see Hints::host_async
   };
@@ -91,6 +115,8 @@ struct FrontendApi {
   // Engine::begin_scope / end_scope: calls between them plan together.
   void (*begin_scope)(Engine& engine) = nullptr;
   int (*end_scope)(Engine& engine, std::string* error) = nullptr;
+  void (*set_stream_provider)(StreamProvider f) = nullptr;
+  void (*set_peer_enabler)(PeerEnabler f) = nullptr;
 };
 
 const FrontendApi* frontend_api();

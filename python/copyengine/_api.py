@@ -1280,6 +1280,16 @@ class FrozenPlan:
 _default = threading.local()
 
 
+# Copies between two GPUs are ordered with both GPUs' current streams; the torch
+# extension tells copyengine those streams, else this does.
+if torch is not None and _torch_ops.copy_ is None and hasattr(torch._C, "_cuda_getCurrentRawStream"):
+    _core._set_stream_provider(torch._C._cuda_getCurrentRawStream)
+
+    def _enable_peer(a, b):  # torch's copy from GPU a to GPU b enables a's access to b's memory
+        torch.empty(1, dtype=torch.uint8, device=f"cuda:{b}").copy_(torch.empty(1, dtype=torch.uint8, device=f"cuda:{a}"))
+
+    _core._set_peer_enabler(_enable_peer)
+
 if torch is not None and _shim.lib is None and "CE_SHIM=0" not in _shim.error:
     warnings.warn(f"copyengine: the C++ interception shim is unavailable ({_shim.error.splitlines()[0]}); "
                   "scopes intercept copies in Python instead: same results, slower", RuntimeWarning, stacklevel=2)

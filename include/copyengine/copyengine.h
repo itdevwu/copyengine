@@ -90,7 +90,10 @@ CE_API void ce_engine_destroy(ce_engine* engine);
 
 /* dst[dst_off[i] + k] = fn(src[src_off[i] + k]) for k < len[i]; element offsets
  * relative to each endpoint's base. fn may be NULL (identity). stream is a
- * CUstream (0 = legacy default stream) or 0 for host-only copies. */
+ * CUstream (0 = legacy default stream) or 0 for host-only copies. A copy
+ * between two GPUs runs on `stream`, ordered with no other stream: the caller
+ * orders the other GPU's work; memory from cuMemCreate must be mapped for the
+ * source GPU (cuMemSetAccess) for copyengine's kernels to write it. */
 CE_API ce_status ce_copy_runs(ce_engine* engine, const ce_endpoint* src, const ce_endpoint* dst,
                               const int64_t* src_off, const int64_t* dst_off, const int64_t* len, size_t n,
                               const ce_elementwise* fn, uint64_t stream);

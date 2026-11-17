@@ -5,6 +5,7 @@
 #include <array>
 #include <cstring>
 #include <map>
+#include <set>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -259,16 +260,18 @@ class CudaExecutor final : public Executor {
   // What each strategy needs of the memory it touches, in one place (the
   // branches of offered() choose; this only refuses). Kernels and batched DMA
   // take device-accessible addresses: host memory must be mapped at its own;
-  // the device-only kernels need both sides on one GPU.
-  static bool admissible(Strategy s, const Group& g) {
+  // the device-only kernels need both sides on one GPU, or (the statement
+  // kernel, on the source GPU) another GPU's memory its admitted pair reaches.
+  bool admissible(Strategy s, const Group& g) {
     const bool sc = g.src.device.kind == DeviceKind::cuda, dc = g.dst.device.kind == DeviceKind::cuda;
     const bool one_gpu = sc && dc && g.src.device.index == g.dst.device.index;
+    const bool two_gpus = sc && dc && !one_gpu;
     const bool reach = kernel_reach(g.src) && kernel_reach(g.dst);
     switch (s) {
-      case Strategy::kernel:
+      case Strategy::kernel: return one_gpu || (two_gpus && peer(g.src.device.index, g.dst.device.index).kernel);
       case Strategy::bulk:
       case Strategy::tma2d: return one_gpu;
-      case Strategy::batch: return reach;
+      case Strategy::batch: return reach && (!two_gpus || peer(g.src.device.index, g.dst.device.index).batch);
       case Strategy::fused: return one_gpu || !g.opaque() || reach;  // non-opaque host sides go through staging
       case Strategy::tile: return !g.tile_host_sides || g.tile_mapped;
       default: return true;  // DMA through the driver (any pinned or pageable host memory), or staging
@@ -302,6 +305,9 @@ class CudaExecutor final : public Executor {
     }
     if (g.opaque()) {  // indices read at run time: the statement kernel, or (host tables) DMA expanded per run
       std::vector<Strategy> c;
+      if (g.src.device.kind == DeviceKind::cuda && g.dst.device.kind == DeviceKind::cuda &&
+          g.src.device.index != g.dst.device.index)
+        (void)peer(g.src.device.index, g.dst.device.index);  // admitted before the plan asks (peer_kernel_known)
       if (g.pure() && host_tables_only(g)) c.push_back(Strategy::lowered);
       const bool sc = g.src.device.kind == DeviceKind::cuda, dc = g.dst.device.kind == DeviceKind::cuda;
       const bool reach = kernel_reach(g.src) && kernel_reach(g.dst);  // the statement kernel touches host memory itself
@@ -330,9 +336,12 @@ class CudaExecutor final : public Executor {
         // Large groups: first among the candidates, so the shortlist keeps it (measured like the rest).
         if (!s.bulk.empty() && g.bytes() >= kBulkMinBytes) c.insert(c.begin(), Strategy::bulk);
         if (s.tma2d && g.bytes() >= kBulkMinBytes && tma2d_fits(g)) c.insert(c.begin(), Strategy::tma2d);
-      } else if (src_cuda && dst_cuda) {  // two GPUs: batch is admitted per device, not per pair yet (P2P)
+      } else if (src_cuda && dst_cuda) {  // two GPUs: what the pair's test copies admitted
+        const Peer& pr = peer(g.src.device.index, g.dst.device.index);
+        if (pr.kernel && rects > 2) c.push_back(Strategy::kernel);  // many fragments: one launch writing the other GPU
+        if (pr.batch) c.push_back(Strategy::batch);
         c.push_back(Strategy::runs);
-        if (rects <= 2) std::reverse(c.begin(), c.end());
+        if (rects <= 2) std::stable_partition(c.begin(), c.end(), [](Strategy x) { return x == Strategy::runs; });
       } else {
         const bool host_ok = (src_cuda || g.src.pinned) && (dst_cuda || g.dst.pinned);
         int64_t rows = 0;
@@ -350,8 +359,12 @@ class CudaExecutor final : public Executor {
     }
     if (!s.kernels) fail(Errc::unsupported, "dtype conversion on CUDA needs the kernel module: " + s.kernel_error);
     if (src_cuda && dst_cuda) {
-      if (!same_dev) fail(Errc::unsupported, "converting copies between two GPUs are not supported yet");
-      return with_fused({Strategy::kernel});
+      if (same_dev) return with_fused({Strategy::kernel});
+      const Peer& pr = peer(g.src.device.index, g.dst.device.index);
+      if (!pr.kernel)
+        fail(Errc::unsupported, "converting copies between two GPUs need a kernel on one writing the other's memory: " +
+                                    pr.error + " (see stats()[\"cuda\"][i][\"peers\"])");
+      return {Strategy::kernel};  // on the source GPU, writing the destination's memory
     }
     return with_fused({Strategy::staged});
   }
@@ -475,13 +488,35 @@ class CudaExecutor final : public Executor {
 
   bool async() const override { return true; }
 
-  void order(uintptr_t later, uintptr_t earlier, int device) override {
-    if (later == earlier) return;
-    Dev& s = state(device);
-    Push push(*d_, s.ctx);
-    if (!s.ev_order) check(d_->cuEventCreate(&s.ev_order, CU_EVENT_DISABLE_TIMING), "cuEventCreate");
-    check(d_->cuEventRecord(s.ev_order, reinterpret_cast<CUstream>(earlier)), "cuEventRecord");
-    check(d_->cuStreamWaitEvent(reinterpret_cast<CUstream>(later), s.ev_order, 0), "cuStreamWaitEvent");
+  void order(uintptr_t later, int later_device, uintptr_t earlier, int earlier_device) override {
+    if (later == earlier && later_device == earlier_device) return;
+    Dev& e = state(earlier_device);
+    {  // the event is recorded in the context of the stream it records
+      Push push(*d_, e.ctx);
+      if (!e.ev_order) check(d_->cuEventCreate(&e.ev_order, CU_EVENT_DISABLE_TIMING), "cuEventCreate");
+      check(d_->cuEventRecord(e.ev_order, reinterpret_cast<CUstream>(earlier)), "cuEventRecord");
+    }
+    // A stream may wait for another device's event; a legacy handle names the current context's stream.
+    Push push(*d_, state(later_device).ctx);
+    check(d_->cuStreamWaitEvent(reinterpret_cast<CUstream>(later), e.ev_order, 0), "cuStreamWaitEvent");
+  }
+
+  int stream_device(uintptr_t stream, int fallback) override {
+    if (stream == 0 || stream == reinterpret_cast<uintptr_t>(CU_STREAM_LEGACY) ||
+        stream == reinterpret_cast<uintptr_t>(CU_STREAM_PER_THREAD))
+      return fallback;
+    CUcontext c{};
+    check(d_->cuStreamGetCtx(reinterpret_cast<CUstream>(stream), &c), "cuStreamGetCtx");
+    for (size_t i = 0; i < devs_.size(); ++i)
+      if (devs_[i].init && devs_[i].ctx == c) return static_cast<int>(i);
+    Push push(*d_, c);  // a context copyengine has not set up yet (or a green context's)
+    CUdevice dv{};
+    check(d_->cuCtxGetDevice(&dv), "cuCtxGetDevice");
+    for (int i = 0; i < static_cast<int>(devs_.size()); ++i) {
+      CUdevice x{};
+      if (d_->cuDeviceGet(&x, i) == CUDA_SUCCESS && x == dv) return i;
+    }
+    return fallback;
   }
 
   int64_t mark(uintptr_t stream, int device) override {
@@ -532,6 +567,30 @@ class CudaExecutor final : public Executor {
     return true;
   }
 
+  // The pairs (this GPU issuing) copies asked about: facts and verdicts.
+  Json peers_info(int a) {
+    std::vector<int> bs;
+    {
+      std::lock_guard<std::mutex> lock(peers_seen_mu_);
+      for (const auto& [x, y] : peers_seen_)
+        if (x == a) bs.push_back(y);
+    }
+    Json out = Json::object();
+    for (int b : bs) {
+      const Peer& p = peer(a, b);
+      Json j = Json::object()
+                   .set("access", p.access)
+                   .set("rank", p.rank)
+                   .set("atomics", p.atomics)
+                   .set("dma", p.dma)
+                   .set("kernel", p.kernel)
+                   .set("batch", p.batch);
+      if (!p.error.empty()) j.set("error", p.error);
+      out.set(std::to_string(b), std::move(j));
+    }
+    return out;
+  }
+
   Json info() override {
     Json devs = Json::array();
     for (size_t i = 0; i < devs_.size(); ++i) {
@@ -545,6 +604,7 @@ class CudaExecutor final : public Executor {
                     .set("tma2d", s.tma2d ? Json(true) : Json(s.tma2d_error))
                     .set("zero_copy", s.zero_copy < 0 ? Json("unchecked")
                                                       : (s.zero_copy ? Json(true) : Json(s.zero_copy_error)))
+                    .set("peers", peers_info(static_cast<int>(i)))
                     .set("allocator", device_allocator() ? device_allocator()->name : "cuda")
                     .set("host_allocator",
                          device_allocator() && device_allocator()->host_alloc ? device_allocator()->name : "cuda"));
@@ -2200,7 +2260,10 @@ class CudaExecutor final : public Executor {
     FusedPlan P;
     if (g.forms.empty()) return P;
     const bool src_cuda = g.src.device.kind == DeviceKind::cuda, dst_cuda = g.dst.device.kind == DeviceKind::cuda;
-    if (src_cuda && dst_cuda && g.src.device.index != g.dst.device.index) return P;
+    // Two GPUs: the kernel on the source GPU writes the other's memory, where the pair admitted it.
+    if (src_cuda && dst_cuda && g.src.device.index != g.dst.device.index &&
+        !peer_kernel_known(g.src.device.index, g.dst.device.index))
+      return P;
     // Copies with host index tables read or write host memory directly
     // (zero-copy, admitted in candidates()), never through staging.
     P.cross = !(src_cuda && dst_cuda) && !g.opaque();
@@ -2635,6 +2698,130 @@ class CudaExecutor final : public Executor {
     return s.zero_copy == 1;
   }
 
+  // ---- peers: one GPU's memory seen from another --------------------------------------
+
+  // Facts and verdicts of an ordered pair (a: the GPU that issues, b: the
+  // other), once per process: peer access (enabled by copyengine where the
+  // driver allows, as torch's own copy does), the driver's performance rank,
+  // and test copies a -> b verified bit for bit: DMA, a kernel on `a` writing
+  // b's memory, and batched DMA.
+  struct Peer {
+    bool checked = false;
+    bool access = false, atomics = false, dma = false, kernel = false, batch = false;
+    int rank = -1;
+    std::string error;  // why access, a test copy, or kernels are unavailable
+  };
+  static Peer& peer_slot(int a, int b, std::mutex** m) {
+    static std::mutex mu;
+    static std::map<std::pair<int, int>, Peer> all;
+    *m = &mu;
+    return all[{a, b}];
+  }
+
+  // A verdict already reached (const callers; peer() reaches it).
+  static bool peer_kernel_known(int a, int b) {
+    std::mutex* mu = nullptr;
+    Peer& p = peer_slot(a, b, &mu);
+    std::lock_guard<std::mutex> lock(*mu);
+    return p.checked && p.kernel;
+  }
+
+  const Peer& peer(int a, int b) {
+    {
+      std::lock_guard<std::mutex> lock(peers_seen_mu_);
+      peers_seen_.emplace(a, b);
+    }
+    std::mutex* mu = nullptr;
+    Peer& p = peer_slot(a, b, &mu);
+    {
+      std::lock_guard<std::mutex> lock(*mu);
+      if (p.checked) return p;
+    }
+    Peer r = admit_peer(a, b);
+    r.checked = true;
+    std::lock_guard<std::mutex> lock(*mu);
+    if (!p.checked) p = std::move(r);
+    return p;
+  }
+
+  Peer admit_peer(int a, int b) {
+    Peer p;
+    Dev& A = state(a);
+    Dev& B = state(b);
+    int can = 0;
+    check(d_->cuDeviceCanAccessPeer(&can, A.dev, B.dev), "cuDeviceCanAccessPeer");
+    int v = 0;
+    if (d_->cuDeviceGetP2PAttribute(&v, CU_DEVICE_P2P_ATTRIBUTE_PERFORMANCE_RANK, A.dev, B.dev) == CUDA_SUCCESS)
+      p.rank = v;
+    if (d_->cuDeviceGetP2PAttribute(&v, CU_DEVICE_P2P_ATTRIBUTE_NATIVE_ATOMIC_SUPPORTED, A.dev, B.dev) == CUDA_SUCCESS)
+      p.atomics = v != 0;
+    if (can) {
+      run_peer_enabler(a, b);  // the framework's memory too (expandable segments)
+      Push push(*d_, A.ctx);
+      const CUresult r = d_->cuCtxEnablePeerAccess(B.ctx, 0);
+      p.access = r == CUDA_SUCCESS || r == CUDA_ERROR_PEER_ACCESS_ALREADY_ENABLED;
+      if (!p.access) p.error = "cuCtxEnablePeerAccess: " + std::to_string(static_cast<int>(r));
+    } else {
+      p.error = "the driver reports no peer access between these GPUs (copies go through the driver's DMA)";
+    }
+    // Test copies a -> b: a pattern on a; DMA into b's first part, a kernel on a
+    // into its second, batched DMA into its third; read back from b and checked.
+    const size_t n = 1 << 16;
+    CUdeviceptr pa = 0, pb = 0;
+    void* host = nullptr;
+    try {
+      check(d_->cuMemHostAlloc(&host, 4 * n, 0), "cuMemHostAlloc");
+      auto* h = static_cast<unsigned char*>(host);
+      for (size_t i = 0; i < n; ++i) h[i] = static_cast<unsigned char>(i * 131 + 7);
+      {
+        Push push(*d_, B.ctx);
+        check(d_->cuMemAlloc(&pb, 3 * n), "cuMemAlloc");
+        check(d_->cuMemsetD8Async(pb, 0, 3 * n, B.side), "cuMemsetD8Async");
+        check(d_->cuStreamSynchronize(B.side), "cuStreamSynchronize");
+      }
+      Push push(*d_, A.ctx);
+      check(d_->cuMemAlloc(&pa, n), "cuMemAlloc");
+      check(d_->cuMemcpyHtoDAsync(pa, host, n, A.side), "cuMemcpyHtoDAsync");
+      check(d_->cuMemcpyDtoDAsync(pb, pa, n, A.side), "cuMemcpyDtoDAsync");
+      const bool try_kernel = p.access && A.kernels;
+      if (try_kernel) {
+        const long long sp = static_cast<long long>(pa), dp = static_cast<long long>(pb + n), ln = static_cast<long long>(n);
+        launch(A, "ce_bytes_cs", {Chunk{sp, dp, ln, 1, 0, 0}}, {}, A.side);
+      }
+      const bool try_batch = A.batch;
+      if (try_batch) {
+        const Side sa{{DeviceKind::cuda, a}, DType::u8, false}, sb{{DeviceKind::cuda, b}, DType::u8, false};
+        std::vector<Raw> raws;
+        for (size_t k = 0; k < 16; ++k) raws.push_back({pa + k * (n / 16), pb + 2 * n + (15 - k) * (n / 16), n / 16});
+        batch(A, sa, sb, raws, A.side);
+      }
+      check(d_->cuMemcpyDtoHAsync(h + n, pb, 3 * n, A.side), "cuMemcpyDtoHAsync");
+      check(d_->cuStreamSynchronize(A.side), "cuStreamSynchronize");
+      p.dma = std::memcmp(h, h + n, n) == 0;
+      if (!p.dma) p.error = "peer DMA test copy came back wrong";
+      p.kernel = try_kernel && std::memcmp(h, h + 2 * n, n) == 0;
+      if (try_kernel && !p.kernel) p.error = "a kernel writing the other GPU's memory came back wrong";
+      if (!try_kernel && p.access) p.error = "no kernels: " + A.kernel_error;
+      bool ok = try_batch;
+      for (size_t k = 0; k < 16 && ok; ++k)
+        ok = std::memcmp(h + k * (n / 16), h + 3 * n + (15 - k) * (n / 16), n / 16) == 0;
+      p.batch = ok;
+    } catch (const Error& e) {
+      p.dma = p.kernel = p.batch = false;
+      p.error = std::string("peer admission: ") + e.what();
+    }
+    if (pa) {
+      Push push(*d_, A.ctx);
+      d_->cuMemFree(pa);
+    }
+    if (pb) {
+      Push push(*d_, B.ctx);
+      d_->cuMemFree(pb);
+    }
+    if (host) d_->cuMemFreeHost(host);
+    return p;
+  }
+
   PacedPlan build_paced(Dev& s, const Group& g) {
     if (!s.kernels) fail(Errc::unsupported, "a bandwidth limit needs the kernel module (pacing): " + s.kernel_error);
     if (!(g.bandwidth > 0)) fail(Errc::backend, "paced: the group has no bandwidth limit");
@@ -2751,6 +2938,8 @@ class CudaExecutor final : public Executor {
   EngineOptions opt_;
   const Driver* d_ = nullptr;
   std::vector<Dev> devs_;
+  std::mutex peers_seen_mu_;
+  std::set<std::pair<int, int>> peers_seen_;  // pairs this executor asked about (stats)
 };
 
 }  // namespace

@@ -50,7 +50,27 @@ HostMemory host_memory(uintptr_t p) {
 
 namespace {
 std::atomic<const DeviceAllocator*> g_allocator{nullptr};
+std::atomic<StreamProvider> g_streams{nullptr};
+std::atomic<PeerEnabler> g_peers{nullptr};
 }  // namespace
+
+void set_peer_enabler(PeerEnabler f) { g_peers.store(f); }
+PeerEnabler peer_enabler() { return g_peers.load(); }
+
+namespace {
+thread_local bool t_enabling_peer = false;
+}
+void run_peer_enabler(int a, int b) {
+  const PeerEnabler f = peer_enabler();
+  if (!f) return;
+  t_enabling_peer = true;
+  f(a, b);  // noexcept
+  t_enabling_peer = false;
+}
+bool enabling_peer() { return t_enabling_peer; }
+
+void set_stream_provider(StreamProvider f) { g_streams.store(f); }
+StreamProvider stream_provider() { return g_streams.load(); }
 
 void set_device_allocator(const DeviceAllocator* a) { g_allocator.store(a); }
 const DeviceAllocator* device_allocator() { return g_allocator.load(); }
@@ -179,6 +199,8 @@ const FrontendApi* frontend_api() {
     a.queued = &queued;
     a.decline = &decline;
     a.set_device_allocator = &set_device_allocator;
+    a.set_stream_provider = &set_stream_provider;
+    a.set_peer_enabler = &set_peer_enabler;
     a.copy_indexed = &copy_indexed;
     a.shared_engine = &shared_engine;
     a.tile = &tile;

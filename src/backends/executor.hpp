@@ -33,9 +33,13 @@ class Executor {
   virtual int64_t mark(uintptr_t /*stream*/, int /*device*/) { return -1; }
   virtual double elapsed(int64_t /*a*/, int64_t /*b*/) { return 0; }
   virtual void release(int64_t /*m*/) {}
-  // Work queued on `later` from now on runs after what is queued on `earlier`
-  // (an event: the host does not wait).
-  virtual void order(uintptr_t /*later*/, uintptr_t /*earlier*/, int /*device*/) {}
+  // Work queued on `later` (a stream of GPU `later_device`) from now on runs
+  // after what is queued on `earlier` (of `earlier_device`): an event, the host
+  // does not wait. A legacy stream handle (0) names that device's.
+  virtual void order(uintptr_t /*later*/, int /*later_device*/, uintptr_t /*earlier*/, int /*earlier_device*/) {}
+  // The GPU `stream` belongs to; `fallback` for handles that name the current
+  // context's stream (0, the legacy and per-thread streams).
+  virtual int stream_device(uintptr_t /*stream*/, int fallback) { return fallback; }
   // Whether the work before mark `m` has completed (does not release it).
   virtual bool ready(int64_t /*m*/) { return true; }
   // CUDA Graph capture. While `stream` is being captured, work may only be

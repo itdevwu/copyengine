@@ -160,6 +160,11 @@ fastest.
   memory it reads or writes, so code in the scope sees the copied data.
   Memory read without going through torch (`.numpy()`, raw pointers) needs
   `ce.barrier()` first.
+- Copies between two GPUs are ordered as torch's own: they run on the source
+  GPU's current stream, after the work queued on both GPUs' current streams
+  and before their later work. Conversions and GPU-index gathers / scatters
+  between two GPUs run as one kernel on the source GPU where the pair passes
+  a verified test copy (`stats()["cuda"][i]["peers"]`); otherwise DMA.
 - GPU work runs on the current stream, like torch's own copies. GPU-to-GPU
   copies are not waited for; intercepted `copy_` keeps its `non_blocking`
   behavior; the explicit `ce.copy_` returns with any host-side copy complete

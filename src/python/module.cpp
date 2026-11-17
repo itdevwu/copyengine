@@ -325,7 +325,7 @@ NB_MODULE(_core, m) {
            "stream"_a, "rebinds"_a)
       .def_prop_ro("tables", &ce::Frozen::tables)
       .def_prop_ro("allocations", &ce::Frozen::allocations)
-      .def("host_overlap", &ce::Frozen::host_overlap);
+      .def("host_overlap", &ce::Frozen::host_overlap, nb::call_guard<nb::gil_scoped_release>());
 
   auto make_hints = [](nb::handle valid_start, nb::handle valid_len, const std::string& ctx) {
     ce::Hints h;
@@ -413,28 +413,29 @@ NB_MODULE(_core, m) {
         e.fence(r, w);
       }, "reads"_a, "writes"_a)
       .def("begin_scope", nb::overload_cast<bool, double>(&ce::Engine::begin_scope), "host_async"_a = false,
-           "bandwidth"_a = 0.0)
+           "bandwidth"_a = 0.0, nb::call_guard<nb::gil_scoped_release>())
       .def("end_scope", &ce::Engine::end_scope, nb::call_guard<nb::gil_scoped_release>())
       .def("flush", &ce::Engine::flush, nb::call_guard<nb::gil_scoped_release>())
       .def("synchronize", &ce::Engine::synchronize, nb::call_guard<nb::gil_scoped_release>())
-      .def("decline", [](ce::Engine& e, const std::string& why) { e.decline(why); }, "reason"_a)
-      .def("mark_pending", &ce::Engine::mark_pending)
-      .def("done", &ce::Engine::done, "token"_a)
-      .def_prop_ro("depth", &ce::Engine::depth)
-      .def_prop_ro("queued", &ce::Engine::queued)
-      .def("stats_json", &ce::Engine::stats_json)
-      .def_prop_ro("tuning_runs", &ce::Engine::tuning_runs)
-      .def("dump_profile", &ce::Engine::dump_profile)
-      .def("load_profile", &ce::Engine::load_profile)
-      .def("freeze", [](const ce::Engine& e, bool rebindable) { return e.freeze(rebindable); }, "rebindable"_a = false)
+      .def("decline", [](ce::Engine& e, const std::string& why) { e.decline(why); }, "reason"_a, nb::call_guard<nb::gil_scoped_release>())
+      .def("mark_pending", &ce::Engine::mark_pending, nb::call_guard<nb::gil_scoped_release>())
+      .def("done", &ce::Engine::done, "token"_a, nb::call_guard<nb::gil_scoped_release>())
+      .def_prop_ro("depth", [](const ce::Engine& e) { nb::gil_scoped_release r; return e.depth(); })
+      .def_prop_ro("queued", [](const ce::Engine& e) { nb::gil_scoped_release r; return e.queued(); })
+      .def("stats_json", &ce::Engine::stats_json, nb::call_guard<nb::gil_scoped_release>())
+      .def_prop_ro("tuning_runs", [](const ce::Engine& e) { nb::gil_scoped_release r; return e.tuning_runs(); })
+      .def("dump_profile", &ce::Engine::dump_profile, nb::call_guard<nb::gil_scoped_release>())
+      .def("load_profile", &ce::Engine::load_profile, nb::call_guard<nb::gil_scoped_release>())
+      .def("freeze", [](const ce::Engine& e, bool rebindable) { return e.freeze(rebindable); }, "rebindable"_a = false, nb::call_guard<nb::gil_scoped_release>())
       .def("freeze_composed",
            [](const ce::Engine& e, const std::vector<std::array<int64_t, 3>>& dead, bool rebindable) {
+             nb::gil_scoped_release release;
              return e.freeze_composed(dead, rebindable);
            },
            "dead"_a, "rebindable"_a = false)
-      .def("release_payloads", &ce::Engine::release_payloads)
-      .def_prop_ro("flushes", &ce::Engine::flushes)
-      .def("set_recording", &ce::Engine::set_recording);
+      .def("release_payloads", &ce::Engine::release_payloads, nb::call_guard<nb::gil_scoped_release>())
+      .def_prop_ro("flushes", [](const ce::Engine& e) { nb::gil_scoped_release r; return e.flushes(); })
+      .def("set_recording", &ce::Engine::set_recording, nb::call_guard<nb::gil_scoped_release>());
 
   m.def("hardware_fingerprint", &ce::hardware_fingerprint);
   m.def("host_is_pinned", &ce::host_is_pinned, "ptr"_a);
@@ -443,9 +444,10 @@ NB_MODULE(_core, m) {
     return std::string(names[static_cast<int>(ce::host_memory(p))]);
   }, "ptr"_a);
   // The process-wide engine of module-level calls inside torch.compile regions (FrontendApi::shared_engine).
-  m.def("shared_engine_stats", [] { return ce::frontend_api()->shared_engine()->stats_json(); });
-  m.def("shared_engine_profile", [] { return ce::frontend_api()->shared_engine()->dump_profile(); });
-  m.def("shared_engine_load_profile", [](const std::string& p) { ce::frontend_api()->shared_engine()->load_profile(p); });
+  m.def("shared_engine_stats", [] { return ce::frontend_api()->shared_engine()->stats_json(); }, nb::call_guard<nb::gil_scoped_release>());
+  m.def("shared_engine_profile", [] { return ce::frontend_api()->shared_engine()->dump_profile(); }, nb::call_guard<nb::gil_scoped_release>());
+  m.def("shared_engine_load_profile", [](const std::string& p) { ce::frontend_api()->shared_engine()->load_profile(p); },
+        nb::call_guard<nb::gil_scoped_release>());
   // torch's float8_e4m3fn overflow mode (convert.hpp): set once at import, before any copy.
   m.def("_set_f8e4m3_saturate", [](bool on) { ce::cv::f8e4m3_saturate = on ? 1 : 0; });
   m.def("_f8e4m3_saturate", [] { return ce::cv::f8e4m3_saturate != 0; });

@@ -197,10 +197,15 @@ class StepPlan:
         self._last = None                           # (leaves, trace) of the previous call
         self._last_memory = None                    # its tensors' memory signature, see _fast
         self._mem_now = None
+        self._mu = threading.RLock()
 
     # ---- calls -------------------------------------------------------------------------
 
     def __call__(self, *args, **kw) -> None:
+        with self._mu:  # threads sharing a plan take turns (its traces and last call are one state)
+            self._call(*args, **kw)
+
+    def _call(self, *args, **kw) -> None:
         leaves = _flatten(args, kw)
         self._mem_now = None
         tr = self._fast(leaves)

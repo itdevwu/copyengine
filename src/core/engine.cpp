@@ -10,6 +10,7 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include <memory>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -171,7 +172,6 @@ struct Engine::Impl {
   std::vector<std::pair<uintptr_t, int>> pending_at;  // (stream, device) with pending work, for mark_pending
   std::unordered_map<int64_t, std::vector<int64_t>> tokens;  // mark_pending token -> executor marks
   int64_t next_token = 0;
-  std::thread::id owner;  // thread with the open scope (depth > 0)
 
   // Objects whose destruction may run frontend code (Python objects, torch
   // tensors): destroyed only once the engine lock is released (see Locked),
@@ -209,23 +209,21 @@ struct Engine::Impl {
   }
 
   // Lets go of kept payloads whose copies have completed (oldest first).
-  void reap(bool all = false) {
-    while (!kept.empty()) {
-      Kept& k = kept.front();
+  void reap(bool all = false) { reap(kept, all); }
+  void reap(std::deque<Kept>& ks, bool all) {
+    while (!ks.empty()) {
+      Kept& k = ks.front();
       if (!all)
         for (int64_t m : k.marks)
           if (!cuda->ready(m)) return;
       for (int64_t m : k.marks) cuda->release(m);
       for (auto& p : k.payloads) bury(std::move(p));
-      kept.pop_front();
+      ks.pop_front();
     }
   }
 
-  void check_thread() const {
-    if (depth > 0 && owner != std::this_thread::get_id())
-      fail(Errc::invalid_argument,
-           "this engine has a scope open on another thread; give each thread its own engine");
-  }
+  // Threads share an engine: each has its own session (see enter_session).
+  void check_thread() const {}
   bool host_pending = false;
   // GPU work that reads or writes host memory may still be running (any stream).
   bool host_inflight = false;
@@ -236,6 +234,8 @@ struct Engine::Impl {
     if (host && host_inflight && !capturing && op.native && op.native->cpu_host_access()) synchronize();
   }
   FlushStats last;
+  // this thread's flushes (a session field: freeze and step plans count their own)
+  int64_t own_flushes = 0;
   int64_t total_flushes = 0, total_ops = 0, total_calls = 0, total_bytes = 0, plan_hits = 0;
   int64_t tuning_runs = 0;  // see Engine::tuning_runs
   double total_plan_us = 0;  // planning on plan-cache misses
@@ -1074,7 +1074,7 @@ struct Engine::Impl {
     const int64_t calls = run_group(g, memo.strategy, queue, stream, false, nullptr);
     keep(queue, stream);
     if (memo.strategy != Strategy::native) bury(std::move(op.native));
-    ++total_flushes, ++total_ops, ++plan_hits;
+    ++total_flushes, ++own_flushes, ++total_ops, ++plan_hits;
     total_calls += calls;
     total_bytes += g.bytes();
     if (last_ops && last_ops.use_count() == 1 && last_ops->size() == 1) {
@@ -1179,7 +1179,7 @@ struct Engine::Impl {
     }
     last = st;
     last_capture = capturing;
-    ++total_flushes;
+    ++total_flushes, ++own_flushes;
     total_ops += st.ops;
     total_calls += st.calls;
     total_bytes += st.bytes;
@@ -1256,6 +1256,103 @@ struct Engine::Impl {
     Capture(Impl& impl, uintptr_t strm) : m(impl), was(impl.capturing) { m.capturing = m.is_capturing(strm); }
     ~Capture() { m.capturing = was; }
   };
+
+  // ---- sessions: one engine, many threads ---------------------------------------
+  //
+  // What one thread's copies are in the middle of (its queue, open scopes,
+  // stream, work still pending, last flush for freeze, a step plan
+  // recording). Every engine call runs under `mu`, so these stay plain
+  // members of Impl: the outermost lock of a thread swaps its session in and
+  // the previous thread's out (Locked). Plans, the tuner, executors and their
+  // tables, the statement cache and the statistics are shared.
+  // Expires when the session's thread exits (a thread_local of that thread).
+  std::weak_ptr<void> alive;
+#define CE_SESSION_FIELDS(X)                                                                          \
+  X(depth) X(scope_async) X(scope_bw) X(async_depth) X(queue) X(stream) X(q_reads) X(q_writes)      \
+  X(cuda_streams) X(pending_at) X(kept) X(host_pending) X(host_inflight) X(last) X(last_capture)    \
+  X(recording) X(last_ops) X(last_ran) X(memo) X(own_flushes) X(alive)
+  struct Session {
+#define CE_SESSION_DECL(f) decltype(Impl::f) f{};
+    CE_SESSION_FIELDS(CE_SESSION_DECL)
+#undef CE_SESSION_DECL
+    bool idle() const {
+      return depth == 0 && queue.empty() && kept.empty() && cuda_streams.empty() && pending_at.empty() && !recording &&
+             !last_ops && own_flushes == 0;
+    }
+  };
+  std::thread::id active{};  // whose session the members hold now
+  std::unordered_map<std::thread::id, Session> parked;
+  static std::weak_ptr<void> this_thread_alive() {
+    thread_local const std::shared_ptr<int> token = std::make_shared<int>(0);
+    return token;
+  }
+  // Sessions of threads that exited (a thread id may be reused by a new
+  // thread, which must not inherit them): their buffers and last flush are
+  // let go (after the lock, as every payload) once nothing of theirs is
+  // queued or in flight; the engine's destruction runs what still is.
+  std::vector<Session> exited;
+  void drop_exited() {
+    for (auto it = parked.begin(); it != parked.end();) {
+      if (it->second.alive.expired()) {
+        exited.push_back(std::move(it->second));
+        it = parked.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    for (size_t i = 0; i < exited.size();) {
+      Session& s = exited[i];
+      if (s.depth == 0 && s.queue.empty()) reap(s.kept, false);
+      if (s.depth == 0 && s.queue.empty() && s.kept.empty()) {
+        bury(std::make_shared<Session>(std::move(s)));
+        exited[i] = std::move(exited.back());
+        exited.pop_back();
+      } else {
+        ++i;
+      }
+    }
+  }
+
+  void park(Session& s) {
+#define CE_SESSION_PARK(f) s.f = std::move(f), f = decltype(f){};
+    CE_SESSION_FIELDS(CE_SESSION_PARK)
+#undef CE_SESSION_PARK
+  }
+  void unpark(Session& s) {
+#define CE_SESSION_LOAD(f) f = std::move(s.f);
+    CE_SESSION_FIELDS(CE_SESSION_LOAD)
+#undef CE_SESSION_LOAD
+  }
+  // Makes the calling thread's session the members (at its outermost lock).
+  void enter_session() {
+    const std::thread::id me = std::this_thread::get_id();
+    const bool reused = me == active && alive.expired();  // an exited thread's id, its session still in
+    if (me == active && !reused) return;
+    Session out;
+    park(out);
+    if (reused) exited.push_back(std::move(out));
+    else if (!out.idle()) parked[active] = std::move(out);
+    drop_exited();
+    if (auto it = parked.find(me); it != parked.end()) {
+      unpark(it->second);
+      parked.erase(it);
+    }
+    alive = this_thread_alive();
+    active = me;
+  }
+  // Runs `f` in every session (the engine's destruction: flush and wait for all).
+  template <class F>
+  void each_session(F&& f) {
+    f();
+    for (auto it = parked.begin(); it != parked.end(); it = parked.erase(it)) exited.push_back(std::move(it->second));
+    while (!exited.empty()) {
+      Session out;
+      park(out);
+      unpark(exited.back());
+      exited.pop_back();
+      f();
+    }
+  }
 };
 
 namespace {
@@ -1263,7 +1360,11 @@ namespace {
 // emptied after unlocking (see Impl::graveyard).
 class Locked {
  public:
-  explicit Locked(Engine::Impl& m) : m_(m), lk_(m.mu) { ++m_.lock_depth; }
+  // Frontends release their own locks (Python's GIL) before calling in: an
+  // engine holding this lock may run frontend code (a native copy) that takes them.
+  explicit Locked(Engine::Impl& m) : m_(m), lk_(m.mu) {
+    if (m_.lock_depth++ == 0) m_.enter_session();
+  }
   ~Locked() {
     std::vector<std::shared_ptr<void>> drop;
     if (--m_.lock_depth == 0) drop.swap(m_.graveyard);
@@ -1280,8 +1381,14 @@ Engine::Engine(EngineOptions options) : impl_(std::make_unique<Impl>(options)) {
 Engine::~Engine() {
   try {
     Locked lk(*impl_);
-    impl_->flush();
-    impl_->synchronize();
+    // Every thread's session: its queued copies run, and are waited for.
+    impl_->each_session([&] {
+      impl_->flush();
+      impl_->synchronize();
+      impl_->memo = {};
+      impl_->last_ran = {};
+      impl_->last_ops.reset();
+    });
   } catch (const std::exception& e) {  // a destructor cannot throw: say what was lost
     std::fprintf(stderr, "[copyengine] engine destroyed with copies that failed: %s\n", e.what());
   } catch (...) {  // NOLINT(bugprone-empty-catch): reported above when it is a std::exception
@@ -1374,7 +1481,7 @@ void Engine::begin_scope(bool host_async, double bandwidth) {
   if (!(bandwidth >= 0)) fail(Errc::invalid_argument, "bandwidth must be >= 0 bytes per second");
   Locked lk(*impl_);
   impl_->check_thread();
-  if (impl_->depth++ == 0) impl_->owner = std::this_thread::get_id();
+  ++impl_->depth;
   impl_->scope_async.push_back(host_async);
   impl_->scope_bw.push_back(bandwidth);
   impl_->async_depth += host_async;
@@ -1498,6 +1605,7 @@ std::string Engine::stats_json() const {
       .set("churn_flushes", m.churn_flushes)
       .set("declined", std::move(declined))
       .set("kept", static_cast<uint64_t>(m.kept.size()))  // in-flight copies whose buffers are held
+      .set("sessions", static_cast<uint64_t>(1 + m.parked.size() + m.exited.size()))  // threads with state here
       .set("plans", static_cast<uint64_t>(m.plans.size()))
       .set("buckets", static_cast<uint64_t>(m.tuner.size()))
       .set("cuda", m.cuda ? m.cuda->info() : Json(m.cuda_error))
@@ -1637,7 +1745,7 @@ void Engine::set_recording(bool on) {
 
 int64_t Engine::flushes() const {
   Locked lk(*impl_);
-  return impl_->total_flushes;
+  return impl_->own_flushes;
 }
 
 void Engine::release_payloads() {

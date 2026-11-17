@@ -164,9 +164,11 @@ fastest.
   copies are not waited for; intercepted `copy_` keeps its `non_blocking`
   behavior; the explicit `ce.copy_` returns with any host-side copy complete
   (unless the engine was created with `allow_async=True`).
-- Threads: `ce.scope()` and `ce.copy_` use a per-thread default engine. An
-  `Engine` you share between threads works while none of them has a scope
-  open on it; a copy or scope from another thread during one raises an error.
+- Threads: an `Engine` may be shared by threads. Each thread has its own
+  scopes, queue and stream, and its own last flush for `freeze()`; plans,
+  tuning and the profile are shared. A scope intercepts copies only on the
+  thread that opened it. `ce.scope()` and `ce.copy_` use a per-thread default
+  engine; share one `Engine` explicitly to share its tuning.
 - Buffers of copies that are not waited for (intercepted `non_blocking`
   copies, `allow_async`) are kept alive until the GPU is done with them.
 - CUDA Graphs: copies inside `torch.cuda.graph` (scopes, `ce.copy_`,

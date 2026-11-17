@@ -13,6 +13,8 @@ Modes:
   scope     plain torch dst.copy_(src) inside eng.scope() (interception); index-free ops only
   plan      the program as a step plan (temporaries allocated inside); new index values per call
   freeze    one explicit flush, frozen, replayed
+  threads   one engine shared by threads, each with its own bases and stream: explicit and
+            scope runs interleaved (plans and tuning shared, sessions per thread)
 
 Also `forced`: every strategy (Engine(_force=...)) wherever the executor offers it, the most
 conservative one elsewhere, so a failure belongs to the forced strategy. FUZZ_SKIP=a,b leaves
@@ -311,6 +313,8 @@ def fuzz_one(seed, modes, runs=24):
             pass
     if "plan" in modes:
         errs += fuzz_plan(seed, init, ops, fresh)
+    if "threads" in modes:
+        errs += fuzz_threads(seed, init, ops, want, fresh, runs)
     if "graph" in modes:  # the program captured in a CUDA graph after warmup, replayed
         eng = ce.Engine()
         bs = fresh()
@@ -336,6 +340,46 @@ def fuzz_one(seed, modes, runs=24):
             if not any(w in str(ex) for w in ("captur", "graph")) and \
                     not isinstance(ex, (ce.Unsupported, ce.NeedsMaterialize, ce.UnsafeCopy)):
                 errs.append(f"seed {seed} mode graph: {type(ex).__name__}: {str(ex).splitlines()[0][:160]}")
+    return errs
+
+
+def fuzz_threads(seed, init, ops, want, fresh, runs, k=3):
+    import threading
+
+    plain = [op for op in ops if not op[1].indexed() and not op[2].indexed()]
+    want_p = reference(init, plain) if plain else None
+    eng = ce.Engine()
+    errs = []
+
+    def work(t):
+        s = torch.cuda.Stream()
+        try:
+            with torch.cuda.stream(s):
+                for it in range(runs):
+                    bs = fresh()
+                    if plain and (it + t) % 2:
+                        with eng.scope():
+                            for _, dv, sv in plain:
+                                dv.plain(bs[dv.base]).copy_(sv.plain(bs[sv.base]), non_blocking=True)
+                        tag, w = "scope", want_p
+                    else:
+                        run_explicit(eng, bs, ops, bool(it % 3 == 0))
+                        tag, w = "explicit", want
+                    torch.cuda.synchronize()
+                    e = check(f"threads[{t}]/{tag}", bs, w, seed, it)
+                    if e:
+                        errs.append(e)
+                        return
+        except (ce.Unsupported, ce.NeedsMaterialize, ce.UnsafeCopy):
+            return
+        except Exception as ex:
+            errs.append(f"seed {seed} mode threads[{t}]: {type(ex).__name__}: {str(ex).splitlines()[0][:160]}")
+
+    ts = [threading.Thread(target=work, args=(t,)) for t in range(k)]
+    for th in ts:
+        th.start()
+    for th in ts:
+        th.join()
     return errs
 
 

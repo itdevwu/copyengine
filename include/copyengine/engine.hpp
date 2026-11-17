@@ -89,10 +89,10 @@ struct Range {
   uintptr_t lo = 0, hi = 0;
 };
 
-// Lazy copy queue. Methods take an internal lock, so threads may share an
-// engine; but while one thread has a scope open, another thread's copies or
-// scopes on the same engine fail (they would be queued into that scope):
-// give each thread its own engine.
+// Lazy copy queue. Threads share an engine: each thread has its own session
+// (its queue, open scopes, stream, pending work and last flush), while plans,
+// tuning decisions, executors and statistics are shared. Methods take an
+// internal lock; a flush plans under it and only enqueues work.
 class Engine {
  public:
   explicit Engine(EngineOptions options = EngineOptions::from_env());
@@ -178,10 +178,12 @@ class Engine {
   // Drops the last flush's references to the frontend's copies (their
   // tensors), so memory only they kept alive is free (see freeze_composed).
   void release_payloads();
+  // The calling thread's flushes so far (its session's: other threads' flushes
+  // do not count; a region that flushed more than once was not one plan).
   int64_t flushes() const;
   // While on, every copy goes through the queue (none runs as torch's copy at
   // interception time): a frontend tracing a region for freeze() sets it.
-  void set_recording(bool on);  // flushes so far (a region that flushed more than once was not one plan)
+  void set_recording(bool on);
 
   struct Impl;
 

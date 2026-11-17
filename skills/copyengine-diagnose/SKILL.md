@@ -81,8 +81,6 @@ Read `why` in the decisions:
 - `NeedsMaterialize`: a `reshape` of a lazy view that no strides express;
   materialize with torch first or restructure the view. Lazy views take
   `[...]` indexing and `.slice` / `.narrow`.
-- "a scope open on another thread": one engine per thread (module-level
-  functions already use a per-thread engine).
 - Shim warning at import, or compile errors: the shim is compiled for the
   installed torch on first import (needs `c++`/`g++`; set `CXX`), cached under
   `CE_CACHE_DIR` (default `~/.cache/copyengine`). Delete that cache after a

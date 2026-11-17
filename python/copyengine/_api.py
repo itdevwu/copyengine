@@ -189,6 +189,32 @@ def _bandwidth(b) -> float:
     return b
 
 
+class _PerThread:
+    """An Engine attribute each thread has its own of (its session, as in the C++
+    engine): scope depth, held buffers, the interception of its open scope.
+    `default(engine)` makes a thread's first value."""
+
+    def __init__(self, default):
+        self.default = default
+
+    def __set_name__(self, owner, name):
+        self.name = name
+
+    def __get__(self, obj, owner=None):
+        if obj is None:
+            return self
+        tls = obj._tls
+        try:
+            return getattr(tls, self.name)
+        except AttributeError:
+            v = self.default(obj)
+            setattr(tls, self.name, v)
+            return v
+
+    def __set__(self, obj, v):
+        setattr(obj._tls, self.name, v)
+
+
 class Engine:
     """A lazy copy queue.
 
@@ -201,6 +227,17 @@ class Engine:
     Buffers touched inside a scope must not be read or written by other code
     until the scope exits (or :meth:`barrier` is called).
     """
+
+    # Per thread (see _PerThread).
+    _held = _PerThread(lambda e: [])                         # inside a scope: buffers of queued copies
+    _inflight = _PerThread(lambda e: collections.deque())   # allow_async: (token, buffers) until done
+    _force = _PerThread(lambda e: e._force0)
+    _async_depth = _PerThread(lambda e: 0)                  # open scope(stream=...)s
+    _depth = _PerThread(lambda e: 0)                        # scope depth: whether queued copies need references
+    _hold = _PerThread(lambda e: e._opts.allow_async)
+    _torch_at = _PerThread(lambda e: None)   # flush count when a site last ran torch's copies instead (freeze)
+    _temps = _PerThread(lambda e: [])        # (flush count, tensor): two-pass temporaries (freeze)
+    _scope_kind = _PerThread(lambda e: None)  # the outermost open scope's interception (inner scopes share it)
 
     def __init__(self, *, staging_budget_mb: int = 256, explore: bool = True, tune_trials: int = 5,
                  tune_topk: int = 3, ab_pairs: int = 20, ab_max_pairs: int = 50, online_every: int = 64,
@@ -234,18 +271,15 @@ class Engine:
         self._e = _core.Engine(self._opts)
         self._handle = self._e.handle
         self._native = native_copy  # replaceable in tests
-        self._held: list[Any] = []         # inside a scope: buffers of queued copies
-        self._inflight: collections.deque = collections.deque()  # allow_async: (token, buffers) until done
+        # Threads share the engine: what one is in the middle of is its own (_PerThread
+        # attributes below); site decisions, copy streams and the C++ engine are shared.
+        self._tls = threading.local()
+        self._force0 = _intercept  # tests: "shim" or "mode" regardless of what is installed
         self._lock = threading.RLock()
-        self._force = _intercept  # tests: "shim" or "mode" regardless of what is installed
         self._copy_streams: dict = {}  # device index -> torch.cuda.Stream (scope(stream="copy"))
-        self._async_depth = 0          # open scope(stream=...)s
-        self._set_depth(0)        # scope depth as seen from Python: whether queued copies need references held
         self._sites: dict = {}    # outermost scope call site -> _Site (intercept or not)
         self._many_sites: dict = {}  # copy_many call layout -> _Site (copyengine or torch._foreach_copy_)
-        self._torch_at = None  # engine flush count when a site last ran torch's copies instead (see freeze)
-        self._temps: list = []  # (flush count, tensor): two-pass temporaries of the recent flushes (see freeze)
-        self._scope_kind = None   # the outermost open scope's interception (inner scopes share it)
+        self._site_profile = {"scope": {}, "copy_many": {}}  # decisions loaded with a profile, by portable key
 
     # ---- scope ----------------------------------------------------------------
 
@@ -278,7 +312,10 @@ class Engine:
             if torch.cuda.is_current_stream_capturing():
                 raise _core.Unsupported("the copy stream is created on first use; use scope(stream='copy') once "
                                         "before capturing a CUDA graph")
-            st = self._copy_streams[dev.index] = torch.cuda.Stream(dev)
+            with self._lock:  # threads share it: one stream per device
+                st = self._copy_streams.get(dev.index)
+                if st is None:
+                    st = self._copy_streams[dev.index] = torch.cuda.Stream(dev)
         return st
 
     def _interception(self, site, limited: bool = False):
@@ -294,7 +331,7 @@ class Engine:
             return self._scope_kind, False
         st = self._sites.get(site)
         if st is None:
-            st = self._sites[site] = _Site(on)
+            st = self._sites.setdefault(site, self._new_site(on, "scope", _scope_key(site)))  # one per site, also when threads race
         kind, timed = st.choose()
         if timed and torch is not None and torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
             return (kind if st.decided is not None else on), False  # nothing runs during a capture: no samples
@@ -476,7 +513,7 @@ class Engine:
         key = (len(dsts), d0.device, s0.device, d0.dtype, s0.dtype, d0.is_pinned(), s0.is_pinned())
         site = self._many_sites.get(key)
         if site is None:
-            site = self._many_sites[key] = _Site("ce")
+            site = self._many_sites.setdefault(key, self._new_site("ce", "copy_many", _many_key(key)))
         kind, timed = site.choose()
         if kind is None:
             try:
@@ -895,11 +932,37 @@ class Engine:
                             for k, st in self._many_sites.items()]
         return out
 
+    def _new_site(self, on_kind, kind, key):
+        """A call site's A/B, decided already where a loaded profile says so; with
+        explore=False and no decision in the profile, the baseline (not measured)."""
+        st = _Site(on_kind)
+        pre = self._site_profile[kind].get(key)
+        if pre is not None:
+            st.decided = bool(pre)
+        elif not self._opts.explore:
+            st.decided = False
+        return st
+
     def dump_profile(self) -> str:
-        return self._e.dump_profile()
+        """The tuning decisions (buckets, from the C++ engine) and the call sites'
+        (scopes and copy_many: copyengine or torch), as JSON."""
+        prof = json.loads(self._e.dump_profile())
+        sites = {"scope": dict(self._site_profile["scope"]), "copy_many": dict(self._site_profile["copy_many"])}
+        for key, st in list(self._sites.items()):
+            if st.decided is not None:
+                sites["scope"][_scope_key(key)] = st.decided
+        for key, st in list(self._many_sites.items()):
+            if st.decided is not None:
+                sites["copy_many"][_many_key(key)] = st.decided
+        prof["sites"] = sites
+        return json.dumps(prof)
 
     def load_profile(self, profile: str) -> None:
-        self._e.load_profile(profile)
+        prof = json.loads(profile)
+        sites = prof.pop("sites", None) or {}
+        self._e.load_profile(json.dumps(prof))
+        for kind in ("scope", "copy_many"):
+            self._site_profile[kind].update({k: bool(v) for k, v in (sites.get(kind) or {}).items()})
 
     def save_profile(self, path: str) -> None:
         with open(path, "w") as f:
@@ -930,6 +993,17 @@ class Engine:
         return self._opts
 
 
+def _scope_key(site) -> str:
+    """A scope call site as a profile key: the same code at the same line in any process."""
+    code, line = site
+    return f"{code.co_filename}:{line}"
+
+
+def _many_key(key) -> str:
+    """A copy_many call layout as a profile key."""
+    return "|".join(str(x) for x in key)
+
+
 class _Site:
     """Whether one outermost scope call site intercepts copies.
 
@@ -958,9 +1032,16 @@ class _Site:
         self.warm = 0
         self.skips = 0
         self.waiting: list = []  # (used, host seconds, start event, end event) not yet complete
+        self._mu = threading.Lock()  # threads sharing the engine share its sites
 
     def choose(self):
         """(kind, timed) for the next entry: kind is the interception or None."""
+        if self.decided is not None:
+            return (self.on_kind if self.decided else None), False
+        with self._mu:
+            return self._choose()
+
+    def _choose(self):
         if self.decided is not None:
             return (self.on_kind if self.decided else None), False
         self._poll()
@@ -973,14 +1054,16 @@ class _Site:
 
     def warmed(self, quiet: bool) -> None:
         """A warm-up entry ended; `quiet`: it ran no tuning measurements."""
-        self.warm += 1
-        self.settled = self.settled + 1 if quiet else 0
+        with self._mu:
+            self.warm += 1
+            self.settled = self.settled + 1 if quiet else 0
 
     def sample(self, used: bool, seconds: float, start=None, end=None) -> None:
-        if start is None:
-            self.report(used, seconds)
-        else:
-            self.waiting.append((used, seconds, start, end))
+        with self._mu:
+            if start is None:
+                self.report(used, seconds)
+            else:
+                self.waiting.append((used, seconds, start, end))
 
     def _poll(self) -> None:
         while self.waiting and self.waiting[0][3].query():
@@ -1192,8 +1275,8 @@ class FrozenPlan:
 
 # ---- module-level default engine ------------------------------------------------------
 
-# One per thread: a scope queues the copies of the engine it belongs to, so a
-# shared default engine would pull other threads' copies into it.
+# One per thread (an Engine may be shared by threads; the default is not, so
+# threads that never asked for sharing tune independently, as before).
 _default = threading.local()
 
 

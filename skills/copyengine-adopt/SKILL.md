@@ -86,7 +86,8 @@ Read [patterns](references/patterns.md) for code. In short:
 | Copies must not take SMs from compute | `ce.Engine(max_sms=N)` |
 | Background offload must leave PCIe / memory bandwidth to other work | `with ce.scope(stream="copy", bandwidth=8e9) as h:` |
 
-Use one `ce.Engine()` per thread (the module-level functions already do).
+An `Engine` may be shared by threads (each has its own scopes and queue;
+tuning is shared); the module-level functions use one engine per thread.
 Index tensors may stay on the GPU (no sync): `ce.gather`, `ce.scatter_` and
 `ce.lazy(...).index_select` read them there. Host indices (lists, numpy
 arrays) are as good in a step plan; do not turn them into CUDA tensors per

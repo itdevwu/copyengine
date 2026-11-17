@@ -6,6 +6,13 @@ change incompatibly only in a new minor (0.x) or major release.
 
 ## Unreleased
 
+- Threads may share an `Engine`: each thread has its own session (scopes,
+  queue, stream, kept buffers, last flush for `freeze()`), while plans,
+  tuning and the profile are shared (before: a scope open on one thread made
+  other threads' calls raise). The engine lock is taken with the GIL
+  released. Scope and `copy_many` site decisions are saved in profiles and
+  loaded with them; with `explore=False` sites are not sampled.
+
 - Lazy copies whose source may share bytes with their destination (block
   copies within one pool, `ce.copy_(ce.lazy(pool)[d], ce.lazy(pool)[s])`)
   give torch's `pool[d] = pool[s]` result: two passes through a temporary

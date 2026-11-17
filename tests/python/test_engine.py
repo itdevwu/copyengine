@@ -653,32 +653,39 @@ def test_default_engine_is_per_thread():
     assert seen[0] is not ce.default_engine()
 
 
-def test_a_scope_on_another_thread_is_an_error_not_a_silent_queue():
+def test_a_scope_on_another_thread_does_not_take_this_threads_copies():
+    # One engine, two threads: each has its own session. A copy on this thread
+    # while the other thread has a scope open runs now, not in that scope.
     import threading
     e = engine()
     a = np.arange(16, dtype=np.float32)
     b = np.zeros(16, np.float32)
+    c, d = np.full(16, 3, np.float32), np.zeros(16, np.float32)
     entered, release = threading.Event(), threading.Event()
+    seen = {}
 
     def owner():
         with e.scope():
+            e.copy_(d, c)  # queued in this thread's scope
             entered.set()
             release.wait(5)
+            seen["queued"] = e._e.queued
+        seen["after"] = d.copy()
 
     t = threading.Thread(target=owner)
     t.start()
     entered.wait(5)
     try:
-        with pytest.raises(ValueError, match="another thread"):
-            e.copy_(b, a)
-        with pytest.raises(ValueError, match="another thread"):
-            with e.scope():
-                pass
+        e.copy_(b, a)  # this thread: no scope open, done on return
+        np.testing.assert_array_equal(b, a)
+        with e.scope():
+            e.copy_(b, a + 1)
+        np.testing.assert_array_equal(b, a + 1)
     finally:
         release.set()
         t.join()
-    e.copy_(b, a)  # fine once the scope is closed
-    np.testing.assert_array_equal(b, a)
+    assert seen["queued"] == 1  # only its own copy was in its scope
+    np.testing.assert_array_equal(seen["after"], c)
 
 
 def test_threads_with_their_own_engines_run_concurrently():
@@ -808,3 +815,38 @@ def test_forced_strategy_runs_where_offered():
     with pytest.raises(ValueError, match="unknown strategy"):
         e = ce.Engine(_force="nope")
         e.copy_(dst, src[:, ::2])
+
+
+def test_site_decisions_travel_with_the_profile():
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    src = torch.randn(256, 256, device="cuda")
+    dst = torch.empty(256, 128, device="cuda")
+
+    def step(e):
+        with e.scope(_site=SITE):
+            dst.copy_(src[:, ::2])
+
+    a = ce.Engine()
+    for _ in range(200):
+        step(a)
+        if a._sites[SITE].decided is not None:
+            break
+    decided = a._sites[SITE].decided
+    assert decided is not None
+    prof = a.dump_profile()
+    import json
+    assert list(json.loads(prof)["sites"]["scope"].values()) == [decided]
+    b = ce.Engine(explore=False)
+    b.load_profile(prof)
+    step(b)
+    assert b._sites[SITE].decided == decided  # taken from the profile, never sampled
+    c = ce.Engine(explore=False)  # no profile: the baseline (torch's copies), not measured
+    step(c)
+    assert c._sites[SITE].decided is False
+    torch.cuda.synchronize()
+    assert torch.equal(dst, src[:, ::2])
+
+
+SITE = (test_site_decisions_travel_with_the_profile.__code__, 1)

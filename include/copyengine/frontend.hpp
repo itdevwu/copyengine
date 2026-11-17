@@ -8,9 +8,16 @@
 
 namespace ce {
 
-// Whether host memory at `p` is page-locked by the CUDA driver (false
-// without a CUDA driver).
-bool host_is_pinned(uintptr_t p);
+// What the driver says of host memory at `p` (one query): pageable, pinned
+// (DMA reaches it), or mapped (kernels too, at `p`). The one source of
+// Endpoint::pinned / mapped for every frontend.
+HostMemory host_memory(uintptr_t p);
+inline bool host_is_pinned(uintptr_t p) { return host_memory(p) != HostMemory::pageable; }
+// An endpoint's host memory facts from the driver (host endpoints only).
+inline void set_host_memory(Endpoint& e) {
+  const HostMemory m = host_memory(e.base);
+  e.pinned = m != HostMemory::pageable, e.mapped = m == HostMemory::mapped;
+}
 
 // Where copyengine's own device memory (staging, resident tables, upload
 // buffers) and pinned host memory (bounce and upload buffers) come from, when
@@ -36,7 +43,7 @@ const DeviceAllocator* device_allocator();
 // extensions need not link the core. Both sides come from the same build;
 // errors cross as codes because exception types do not cross shared objects.
 struct FrontendApi {
-  static constexpr uint32_t kVersion = 5;
+  static constexpr uint32_t kVersion = 6;
   enum Flags : uint32_t {
     kHostAsync = 1,  // see Hints::host_async
   };
@@ -49,7 +56,7 @@ struct FrontendApi {
                       const int64_t* d_strides, int d_rank, int64_t d_off, const Elementwise& fn,
                       std::shared_ptr<NativeOp> native, uint32_t flags, uintptr_t stream,
                       std::string* error) = nullptr;
-  bool (*host_is_pinned)(uintptr_t p) = nullptr;
+  HostMemory (*host_memory)(uintptr_t p) = nullptr;
   // Engine::fence and Engine::queued.
   int (*fence)(Engine& engine, const Range* reads, size_t n_reads, const Range* writes, size_t n_writes,
                std::string* error) = nullptr;

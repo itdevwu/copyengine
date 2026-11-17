@@ -86,7 +86,10 @@ ce::Endpoint endpoint(const at::Tensor& t) {
   e.device = ce_device(t);
   e.base = reinterpret_cast<uintptr_t>(t.storage().data());
   e.nbytes = static_cast<int64_t>(t.storage().nbytes());
-  e.pinned = t.is_cpu() && g_api->host_is_pinned(e.base);
+  if (t.is_cpu()) {
+    const ce::HostMemory m = g_api->host_memory(e.base);
+    e.pinned = m != ce::HostMemory::pageable, e.mapped = m == ce::HostMemory::mapped;
+  }
   return e;
 }
 

@@ -13,16 +13,38 @@
 
 namespace ce {
 
-bool host_is_pinned(uintptr_t p) {
+HostMemory host_memory(uintptr_t p) {
 #if CE_WITH_CUDA
   const cuda::Driver* d = cuda::driver(nullptr);
-  if (!d || p == 0) return false;
-  CUmemorytype t{};
-  return d->cuPointerGetAttribute(&t, CU_POINTER_ATTRIBUTE_MEMORY_TYPE, static_cast<CUdeviceptr>(p)) == CUDA_SUCCESS &&
-         t == CU_MEMORYTYPE_HOST;
+  if (!d || p == 0) return HostMemory::pageable;
+  // The memory type needs no context; not known to the driver: pageable.
+  CUmemorytype type{};
+  if (d->cuPointerGetAttribute(&type, CU_POINTER_ATTRIBUTE_MEMORY_TYPE, static_cast<CUdeviceptr>(p)) != CUDA_SUCCESS ||
+      type != CU_MEMORYTYPE_HOST)
+    return HostMemory::pageable;
+  // The device address is a context's view: without one current on this thread
+  // (a fresh worker thread), ask in GPU 0's primary context (retained once).
+  CUcontext cur = nullptr;
+  bool pushed = false;
+  if (d->cuCtxGetCurrent(&cur) != CUDA_SUCCESS || !cur) {
+    static CUcontext primary = [d] {
+      CUdevice dev0 = 0;
+      CUcontext c = nullptr;
+      if (d->cuDeviceGet(&dev0, 0) != CUDA_SUCCESS || d->cuDevicePrimaryCtxRetain(&c, dev0) != CUDA_SUCCESS) c = nullptr;
+      return c;
+    }();
+    pushed = primary && d->cuCtxPushCurrent(primary) == CUDA_SUCCESS;
+  }
+  CUdeviceptr dev = 0;
+  const CUresult r = d->cuPointerGetAttribute(&dev, CU_POINTER_ATTRIBUTE_DEVICE_POINTER, static_cast<CUdeviceptr>(p));
+  if (pushed) {
+    CUcontext popped = nullptr;
+    d->cuCtxPopCurrent(&popped);
+  }
+  return r == CUDA_SUCCESS && dev == static_cast<CUdeviceptr>(p) ? HostMemory::mapped : HostMemory::pinned;
 #else
   (void)p;
-  return false;
+  return HostMemory::pageable;
 #endif
 }
 
@@ -152,7 +174,7 @@ const FrontendApi* frontend_api() {
   static const FrontendApi api = [] {
     FrontendApi a;
     a.copy_strided = &copy_strided;
-    a.host_is_pinned = &host_is_pinned;
+    a.host_memory = &host_memory;
     a.fence = &fence;
     a.queued = &queued;
     a.decline = &decline;

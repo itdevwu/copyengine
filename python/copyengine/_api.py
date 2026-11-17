@@ -16,6 +16,7 @@ import numpy as np
 
 from . import _compiled, _core, _plan, _torch_ops, _shim  # the shim lets copyengine:: ops through: load them first
 from ._tensor import (
+    same_bits_dtypes,
     device_table,
     select_device,
     Lazy,
@@ -50,6 +51,8 @@ def _stable(t) -> bool:
 
 
 _IS_CPU = __import__("operator").attrgetter("is_cpu")
+_DTYPE = __import__("operator").attrgetter("dtype")
+
 
 def _torch_f8e4m3_saturates() -> bool:
     """Whether the installed torch saturates float -> float8_e4m3fn beyond the
@@ -66,9 +69,6 @@ def _torch_f8e4m3_saturates() -> bool:
 if torch is not None:
     _core._set_f8e4m3_saturate(_torch_f8e4m3_saturates())  # copies keep matching torch
 
-if torch is not None:
-    _FLOATS = (torch.float16, torch.bfloat16, torch.float32, torch.float64,
-               torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e8m0fnu)
 
 
 def _same_bits(dst, src, fn) -> bool:
@@ -80,7 +80,7 @@ def _same_bits(dst, src, fn) -> bool:
     if fn is not None and fn is not _IDENTITY:
         return False
     if is_tensor(dst) and is_tensor(src):
-        return dst.dtype == src.dtype or (dst.dtype in _FLOATS and src.dtype != torch.bool)
+        return same_bits_dtypes(dst.dtype, src.dtype)
     return isinstance(dst, np.ndarray) and isinstance(src, np.ndarray) and dst.dtype == src.dtype
 
 
@@ -106,7 +106,7 @@ def _lazy_payload(dst, src, fn):
     if fn is not None and fn is not _IDENTITY:
         return None
     sd, dd = _dtype_of(src), _dtype_of(dst)
-    if sd is None or dd is None or not (dd == sd or (dd in _FLOATS and sd != torch.bool)):
+    if sd is None or dd is None or not same_bits_dtypes(dd, sd):
         return None
     if isinstance(src, Lazy) and any(op[0] == "slice" and (op[4] or 1) < 0 for op in src._ops):
         return None
@@ -174,7 +174,7 @@ def _flat_payload(dst, src, fn):
     """Whether a flat-index torch equivalent gives ce's bits for these tensors."""
     if fn is not None and fn is not _IDENTITY or not (is_tensor(dst) and is_tensor(src)):
         return False
-    return dst.dtype == src.dtype or (dst.dtype in _FLOATS and src.dtype != torch.bool)
+    return same_bits_dtypes(dst.dtype, src.dtype)
 
 
 def _bandwidth(b) -> float:
@@ -434,10 +434,18 @@ class Engine:
         if site is None:
             site = self._many_sites[key] = _Site("ce")
         kind, timed = site.choose()
-        if kind is None and not timed:  # decided: torch's copies, nothing else to check
+        if kind is None:
+            try:
+                # The distinct dtype pairs (C-level map), then the native baseline's rule on each.
+                same = all(same_bits_dtypes(d, s) for d, s in set(zip(map(_DTYPE, dsts), map(_DTYPE, srcs))))
+            except AttributeError:  # not all tensors: the general path
+                return False
+            if not same:
+                kind, timed = "ce", False  # torch's bits differ for some pair: copyengine's copy, no A/B
+        if kind is None and not timed:  # decided: torch's copies
             try:
                 self._copy_many_torch(dsts, srcs)
-            except TypeError:  # not all tensors (rejected before anything is copied)
+            except (TypeError, AttributeError):  # not all tensors (rejected before anything is copied)
                 return False
             return True
         if not all(map(_stable, dsts)) or not all(map(_stable, srcs)):
@@ -645,7 +653,7 @@ class Engine:
             spec.zero = sides["zero"][0]
         for x_side, ix in ((True, xt), (False, ct)):
             if ix is not None:
-                spec.set_index(x_side, ix[0], ix[1], ix[2], ix[4])
+                spec.set_index(x_side, ix[0], ix[1], ix[2], ix[4], len(ix[3]))
         xi = None if xt is None else xt[3]  # moved to the tensors' device only if the baseline runs
         ci = None if ct is None else ct[3]
         blk = None if block is None else (bh, g)

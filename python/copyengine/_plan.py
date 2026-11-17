@@ -103,7 +103,7 @@ def _fill(buf, x) -> None:
 
 
 def _buffer(x):
-    n = x.numel() if _is_tensor(x) else len(x)
+    n = x.numel() if _is_tensor(x) else int(np.asarray(x).size)  # 0-d arrays too
     pin = torch.cuda.is_available()
     buf = torch.empty(n, dtype=torch.int64, pin_memory=pin)
     _fill(buf, x)

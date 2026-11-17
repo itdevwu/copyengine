@@ -75,10 +75,40 @@ def _real(m, bound=None):
         else:
             r.copy_(torch.randint(0, max(1, b), shape, device=dev))
     elif dtype.is_floating_point:
-        r.copy_((torch.randn(shape, device=dev) * 3).to(dtype))
+        wide = torch.float64 if dtype == torch.float64 else torch.float32  # f64 samples keep f64-only values
+        v = torch.randn(shape, device=dev, dtype=wide) * 3
+        _edges(v.view(-1), _FLOAT_EDGES + (_F64_EDGES if wide == torch.float64 else []))
+        r.copy_(v.to(dtype))
     elif dtype != torch.bool:
-        r.copy_(torch.randint(0, 100, shape, device=dev).to(dtype))
+        v = torch.randint(0, 100, shape, device=dev).to(dtype)
+        info = torch.iinfo(dtype)
+        _edges(v.view(-1), [info.min, info.max, 0, -1 if info.min < 0 else 1])
+        r.copy_(v)
     return r
+
+
+# Values where implementations disagree most (rounding ties, saturation, NaN / inf,
+# denormals, FP8 and integer ranges): part of every sample the bits are checked on.
+_FLOAT_EDGES = [float("nan"), float("inf"), -float("inf"), 0.0, -0.0, 448.0, 449.0, 464.0, -448.0, 57344.0,
+                61440.0, 1e30, -1e30, 3.4e38, 1e-40, -1e-40, 2.0 ** 31, -(2.0 ** 31) - 1, 0.5, 1.5, 2.5, -2.5,
+                127.5, -128.5, 255.5, 1.0 + 2.0 ** -8, 1.0 + 2.0 ** -9, 1.0 + 2.0 ** -11, 1.0 + 2.0 ** -12,
+                65504.0, 65520.0, 6e-8]
+# Only representable in float64: beyond float32's range, below its denormals, and ties of the
+# narrow types that float32 would round first (double rounding).
+_F64_EDGES = [1e300, -1e300, 1e-310, 1.0 + 2.0 ** -9 + 2.0 ** -40, 1.0 + 2.0 ** -12 + 2.0 ** -40,
+              3.5e38, 65519.99999999]
+
+
+def _edges(flat, values):
+    """Spread `values` over a flat sample (every k-th element), so every unit / row sees some."""
+    n = flat.numel()
+    if n == 0:
+        return
+    k = max(1, n // (4 * len(values)))
+    for j, x in enumerate(values * 4):
+        if j * k >= n:
+            break
+        flat[j * k] = x
 
 
 def _same_bits(a, b) -> bool:
@@ -178,11 +208,32 @@ def _measure(kind, metas, extra, reps=25):
     return ("ce" if mc < _MARGIN * mn else "torch"), why
 
 
+def _pairs_same_bits(kind, metas, extra) -> bool:
+    """For copies, whether torch's conversion gives copyengine's bits for every (dst, src)
+    dtype pair (the eager rule, same_bits): elsewhere no baseline is offered."""
+    from ._tensor import same_bits_dtypes
+
+    def ok(d, s):
+        return same_bits_dtypes(getattr(torch, d[2]), getattr(torch, s[2]))
+    if kind == "copy":
+        return ok(metas[0], metas[1])
+    if kind == "copy_many":
+        n = extra[0]
+        return all(ok(d, s) for d, s in zip(metas[:n], metas[n:2 * n]))
+    if kind == "gather":  # [out, src, idx]
+        return ok(metas[0], metas[1])
+    if kind == "scatter":  # [dst, idx, src]
+        return ok(metas[0], metas[2])
+    return True  # tile ops: checked on edge-value samples (their recipe is the reference)
+
+
 def _decide(kind, metas, extra):
     if os.environ.get("CE_COMPILE_BASELINE", "1") in ("0", "off", "false") or not torch.cuda.is_available():
         return "ce"
     if any(m is False for m in metas) or not any(m is not None and m[3] == "cuda" for m in metas):
         return "ce"  # symbolic sizes, or no GPU tensor
+    if not _pairs_same_bits(kind, metas, extra):
+        return "ce"  # a dtype pair where torch's bits differ: no baseline, whatever is faster
     key = (kind, metas, extra)
     with _LOCK:
         if key in _DECISIONS:

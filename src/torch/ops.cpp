@@ -68,7 +68,8 @@ ce::Endpoint endpoint(const Tensor& t) {
   } else {
     STD_TORCH_CHECK(t.is_cpu(), "[copyengine:3] only CPU and CUDA tensors are supported");
     e.device = {ce::DeviceKind::host, 0};
-    e.pinned = g_api->host_is_pinned(e.base);
+    const ce::HostMemory m = g_api->host_memory(e.base);
+    e.pinned = m != ce::HostMemory::pageable, e.mapped = m == ce::HostMemory::mapped;
   }
   return e;
 }
@@ -374,6 +375,7 @@ ce::TileSpec::Index tile_index(const std::optional<Tensor>& ix, const Tensor& of
   STD_TORCH_CHECK(t.scalar_type() == ST::Long && t.dim() == 1 && t.stride(0) == 1,
                   "[copyengine:0] an index is a contiguous int64 vector");
   i.bound = of.size(0);
+  i.count = t.numel();
   if (t.is_cuda()) {
     i.dev = reinterpret_cast<uintptr_t>(t.data_ptr());
   } else {

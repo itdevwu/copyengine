@@ -139,6 +139,9 @@ it merges, against these:
   against torch, every strategy forced) and `just sanitize`
   (compute-sanitizer) run before a pre-release; a feature merges after a
   review against the checklist above.
+- Other GPU generations and multi-GPU machines are reached through
+  `tests/fuzz/kit.py` (one JSON report, run by whoever has the machine); a
+  pre-release is announced with the kit results it has.
 
 ## Branches, commits and releases
 

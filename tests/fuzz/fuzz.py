@@ -31,19 +31,60 @@ import torch
 import copyengine as ce
 
 DEV = "cuda"
-KINDS = ("cuda", "pinned", "pageable")
+# Host memory kinds: pinned (cudaHostAlloc, mapped), registered (cudaHostRegister: pinned, maybe
+# not mapped at its own address), pageable. With several GPUs, CUDA bases spread over them.
+KINDS = ("cuda", "pinned", "registered", "pageable")
+GPUS = torch.cuda.device_count() if torch.cuda.is_available() else 0
+_REGISTERED = []  # (ctypes buffer) kept alive and registered for the process
 STRATEGIES = ("native", "passthrough", "runs", "runs_parallel", "batch", "kernel", "staged", "bounce", "fused",
               "lowered", "bulk", "tma2d")
 import os as _os  # noqa: E402
 STRATEGIES = tuple(s for s in STRATEGIES if s not in _os.environ.get("FUZZ_SKIP", "").split(","))
 
 
+def registered_like(t):
+    """A copy of host tensor t in memory registered with cudaHostRegister (Portable): pages of
+    its own (mmap), so no registration shares a page with another and none fails for that."""
+    import ctypes
+    import mmap
+    n = t.numel() * t.element_size()
+    buf = mmap.mmap(-1, max(mmap.PAGESIZE, -(-n // mmap.PAGESIZE) * mmap.PAGESIZE))
+    addr = ctypes.addressof(ctypes.c_char.from_buffer(buf))
+    rt = torch.cuda.cudart()
+    err = rt.cudaHostRegister(addr, len(buf), 1)
+    if err != rt.cudaError.success:
+        raise RuntimeError(f"fuzz: cudaHostRegister failed ({err}): the registered kind would go untested")
+    _REGISTERED.append((buf, addr))
+    r = torch.frombuffer(buf, dtype=torch.uint8)[:n].view(t.dtype).view(t.shape)
+    r.copy_(t)
+    return r
+
+
 def make_base(rng, kind, dtype):
     shape = tuple(int(rng.integers(4, 11)) for _ in range(3))
     t = torch.from_numpy(rng.standard_normal(shape).astype(np.float32)).to(dtype)
     if kind == "cuda":
-        return t.to(DEV)
+        return t.to(f"cuda:{int(rng.integers(0, GPUS))}" if GPUS > 1 else DEV)
+    if kind == "registered":
+        return registered_like(t)
     return t.pin_memory() if kind == "pinned" else t
+
+
+def kind_of(t):
+    """The memory kind a base was made with (copies of it are made alike)."""
+    if t.is_cuda:
+        return "cuda"
+    if not t.is_pinned():
+        return "pageable"
+    return "registered" if any(t.data_ptr() == addr for _, addr in _REGISTERED) else "pinned"
+
+
+def copy_like(t, kind):
+    if kind == "registered":
+        return registered_like(t)
+    if kind == "pinned":
+        return t.clone().pin_memory()
+    return t.clone()
 
 
 class View:
@@ -85,7 +126,7 @@ class View:
         grids = torch.meshgrid(*idx, indexing="ij")
         x[grids] = value.to(x.dtype).to(x.device)
 
-    def lazy(self, t, cuda_index):
+    def lazy(self, t, cuda_index, cache=None):
         x = ce.lazy(t).permute(*self.perm)
         for d, s in enumerate(self.sel):
             if s[0] == "s":
@@ -93,7 +134,13 @@ class View:
             else:
                 idx = s[1]
                 if cuda_index and t.is_cuda:
-                    idx = torch.as_tensor(idx, device=t.device)
+                    key = (id(s[1]), t.device)
+                    if cache is not None and key in cache:
+                        idx = cache[key]
+                    else:  # (made before a capture: no allocation while capturing)
+                        idx = torch.as_tensor(idx, device=t.device)
+                        if cache is not None:
+                            cache[key] = idx
                 x = x.index_select(d, idx)
         return x
 
@@ -127,7 +174,7 @@ def make_program(seed):
     rng = np.random.default_rng(seed)
     nb = int(rng.integers(2, 5))
     dtypes = [torch.float32, torch.float32, torch.bfloat16]
-    bases = [make_base(rng, KINDS[int(rng.integers(0, 3))], dtypes[int(rng.integers(0, 3))]) for _ in range(nb)]
+    bases = [make_base(rng, KINDS[int(rng.integers(0, len(KINDS)))], dtypes[int(rng.integers(0, 3))]) for _ in range(nb)]
     if not any(b.is_cuda for b in bases):
         bases[0] = bases[0].to(DEV)
     ops = []
@@ -175,10 +222,10 @@ def check(tag, got, want, seed, it):
     return None
 
 
-def run_explicit(eng, bases, ops, cuda_index):
+def run_explicit(eng, bases, ops, cuda_index, cache=None):
     with eng.scope():
         for _, dv, sv in ops:
-            eng.copy_(dv.lazy(bases[dv.base], cuda_index), sv.lazy(bases[sv.base], cuda_index))
+            eng.copy_(dv.lazy(bases[dv.base], cuda_index, cache), sv.lazy(bases[sv.base], cuda_index, cache))
 
 
 def fuzz_one(seed, modes, runs=24):
@@ -188,8 +235,10 @@ def fuzz_one(seed, modes, runs=24):
     want = reference(init, ops)
     errs = []
 
+    kinds = [kind_of(b) for b in init]
+
     def fresh():
-        return [b.clone() if not b.is_pinned() else b.clone().pin_memory() for b in init]
+        return [copy_like(b, k) for b, k in zip(init, kinds)]
 
     if "forced" in modes:  # every strategy where the executor offers it, one run each
         for name in STRATEGIES:
@@ -256,6 +305,31 @@ def fuzz_one(seed, modes, runs=24):
             pass
     if "plan" in modes:
         errs += fuzz_plan(seed, init, ops, fresh)
+    if "graph" in modes:  # the program captured in a CUDA graph after warmup, replayed
+        eng = ce.Engine()
+        bs = fresh()
+        cache = {}
+        try:
+            for _ in range(30):
+                run_explicit(eng, bs, ops, True, cache)
+            torch.cuda.synchronize()
+            g, side = torch.cuda.CUDAGraph(), torch.cuda.Stream()
+            with torch.cuda.graph(g, stream=side):
+                run_explicit(eng, bs, ops, True, cache)
+            for it in range(3):
+                for b, b0 in zip(bs, init):
+                    b.copy_(b0)
+                torch.cuda.synchronize()
+                g.replay()
+                torch.cuda.synchronize()
+                e = check("graph", bs, want, seed, it)
+                if e:
+                    errs.append(e)
+                    break
+        except (ce.Unsupported, ce.NeedsMaterialize, ce.UnsafeCopy, RuntimeError) as ex:
+            if not any(w in str(ex) for w in ("captur", "graph")) and \
+                    not isinstance(ex, (ce.Unsupported, ce.NeedsMaterialize, ce.UnsafeCopy)):
+                errs.append(f"seed {seed} mode graph: {type(ex).__name__}: {str(ex).splitlines()[0][:160]}")
     return errs
 
 

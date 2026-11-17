@@ -273,7 +273,9 @@ struct Engine::Impl {
     for (const Endpoint* e : {&src, &dst}) {
       if (e->base % itemsize(e->dtype) != 0) fail(Errc::invalid_argument, "buffer base is not aligned to its dtype");
       if (e->nbytes < 0) fail(Errc::invalid_argument, "buffer size is negative");
-      if (e->device.kind == DeviceKind::cuda && e->pinned) fail(Errc::invalid_argument, "pinned applies to host buffers only");
+      if (e->device.kind == DeviceKind::cuda && (e->pinned || e->mapped))
+        fail(Errc::invalid_argument, "pinned applies to host buffers only");
+      if (e->mapped && !e->pinned) fail(Errc::invalid_argument, "mapped host memory is pinned");
     }
     if (hints.has_valid) runs = runs.clip_src(hints.valid_start, hints.valid_len);
     const i64 s_lim = src.nbytes / ssz, d_lim = dst.nbytes / dsz;
@@ -286,8 +288,8 @@ struct Engine::Impl {
                                          std::to_string(runs.dst[i] + runs.len[i]) + ") of " + std::to_string(d_lim));
     }
     Op op;
-    op.src = {src.device, src.dtype, src.pinned};
-    op.dst = {dst.device, dst.dtype, dst.pinned};
+    op.src = side_of(src);
+    op.dst = side_of(dst);
     op.fn = fn;
     op.ctx = hints.ctx;
     op.src_lo = static_cast<int64_t>(src.base);
@@ -549,7 +551,7 @@ struct Engine::Impl {
 
   static void add_endpoint(Hasher& h, const Endpoint& e) {
     h.add((static_cast<uint64_t>(e.device.kind) << 40) | (static_cast<uint64_t>(e.device.index) << 8) |
-          (static_cast<uint64_t>(e.dtype) << 1) | (e.pinned ? 1u : 0u));
+          (static_cast<uint64_t>(e.dtype) << 2) | (e.mapped ? 2u : 0u) | (e.pinned ? 1u : 0u));
     h.add(static_cast<uint64_t>(e.base));
     h.add(static_cast<uint64_t>(e.nbytes));
   }
@@ -573,6 +575,9 @@ struct Engine::Impl {
         fail(Errc::unsupported, "device indices with tensors on two GPUs");
       if ((!scuda && !src.pinned) || (!dcuda && !dst.pinned))
         fail(Errc::unsupported, "device indices with pageable host memory (pin it)");
+      if ((!scuda && !src.mapped) || (!dcuda && !dst.mapped))  // only the statement kernel reads the indices
+        fail(Errc::unsupported, "device indices with host memory kernels cannot reach at its address (pinned but "
+                                "not mapped there, e.g. cudaHostRegister'ed memory under WSL2): use pin_memory()");
       const int gpu = scuda ? src.device.index : dst.device.index;
       for (const Access* a : {&stmt.src, &stmt.dst})
         for (const Term& t : a->terms())
@@ -592,9 +597,9 @@ struct Engine::Impl {
     const i64 s0 = static_cast<i64>(src.base) / ss, d0 = static_cast<i64>(dst.base) / ds;
     if (slo < s0 || shi >= s0 + src.nbytes / ss) fail(Errc::invalid_argument, "source access out of bounds");
     if (dlo < d0 || dhi >= d0 + dst.nbytes / ds) fail(Errc::invalid_argument, "destination access out of bounds");
-    exec_for({src.device, src.dtype, src.pinned}, {dst.device, dst.dtype, dst.pinned});
-    op.src = {src.device, src.dtype, src.pinned};
-    op.dst = {dst.device, dst.dtype, dst.pinned};
+    exec_for(side_of(src), side_of(dst));
+    op.src = side_of(src);
+    op.dst = side_of(dst);
     op.fn = fn;
     op.ctx = hints.ctx;
     op.src_lo = static_cast<int64_t>(src.base), op.src_hi = static_cast<int64_t>(src.base) + src.nbytes;
@@ -679,16 +684,20 @@ struct Engine::Impl {
       }
     if (dev.kind == DeviceKind::cuda && t.x.ep.device.kind != DeviceKind::cuda && t.q.ep.device.kind != DeviceKind::cuda)
       fail(Errc::unsupported, "quantization with only the scale on a GPU");
+    bool all_mapped = true;
     if (dev.kind == DeviceKind::cuda)
-      for (const auto* s : sides)
-        if (s->ep.device.kind == DeviceKind::host && !s->ep.pinned)
-          fail(Errc::unsupported, "quantization between a GPU and pageable host memory (pin it)");
+      for (const auto* s : sides) {
+        if (s->ep.device.kind != DeviceKind::host) continue;
+        if (!s->ep.pinned) fail(Errc::unsupported, "quantization between a GPU and pageable host memory (pin it)");
+        all_mapped = all_mapped && s->ep.mapped;
+      }
 
     for (const TileSpec::Index* ix : {&t.x_index, &t.index}) {
       if (!ix->used()) continue;
       if (ix->dev && dev.kind != DeviceKind::cuda) fail(Errc::unsupported, "GPU index tables need GPU tensors");
-      if (!ix->dev && !ix->host_ptr && static_cast<int64_t>(ix->host.size()) != t.rows[0])
-        fail(Errc::invalid_argument, "an index table's length is not rows[0]");
+      if (ix->size() != t.rows[0])  // the kernel reads rows[0] indices from it
+        fail(Errc::invalid_argument, "an index table holds " + std::to_string(ix->size()) + " indices, not rows[0] = " +
+                                         std::to_string(t.rows[0]));
       for (int64_t v : ix->host)
         if (v < 0 || v >= ix->bound) fail(Errc::invalid_argument, "index out of range");
     }
@@ -757,7 +766,7 @@ struct Engine::Impl {
       else hc = std::make_shared<std::vector<int64_t>>(t.index.host), k->ci = reinterpret_cast<long long>(hc->data());
     }
 
-    const Side xs{t.x.ep.device, xd, t.x.ep.pinned}, qs{t.q.ep.device, qd, t.q.ep.pinned};
+    const Side xs = side_of(t.x.ep, xd), qs = side_of(t.q.ep, qd);
     exec_for(xs, qs);
     Op op;
     op.src = t.quantize ? xs : qs;
@@ -838,6 +847,11 @@ struct Engine::Impl {
       op.tile_staged_ok = any_host && ok && dev.kind == DeviceKind::cuda;
     }
     op.tile_dev_index = t.x_index.dev || t.index.dev;
+    op.tile_mapped = all_mapped;
+    if (dev.kind == DeviceKind::cuda && !all_mapped && !op.tile_staged_ok)  // refused now, not at the flush
+      fail(Errc::unsupported, "quantization with host memory kernels cannot reach at its address (pinned but not "
+                              "mapped there, e.g. cudaHostRegister'ed memory under WSL2) and that cannot be staged: "
+                              "use pin_memory()");
     op.opaque = true;
     op.ctx = hints.ctx;
     op.fp = fingerprint(op);
@@ -1594,8 +1608,9 @@ std::shared_ptr<Frozen> Engine::freeze_composed(const std::vector<std::array<int
       }
     }
     for (Out& o : outs) {  // pure copies in bytes: endpoints are the allocations
-      Endpoint se{o.side.device, static_cast<uintptr_t>(o.lo), o.hi - o.lo, DType::u8, o.side.pinned};
-      Endpoint de{op.dst.device, static_cast<uintptr_t>(op.dst_lo), op.dst_hi - op.dst_lo, DType::u8, op.dst.pinned};
+      Endpoint se{o.side.device, static_cast<uintptr_t>(o.lo), o.hi - o.lo, DType::u8, o.side.pinned, o.side.mapped};
+      Endpoint de{op.dst.device, static_cast<uintptr_t>(op.dst_lo), op.dst_hi - op.dst_lo, DType::u8, op.dst.pinned,
+                  op.dst.mapped};
       for (size_t i = 0; i < o.runs.size(); ++i) o.runs.src[i] -= o.lo, o.runs.dst[i] -= op.dst_lo;
       Hints h;
       h.ctx = op.ctx;

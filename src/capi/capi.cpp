@@ -6,6 +6,7 @@
 #include "copyengine/copyengine.hpp"
 #include "copyengine/engine.hpp"
 #include "copyengine/error.hpp"
+#include "copyengine/frontend.hpp"
 #include "copyengine/probe.hpp"
 
 struct ce_engine {
@@ -58,7 +59,10 @@ ce::Endpoint endpoint(const ce_endpoint* e) {
   if (e->device_kind == CE_DEVICE_HOST) dev = {ce::DeviceKind::host, 0};
   else if (e->device_kind == CE_DEVICE_CUDA) dev = {ce::DeviceKind::cuda, e->device_index};
   else ce::fail(ce::Errc::unsupported, "bad device kind");
-  return {dev, static_cast<uintptr_t>(e->base), e->nbytes, static_cast<ce::DType>(e->dtype), e->pinned != 0};
+  ce::Endpoint out{dev, static_cast<uintptr_t>(e->base), e->nbytes, static_cast<ce::DType>(e->dtype), false, false};
+  // Host memory facts come from the driver (`pinned` in the C struct is a hint the driver overrides).
+  if (dev.kind == ce::DeviceKind::host) ce::set_host_memory(out);
+  return out;
 }
 
 }  // namespace

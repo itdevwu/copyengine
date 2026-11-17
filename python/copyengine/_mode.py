@@ -12,13 +12,11 @@ import torch
 from torch.utils._python_dispatch import TorchDispatchMode, _disable_current_modes
 
 from . import _core
-from ._tensor import torch_parts, raw_stream
+from ._tensor import raw_stream, same_bits_dtypes, torch_parts
 
 _COPY = torch.ops.aten.copy_.default
 _PASS_THROUGH = {torch.ops.aten.is_pinned.default}
 
-_FLOATS = (torch.float16, torch.bfloat16, torch.float32, torch.float64,
-           torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e8m0fnu)
 _DTYPES = {torch.float64, torch.float32, torch.float16, torch.bfloat16, torch.int64, torch.int32, torch.int16,
            torch.int8, torch.uint8, torch.bool, torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e8m0fnu,
            torch.float4_e2m1fn_x2}
@@ -49,7 +47,7 @@ def decline_reason(dst, src):
     """None if ce may run ``dst.copy_(src)`` (it gives torch's exact result), else why not. Mirrors the shim."""
     if not (isinstance(dst, torch.Tensor) and isinstance(src, torch.Tensor) and _usable(dst) and _usable(src)):
         return "layout, device or dtype copyengine does not handle"
-    if not (dst.dtype == src.dtype or (dst.dtype in _FLOATS and src.dtype != torch.bool)):
+    if not same_bits_dtypes(dst.dtype, src.dtype):
         return "dtype pair where torch's result differs"
     if torch.is_grad_enabled() and (dst.requires_grad or src.requires_grad):
         return "autograd"

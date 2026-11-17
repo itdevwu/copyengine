@@ -6,6 +6,28 @@ change incompatibly only in a new minor (0.x) or major release.
 
 ## Unreleased
 
+- Host memory registered with `cudaHostRegister` (pinned, but possibly at
+  another device address, as under WSL2) is no longer handed to kernels or
+  batched DMA at its host address (an illegal-address fault): copyengine asks
+  the driver whether host memory is pageable, pinned or mapped for every
+  frontend, copies registered memory with plain DMA or staging, and refuses
+  GPU-index copies that only a kernel could do there.
+
+- Fixed a misaligned-address fault (which poisoned the process's CUDA
+  context) in the statement kernel for destinations whose rows are not
+  aligned like their base (16-byte rows 24 bytes apart, say).
+
+- Index tables are checked against the rows they select in every frontend
+  (the compiled quantize op could read past a shorter one); copies with
+  run-time indices no longer share a plan group with segments or index-list
+  copies (the flush failed); batched DMA is admitted per direction; a 0-d host
+  index works in step plans.
+
+- No result depends on which side of a measurement won: `copy_many` and
+  compiled regions offer torch's copy as the baseline only for dtype pairs
+  whose bits equal copyengine's, and compiled baselines are checked on
+  samples that include NaN, infinities, saturation and rounding edges.
+
 - An engine destroyed while its last copies failed says so on stderr
   instead of discarding the error; a CUDA failure during cleanup no longer
   terminates the process. The explicit indexed-copy op checks `dim`.

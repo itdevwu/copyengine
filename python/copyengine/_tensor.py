@@ -114,6 +114,21 @@ class Lazy:
         return View(b.obj, b.endpoint, self._access, b.is_cuda, b.device_index)
 
 
+_FLOATS = None
+
+
+def same_bits_dtypes(dt, st) -> bool:
+    """Whether torch's own copy from dtype `st` to `dt` gives copyengine's bits: the only
+    pairs a native baseline is offered for (eager, copy_many and compiled regions alike).
+    The same rule and float set as same_bits / is_float in src/torch (keep them equal)."""
+    global _FLOATS
+    import torch
+    if _FLOATS is None:
+        _FLOATS = (torch.float16, torch.bfloat16, torch.float32, torch.float64,
+                   torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e8m0fnu)
+    return dt == st or (dt in _FLOATS and st is not torch.bool)
+
+
 def apply_index(x, key):
     """``x[key]`` as torch indexes a tensor, with the ops a lazy view has: integers
     (select), slices with a positive step, ``...``, ``None`` (unsqueeze) and one
@@ -286,7 +301,7 @@ def torch_parts(t):
     if dev.type == "cuda":
         ep = _core.Endpoint("cuda", dev.index or 0, st.data_ptr(), st.nbytes(), _TORCH_DTYPES[t.dtype], False)
         return ep, list(t.shape), list(t.stride()), t.storage_offset(), True
-    ep = _core.Endpoint("host", 0, st.data_ptr(), st.nbytes(), _TORCH_DTYPES[t.dtype], t.is_pinned())
+    ep = _core.Endpoint("host", 0, st.data_ptr(), st.nbytes(), _TORCH_DTYPES[t.dtype])  # pinned / mapped: the driver
     return ep, list(t.shape), list(t.stride()), t.storage_offset(), False
 
 
@@ -303,7 +318,7 @@ def _torch_view(t) -> View:
     if t.device.type == "cuda":
         kind, index, pinned = "cuda", t.device.index if t.device.index is not None else 0, False
     elif t.device.type == "cpu":
-        kind, index, pinned = "host", 0, bool(t.is_pinned())
+        kind, index, pinned = "host", 0, False  # pinned / mapped: asked of the driver by the endpoint
     else:
         raise _core.Unsupported(f"unsupported device {t.device}")
     ep = _core.Endpoint(kind, index, st.data_ptr(), st.nbytes(), _TORCH_DTYPES[t.dtype], pinned)

@@ -38,7 +38,7 @@ void Hasher::add(std::string_view s) {
 
 static void add_side(Hasher& h, const Side& s) {
   h.add((static_cast<uint64_t>(s.device.kind) << 40) | (static_cast<uint64_t>(s.device.index) << 8) |
-        (static_cast<uint64_t>(s.dtype) << 1) | (s.pinned ? 1u : 0u));
+        (static_cast<uint64_t>(s.dtype) << 2) | (s.mapped ? 2u : 0u) | (s.pinned ? 1u : 0u));
 }
 
 uint64_t fingerprint_sides(const Op& op) {
@@ -333,9 +333,13 @@ Plan build_plan(const std::vector<Op>& ops) {
                a->xdt == b->xdt &&
                a->scale_byte == b->scale_byte && a->eps == b->eps && a->gs == b->gs;
       };
+      // Copies whose indices are read at run time (opaque) run only as such
+      // (their form): never in a group with run-described copies.
+      const bool opaque_copy = op.opaque && !op.tile;
       auto it = std::find_if(groups.begin(), groups.end(), [&](const Group& g) {
+        const bool g_opaque = !g.ops.empty() && ops[g.ops[0]].opaque && !ops[g.ops[0]].tile;
         return g.src == op.src && g.dst == op.dst && g.fn == op.fn && g.ctx == op.ctx && g.bandwidth == op.bandwidth &&
-               same_tile(g);
+               same_tile(g) && g_opaque == opaque_copy;
       });
       if (it == groups.end()) {
         groups.push_back({});
@@ -350,6 +354,7 @@ Plan build_plan(const std::vector<Op>& ops) {
         it->opaque_elems += op.tile->units() * op.tile->g, it->tiles = true;
         it->tile_host_sides = it->tile_host_sides || op.tile_host;
         it->tile_staged_ok = (first || it->tile_staged_ok) && op.tile_staged_ok;
+        it->tile_mapped = it->tile_mapped && op.tile_mapped;
       }
       else if (op.opaque) it->opaque_elems += op.form->numel;
     }
@@ -389,7 +394,7 @@ static int lg(int64_t x) { return x > 0 ? 63 - std::countl_zero(static_cast<uint
 
 std::string bucket_key(const Group& g, int nops) {
   auto side = [](const Side& s) {
-    std::string r = s.device.kind == DeviceKind::cuda ? "cuda" : (s.pinned ? "pinned" : "host");
+    std::string r = s.device.kind == DeviceKind::cuda ? "cuda" : (s.mapped ? "pinned" : s.pinned ? "pinned-unmapped" : "host");
     return r + ":" + std::string(dtype_name(s.dtype));
   };
   std::string fn = g.fn.identity() ? "id" : (std::string("aff") + (g.fn.round ? "r" : "") + (g.fn.clamp ? "c" : ""));

@@ -227,10 +227,10 @@ NB_MODULE(_core, m) {
       .def_rw("scale", &ce::TileSpec::scale)
       .def_rw("zero", &ce::TileSpec::zero)
       .def("set_index", [](ce::TileSpec& t, bool x_side, uintptr_t dev, const std::vector<int64_t>& host,
-                           int64_t bound, uintptr_t host_ptr) {
+                           int64_t bound, uintptr_t host_ptr, int64_t count) {
         ce::TileSpec::Index& ix = x_side ? t.x_index : t.index;
-        ix.dev = dev, ix.host = host, ix.bound = bound, ix.host_ptr = host_ptr;
-      }, "x_side"_a, "dev"_a, "host"_a, "bound"_a, "host_ptr"_a = 0);
+        ix.dev = dev, ix.host = host, ix.bound = bound, ix.host_ptr = host_ptr, ix.count = count;
+      }, "x_side"_a, "dev"_a, "host"_a, "bound"_a, "host_ptr"_a = 0, "count"_a = -1);
 
   nb::class_<ce::Stmt>(m, "Stmt")
       .def(nb::init<ce::Access, ce::Access>(), "dst"_a, "src"_a)
@@ -248,11 +248,15 @@ NB_MODULE(_core, m) {
         if (kind == "host" || kind == "cpu") dev = {ce::DeviceKind::host, 0};
         else if (kind == "cuda") dev = {ce::DeviceKind::cuda, index};
         else throw ce::Error(ce::Errc::unsupported, "unsupported device kind: " + kind);
-        new (e) ce::Endpoint{dev, base, nbytes, ce::parse_dtype(dtype), pinned};
+        new (e) ce::Endpoint{dev, base, nbytes, ce::parse_dtype(dtype), false, false};
+        // Host memory facts come from the driver, not the caller (`pinned` is kept for compatibility).
+        (void)pinned;
+        if (dev.kind == ce::DeviceKind::host) ce::set_host_memory(*e);
       }, "kind"_a, "index"_a, "base"_a, "nbytes"_a, "dtype"_a, "pinned"_a = false)
       .def_prop_ro("base", [](const ce::Endpoint& e) { return e.base; })
       .def_prop_ro("nbytes", [](const ce::Endpoint& e) { return e.nbytes; })
       .def_prop_ro("pinned", [](const ce::Endpoint& e) { return e.pinned; })
+      .def_prop_ro("mapped", [](const ce::Endpoint& e) { return e.mapped; })
       .def_prop_ro("dtype", [](const ce::Endpoint& e) { return std::string(ce::dtype_name(e.dtype)); });
 
   nb::class_<ce::Elementwise>(m, "Elementwise")
@@ -416,6 +420,10 @@ NB_MODULE(_core, m) {
 
   m.def("hardware_fingerprint", &ce::hardware_fingerprint);
   m.def("host_is_pinned", &ce::host_is_pinned, "ptr"_a);
+  m.def("host_memory", [](uintptr_t p) {
+    static const char* names[] = {"pageable", "pinned", "mapped"};
+    return std::string(names[static_cast<int>(ce::host_memory(p))]);
+  }, "ptr"_a);
   // The process-wide engine of module-level calls inside torch.compile regions (FrontendApi::shared_engine).
   m.def("shared_engine_stats", [] { return ce::frontend_api()->shared_engine()->stats_json(); });
   m.def("shared_engine_profile", [] { return ce::frontend_api()->shared_engine()->dump_profile(); });

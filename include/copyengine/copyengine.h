@@ -62,7 +62,7 @@ typedef struct ce_endpoint {
   uint64_t base;
   int64_t nbytes;
   int32_t dtype;        /* ce_dtype */
-  int32_t pinned;       /* host memory is page-locked */
+  int32_t pinned;       /* ignored: whether host memory is pinned (and mapped for kernels) is asked of the driver */
 } ce_endpoint;
 
 /* y = clamp(round(x * scale + bias)) converted to the destination dtype. */

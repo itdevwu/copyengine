@@ -38,9 +38,14 @@ class Hasher {
 struct Side {
   Device device;
   DType dtype = DType::u8;
-  bool pinned = false;
+  bool pinned = false;  // host only: DMA reaches it
+  bool mapped = false;  // host only: kernels reach it at its own addresses (Endpoint::mapped)
   bool operator==(const Side&) const = default;
 };
+inline Side side_of(const Endpoint& e, DType dtype) { return {e.device, dtype, e.pinned, e.mapped}; }
+inline Side side_of(const Endpoint& e) { return side_of(e, e.dtype); }
+// Kernels may read or write this side's memory directly (device memory, or mapped host memory).
+inline bool kernel_reach(const Side& s) { return s.device.kind == DeviceKind::cuda || s.mapped; }
 
 // A table-free statement kept in structured form: absolute element indices in
 // units of the original dtypes (also for pure copies, whose runs are bytes).
@@ -132,6 +137,7 @@ struct Op {
   // reads spans at most twice the bytes it holds, what it writes is dense,
   // and no index tables (rows could be anywhere). Set when queued.
   bool tile_host = false, tile_staged_ok = false;
+  bool tile_mapped = true;  // every host tensor of the tile op is mapped (kernels reach it: zero-copy)
   // A further tensor of the op (a tile op's scale, zero point): its allocation
   // range [lo, hi) and its footprint (what dependencies use).
   struct Extra {
@@ -169,6 +175,7 @@ struct Group {
   bool tiles = false;  // tile ops (quantization while copying): only the tile strategies run them
   bool tile_host_sides = false;  // some tensor of its tile ops is in host memory
   bool tile_staged_ok = false;   // ... and every op can go through device staging (Op::tile_staged_ok)
+  bool tile_mapped = true;       // ... and every host tensor is mapped (zero-copy kernels reach it)
   Rects rects;           // structure recovered from runs
   // Allocation boundaries on each side, in run units: one copy call never
   // crosses them (separate allocations, even adjacent ones, are not one range

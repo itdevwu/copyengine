@@ -1,6 +1,7 @@
 #include "backends/cuda/executor.hpp"
 
 #include <algorithm>
+#include <numeric>
 #include <array>
 #include <cstring>
 #include <map>
@@ -254,7 +255,33 @@ class CudaExecutor final : public Executor {
     }
   }
 
+  // What each strategy needs of the memory it touches, in one place (the
+  // branches of offered() choose; this only refuses). Kernels and batched DMA
+  // take device-accessible addresses: host memory must be mapped at its own;
+  // the device-only kernels need both sides on one GPU.
+  static bool admissible(Strategy s, const Group& g) {
+    const bool sc = g.src.device.kind == DeviceKind::cuda, dc = g.dst.device.kind == DeviceKind::cuda;
+    const bool one_gpu = sc && dc && g.src.device.index == g.dst.device.index;
+    const bool reach = kernel_reach(g.src) && kernel_reach(g.dst);
+    switch (s) {
+      case Strategy::kernel:
+      case Strategy::bulk:
+      case Strategy::tma2d: return one_gpu;
+      case Strategy::batch: return reach;
+      case Strategy::fused: return one_gpu || !g.opaque() || reach;  // non-opaque host sides go through staging
+      case Strategy::tile: return !g.tile_host_sides || g.tile_mapped;
+      default: return true;  // DMA through the driver (any pinned or pageable host memory), or staging
+    }
+  }
+
   std::vector<Strategy> candidates(const Group& g) override {
+    std::vector<Strategy> c = offered(g);
+    std::erase_if(c, [&](Strategy s) { return !admissible(s, g); });
+    if (c.empty()) fail(Errc::unsupported, "no strategy can reach this memory (see stats()[\"cuda\"]: zero_copy, batch)");
+    return c;
+  }
+
+  std::vector<Strategy> offered(const Group& g) {
     const int di = device_of(g);
     Dev& s = state(di);
     if (g.tiles) {  // quantization while copying: the tile kernel on this GPU
@@ -263,10 +290,12 @@ class CudaExecutor final : public Executor {
       // Host sides: the kernel reading / writing pinned memory directly, or
       // through device staging (DMA in, kernel, DMA out); measured.
       std::vector<Strategy> c;
-      if (zero_copy_ok(s)) c.push_back(Strategy::tile);
+      if (g.tile_mapped && zero_copy_ok(s)) c.push_back(Strategy::tile);
       if (g.tile_staged_ok) c.push_back(Strategy::tile_staged);
       if (c.empty())
-        fail(Errc::unsupported, "quantizing to or from host memory needs zero-copy kernels (" + s.zero_copy_error +
+        fail(Errc::unsupported, "quantizing to or from host memory needs zero-copy kernels (" +
+                                    (g.tile_mapped ? s.zero_copy_error
+                                                   : std::string("host memory not mapped for kernels at its address")) +
                                     ") or compact host tensors for staging");
       return c;
     }
@@ -274,8 +303,8 @@ class CudaExecutor final : public Executor {
       std::vector<Strategy> c;
       if (g.pure() && host_tables_only(g)) c.push_back(Strategy::lowered);
       const bool sc = g.src.device.kind == DeviceKind::cuda, dc = g.dst.device.kind == DeviceKind::cuda;
-      const bool host_ok = (sc || g.src.pinned) && (dc || g.dst.pinned);
-      if (s.kernels && fused_plan(g).ok && ((sc && dc) || (host_ok && zero_copy_ok(s)))) c.push_back(Strategy::fused);
+      const bool reach = kernel_reach(g.src) && kernel_reach(g.dst);  // the statement kernel touches host memory itself
+      if (s.kernels && fused_plan(g).ok && ((sc && dc) || (reach && zero_copy_ok(s)))) c.push_back(Strategy::fused);
       if (c.empty())
         fail(Errc::unsupported, "copies with indices read at run time need the statement kernel (" +
                                     (s.kernels ? std::string("this layout or memory is not supported") : s.kernel_error) +
@@ -300,8 +329,7 @@ class CudaExecutor final : public Executor {
         // Large groups: first among the candidates, so the shortlist keeps it (measured like the rest).
         if (!s.bulk.empty() && g.bytes() >= kBulkMinBytes) c.insert(c.begin(), Strategy::bulk);
         if (s.tma2d && g.bytes() >= kBulkMinBytes && tma2d_fits(g)) c.insert(c.begin(), Strategy::tma2d);
-      } else if (src_cuda && dst_cuda) {
-        if (s.batch) c.push_back(Strategy::batch);
+      } else if (src_cuda && dst_cuda) {  // two GPUs: batch is admitted per device, not per pair yet (P2P)
         c.push_back(Strategy::runs);
         if (rects <= 2) std::reverse(c.begin(), c.end());
       } else {
@@ -310,7 +338,8 @@ class CudaExecutor final : public Executor {
         for (i64 h : g.rects.height) rows += h;
         const bool fragmented = rows > 2 && g.bytes() / rows < kSmallRect;  // small rows DMA poorly
         if (fragmented && s.kernels) c.push_back(Strategy::staged);  // dense link copy + device-side kernel
-        if (s.batch && host_ok) c.push_back(Strategy::batch);
+        // cuMemcpyBatchAsync takes device-accessible addresses: host memory must be mapped at its own.
+        if (s.batch && kernel_reach(g.src) && kernel_reach(g.dst)) c.push_back(Strategy::batch);
         if (!host_ok) c.push_back(Strategy::bounce);
         if (!fragmented && s.kernels && rects > 2) c.push_back(Strategy::staged);
         c.push_back(Strategy::runs);
@@ -538,6 +567,7 @@ class CudaExecutor final : public Executor {
     size_t cap = 0;
     CUevent done = nullptr;
     bool used = false;
+    bool mapped = false;  // host_memory(host): the allocator decides (a framework's may register memory)
   };
 
   struct Lane {
@@ -928,30 +958,43 @@ class CudaExecutor final : public Executor {
     }
     s.batch = true;
     try {
+      // Every direction batch is offered for, each its own test copy: H2D into
+      // reversed padded slots, D2D (same device) reversing them again, D2H back
+      // into host slots; then the bytes and the untouched padding are checked.
       const size_t segs = 16, len = 1000, pitch = 1024;
       void* h = nullptr;
       check(d_->cuMemHostAlloc(&h, segs * len + segs * pitch, 0), "cuMemHostAlloc");
-      CUdeviceptr dp = 0;
+      CUdeviceptr dp = 0, dq = 0;
       check(d_->cuMemAlloc(&dp, segs * pitch), "cuMemAlloc");
+      check(d_->cuMemAlloc(&dq, segs * pitch), "cuMemAlloc");
       auto* src = static_cast<uint8_t*>(h);
       auto* back = src + segs * len;
       for (size_t i = 0; i < segs * len; ++i) src[i] = static_cast<uint8_t>(i * 131 + 7);
+      std::memset(back, 0, segs * pitch);
       check(d_->cuMemsetD8Async(dp, 0, segs * pitch, s.side), "cuMemsetD8Async");
-      std::vector<Raw> raws;
-      for (size_t i = 0; i < segs; ++i)
-        raws.push_back({reinterpret_cast<uintptr_t>(src + i * len), dp + (segs - 1 - i) * pitch, len});
-      Side hs{{DeviceKind::host, 0}, DType::u8, true}, ds{{DeviceKind::cuda, s.index}, DType::u8, false};
-      batch(s, hs, ds, raws, s.side);
-      check(d_->cuMemcpyDtoHAsync(back, dp, segs * pitch, s.side), "cuMemcpyDtoHAsync");
+      check(d_->cuMemsetD8Async(dq, 0, segs * pitch, s.side), "cuMemsetD8Async");
+      const Side hs{{DeviceKind::host, 0}, DType::u8, true, true}, ds{{DeviceKind::cuda, s.index}, DType::u8, false};
+      std::vector<Raw> h2d, d2d, d2h;
+      for (size_t i = 0; i < segs; ++i) {
+        const size_t r = segs - 1 - i;
+        h2d.push_back({reinterpret_cast<uintptr_t>(src + i * len), dp + r * pitch, len});  // slot r: segment i
+        d2d.push_back({dp + r * pitch, dq + i * pitch, len});                              // slot i: segment i
+        d2h.push_back({dq + i * pitch, reinterpret_cast<uintptr_t>(back + r * pitch), len});  // host slot r
+      }
+      batch(s, hs, ds, h2d, s.side);
+      batch(s, ds, ds, d2d, s.side);
+      batch(s, ds, hs, d2h, s.side);
       check(d_->cuStreamSynchronize(s.side), "cuStreamSynchronize");
       bool ok = true;
       for (size_t i = 0; i < segs && ok; ++i) {
-        ok = std::memcmp(back + (segs - 1 - i) * pitch, src + i * len, len) == 0;
-        for (size_t k = len; k < pitch && ok; ++k) ok = back[(segs - 1 - i) * pitch + k] == 0;
+        const size_t r = segs - 1 - i;
+        ok = std::memcmp(back + r * pitch, src + i * len, len) == 0;
+        for (size_t k = len; k < pitch && ok; ++k) ok = back[r * pitch + k] == 0;
       }
       d_->cuMemFree(dp);
+      d_->cuMemFree(dq);
       d_->cuMemFreeHost(h);
-      if (!ok) s.batch = false, s.batch_error = "batch admission: wrong bytes";
+      if (!ok) s.batch = false, s.batch_error = "batch admission: wrong bytes (H2D, D2D or D2H)";
     } catch (const std::exception& e) {
       s.batch = false;
       s.batch_error = std::string("batch admission: ") + e.what();
@@ -1061,7 +1104,7 @@ class CudaExecutor final : public Executor {
       bounce(s, src, dst, raws, st);
       return;
     }
-    if (s.batch && host_ok && raws.size() > 2) {
+    if (s.batch && kernel_reach(src) && kernel_reach(dst) && raws.size() > 2) {  // device-accessible addresses
       batch(s, src, dst, raws, st);
       return;
     }
@@ -1084,8 +1127,9 @@ class CudaExecutor final : public Executor {
       b.host = pinned_alloc(cap, &b.host_handle, "bounce buffer");
       if (!b.done) check(d_->cuEventCreate(&b.done, CU_EVENT_DISABLE_TIMING), "cuEventCreate");
       b.cap = cap, b.used = false;
+      b.mapped = host_memory(reinterpret_cast<uintptr_t>(b.host)) == HostMemory::mapped;
     }
-    const Side pinned_host{{DeviceKind::host, 0}, DType::u8, true};
+    const Side pinned_host{{DeviceKind::host, 0}, DType::u8, true, s.bounce[0].mapped && s.bounce[1].mapped};
     struct Pending {
       int buf;
       std::vector<Raw> unpack;  // D2H: bounce -> pageable
@@ -1843,7 +1887,9 @@ class CudaExecutor final : public Executor {
     const bool piped = chunks.size() > 1;
     const size_t H = piped ? most : total;
     const CUdeviceptr stg = staging(s, piped ? 2 * H : H, st);
-    const Side dev_side{{DeviceKind::cuda, s.index}, DType::u8, false}, host_side{{DeviceKind::host, 0}, DType::u8, true};
+    // The user's host tensors: mapped only if all of them are (batched DMA takes device addresses).
+    const Side dev_side{{DeviceKind::cuda, s.index}, DType::u8, false},
+        host_side{{DeviceKind::host, 0}, DType::u8, true, g.tile_mapped};
 
     // The chunks' TileKs (one table) and DMA.
     std::vector<cv::TileK> v;
@@ -2065,8 +2111,17 @@ class CudaExecutor final : public Executor {
   }
 
   // Destination elements one thread of ce_stmt stores at once: the innermost
-  // dimension is contiguous on the destination, divisible by the width, and
-  // every statement's destination base (plus `dadd`) is aligned to it.
+  // dimension is contiguous on the destination and divisible by the width, and
+  // every row start is aligned to it. A row starts at a statement's base (plus
+  // `dadd`) plus any combination of the outer strides, so the width must divide
+  // the base and every outer stride whose dimension has more than one index
+  // (row_align, in elements); a table dimension's stride counts too (any index).
+  static long long row_align(const StmtDesc& d, long long base) {
+    long long g = base < 0 ? -base : base;
+    for (int k = 0; k + 1 < d.rank; ++k)
+      if (d.shape[k] > 1 || k == d.dtab_dim) g = std::gcd(g, d.ds[k] < 0 ? -d.ds[k] : d.ds[k]);
+    return g;  // 0: every row starts at element 0 (aligned to anything)
+  }
   static int vector_width(const FusedBatch& b, long long dadd) {
     const StmtDesc& d = b.desc;
     if (d.rank == 0 || d.ds[d.rank - 1] != 1 || b.tile_a >= 0) return 1;
@@ -2075,7 +2130,7 @@ class CudaExecutor final : public Executor {
     for (int v = 16 / dsz; v >= 2; v /= 2) {
       if (d.shape[d.rank - 1] % v != 0) continue;
       bool ok = true;
-      for (const Base& x : b.bases) ok = ok && ((x.dst + dadd) % v) == 0;
+      for (const Base& x : b.bases) ok = ok && row_align(d, x.dst + dadd) % v == 0;
       if (ok) return v;
     }
     return 1;
@@ -2253,7 +2308,8 @@ class CudaExecutor final : public Executor {
     CUdeviceptr stg = 0;
     std::vector<Raw> raws;
     const Side dev_side{P.h2d ? g.dst.device : g.src.device, DType::u8, false};
-    const Side host_side{{DeviceKind::host, 0}, DType::u8, P.h2d ? g.src.pinned : g.dst.pinned};
+    const Side host_side{{DeviceKind::host, 0}, DType::u8, P.h2d ? g.src.pinned : g.dst.pinned,
+                         P.h2d ? g.src.mapped : g.dst.mapped};
     if (P.cross) {
       stg = staging(s, P.stg_bytes, st);
       raws = P.raws;
@@ -2568,24 +2624,6 @@ class CudaExecutor final : public Executor {
     return s.zero_copy == 1;
   }
 
-  // Every host allocation the runs touch is pinned and mapped at the same
-  // address on the device (unified addressing): kernels may use the pointers.
-  bool host_mapped(const Runs& r, const std::vector<i64>& cuts, bool src_side, size_t isz) {
-    std::vector<size_t> seen;
-    for (size_t i = 0; i < r.size(); ++i) {
-      const i64 at = src_side ? r.src[i] : r.dst[i];
-      const size_t k = static_cast<size_t>(std::upper_bound(cuts.begin(), cuts.end(), at) - cuts.begin());
-      if (std::find(seen.begin(), seen.end(), k) != seen.end()) continue;
-      seen.push_back(k);
-      const uintptr_t addr = static_cast<uintptr_t>(at) * isz;
-      CUdeviceptr dp = 0;
-      if (d_->cuPointerGetAttribute(&dp, CU_POINTER_ATTRIBUTE_DEVICE_POINTER, addr) != CUDA_SUCCESS ||
-          dp != static_cast<CUdeviceptr>(addr))
-        return false;
-    }
-    return true;
-  }
-
   PacedPlan build_paced(Dev& s, const Group& g) {
     if (!s.kernels) fail(Errc::unsupported, "a bandwidth limit needs the kernel module (pacing): " + s.kernel_error);
     if (!(g.bandwidth > 0)) fail(Errc::backend, "paced: the group has no bandwidth limit");
@@ -2618,17 +2656,12 @@ class CudaExecutor final : public Executor {
       int64_t rows = 0;
       for (i64 h : sub.rects.height) rows += h;
       const bool fragmented = rows > 2 && sub.bytes() / rows < kSmallRect;
-      auto zero_copy = [&] {
-        if (sc == dc || !host_ok || !zero_copy_ok(s)) return false;
-        const bool host_src = !sc;
-        return host_mapped(sub.runs, host_src ? sub.src_cuts : sub.dst_cuts, host_src,
-                           itemsize(host_src ? sub.src.dtype : sub.dst.dtype));
-      };
+      auto zero_copy = [&] { return sc != dc && kernel_reach(g.src) && kernel_reach(g.dst) && zero_copy_ok(s); };
       if (g.pure()) {
         if (!host_ok) c.inner = Strategy::bounce;
         else if (fragmented && same_dev) c.inner = Strategy::kernel;
         else if (fragmented && zero_copy()) c.inner = Strategy::kernel, c.zero_copy = true;
-        else if (sub.rects.size() > 2 && s.batch) c.inner = Strategy::batch;
+        else if (sub.rects.size() > 2 && s.batch && kernel_reach(g.src) && kernel_reach(g.dst)) c.inner = Strategy::batch;
         else c.inner = Strategy::runs;
       } else if (same_dev) {
         c.inner = Strategy::kernel;

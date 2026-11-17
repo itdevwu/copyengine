@@ -35,12 +35,18 @@ struct Device {
 
 // One side of a copy: a typed view of an allocation. Offsets in requests are
 // elements relative to `base`; [base, base + nbytes) bounds every access.
+// Host memory as the driver sees it. DMA reaches pinned memory; kernels reach
+// it at its own address only when it is mapped there (memory from cudaHostAlloc
+// is; cudaHostRegister'ed memory may have another device address, e.g. WSL2).
+enum class HostMemory : uint8_t { pageable, pinned, mapped };
+
 struct Endpoint {
   Device device;
   uintptr_t base = 0;
   int64_t nbytes = 0;
   DType dtype = DType::u8;
-  bool pinned = false;  // host only: page-locked
+  bool pinned = false;  // host only: page-locked (DMA reaches it)
+  bool mapped = false;  // host only: pinned, and kernels reach it at `base` (see host_memory)
 };
 
 // y = clamp(round(float(x) * scale + bias)), then converted to the destination
@@ -115,7 +121,11 @@ struct TileSpec {
     // Host values read when the copy runs, from rows[0] int64 at this address
     // (a step plan's parameter buffer, refilled between calls); 0: none.
     uintptr_t host_ptr = 0;
+    // How many indices `dev` / `host_ptr` hold (host: host.size()); must be
+    // rows[0], checked by the engine: the kernel reads rows[0] of them.
+    int64_t count = -1;
     bool used() const { return dev != 0 || !host.empty() || host_ptr != 0; }
+    int64_t size() const { return dev || host_ptr ? count : static_cast<int64_t>(host.size()); }
   };
   Index x_index, index;
 };

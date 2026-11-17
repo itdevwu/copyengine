@@ -83,6 +83,11 @@ class NativeOp {
     (void)host_async;
     run(stream);
   }
+  // Whether running it touches host memory on the CPU when it is called (a
+  // conversion, gather or pageable copy done by the host), rather than only in
+  // stream order: the engine then lets pending GPU work on host memory finish
+  // first. Unknown: true.
+  virtual bool cpu_host_access() const { return true; }
 };
 
 // A tile op (quantization while copying, docs/design/v0.4.md): rows of `upr`
@@ -143,6 +148,10 @@ struct Hints {
   // The caller does not need the host side complete on return (an
   // intercepted copy_ with non_blocking=True); device order still holds.
   bool host_async = false;
+  // The caller checks, before each run, that the copy's source and
+  // destination do not share bytes (a step plan with host indices,
+  // Frozen::host_overlap): footprints that may overlap are not refused.
+  bool overlap_checked = false;
 };
 
 }  // namespace ce

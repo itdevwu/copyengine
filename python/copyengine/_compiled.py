@@ -512,14 +512,28 @@ def copy_(engine: int, dst, src, fn=None) -> bool:
     (st, sidx, sperm), (dt, didx, dperm) = s, d
     if sidx is not None and didx is not None:
         return False
+    # Both sides from one traced tensor (blocks of one pool): the eager lazy copy gathers
+    # first (two passes, as torch's pool[d] = pool[s]); so does the graph. Sides from
+    # separate tensors that alias are refused at run time if they may overlap (UnsafeCopy).
+    base = lambda x: x.t if isinstance(x, TracedLazy) else x  # noqa: E731
+    one_pool = base(src) is base(dst)
     if sidx is not None:  # dst = base.index_select(dim, i).permute(p): gather into dst.permute(p^-1)
         if not identity:
             return False
-        gather(engine, st, sidx[1], sidx[0], dt.permute(_inverse(sperm)))
+        if one_pool:
+            tmp = torch.empty(dt.shape, dtype=st.dtype, device=st.device)
+            gather(engine, st, sidx[1], sidx[0], tmp.permute(_inverse(sperm)))
+            ops.copy_(dt, tmp, engine)
+        else:
+            gather(engine, st, sidx[1], sidx[0], dt.permute(_inverse(sperm)))
         return True
     if didx is not None:  # base.index_select(dim, i).permute(p) = src: scatter src.permute(p^-1)
         if not identity:
             return False
+        if one_pool:
+            tmp = torch.empty(st.shape, dtype=st.dtype, device=st.device)
+            ops.copy_(tmp, st, engine)
+            st = tmp
         scatter_(engine, dt, didx[1], st.permute(_inverse(dperm)), didx[0])
         return True
     if identity:

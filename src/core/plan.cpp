@@ -65,8 +65,12 @@ Hash128 fingerprint(const Op& op) {
   h.add(std::bit_cast<uint32_t>(op.fn.hi));
   h.add(op.ctx);
   h.add(uint64_t{op.form != nullptr});
+  // Both sides' allocations: their boundaries cut runs (build_plan), so the
+  // same addresses split into other allocations are another plan.
   h.add(static_cast<uint64_t>(op.src_lo));
   h.add(static_cast<uint64_t>(op.src_hi));
+  h.add(static_cast<uint64_t>(op.dst_lo));
+  h.add(static_cast<uint64_t>(op.dst_hi));
   h.add(op.runs().src);
   h.add(op.runs().dst);
   h.add(op.runs().len);
@@ -85,8 +89,6 @@ Hash128 fingerprint(const Op& op) {
   }
   if (op.opaque && op.form) {  // the structure, not this call's table pointers: new indices hit the same plan
     const Form& f = *op.form;
-    h.add(static_cast<uint64_t>(op.dst_lo));
-    h.add(static_cast<uint64_t>(op.dst_hi));
     h.add(static_cast<uint64_t>(f.rank));
     for (int k = 0; k < f.rank; ++k)
       h.add(static_cast<uint64_t>(f.shape[k])), h.add(static_cast<uint64_t>(f.ss[k])), h.add(static_cast<uint64_t>(f.ds[k]));
@@ -400,7 +402,8 @@ std::string bucket_key(const Group& g, int nops) {
   std::string fn = g.fn.identity() ? "id" : (std::string("aff") + (g.fn.round ? "r" : "") + (g.fn.clamp ? "c" : ""));
   return side(g.src) + ">" + side(g.dst) + "|" + fn + "|b" + std::to_string(lg(g.bytes())) + "|n" +
          std::to_string(lg(static_cast<int64_t>(g.rects.size()))) + "|o" + std::to_string(lg(nops)) +
-         (g.rects.has_2d() ? "|2d" : "") + (g.ctx.empty() ? "" : "|" + g.ctx) + (g.bandwidth > 0 ? "|paced" : "");
+         (g.rects.has_2d() ? "|2d" : "") + (g.tiles ? "|tile" : g.opaque() ? "|indexed" : "") +
+         (g.ctx.empty() ? "" : "|" + g.ctx) + (g.bandwidth > 0 ? "|paced" : "");
 }
 
 }  // namespace ce

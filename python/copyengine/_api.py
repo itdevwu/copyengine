@@ -16,6 +16,8 @@ import numpy as np
 
 from . import _compiled, _core, _plan, _torch_ops, _shim  # the shim lets copyengine:: ops through: load them first
 from ._tensor import (
+    note_table,
+    owned_tables,
     same_bits_dtypes,
     device_table,
     select_device,
@@ -242,6 +244,7 @@ class Engine:
         self._sites: dict = {}    # outermost scope call site -> _Site (intercept or not)
         self._many_sites: dict = {}  # copy_many call layout -> _Site (copyengine or torch._foreach_copy_)
         self._torch_at = None  # engine flush count when a site last ran torch's copies instead (see freeze)
+        self._temps: list = []  # (flush count, tensor): two-pass temporaries of the recent flushes (see freeze)
         self._scope_kind = None   # the outermost open scope's interception (inner scopes share it)
 
     # ---- scope ----------------------------------------------------------------
@@ -375,14 +378,53 @@ class Engine:
         d, s = view(dst, writable=True), view(src)
         sacc = broadcast_to(s.access, list(d.access.shape))
         stmt = _core.Stmt(d.access, sacc)
+        checked = False
+        if isinstance(dst, Lazy) or isinstance(src, Lazy):
+            # torch's equivalent (dst[ids] = src[ids2]) gathers first: where the two sides
+            # may share bytes, so does copyengine (two passes through a temporary).
+            ov = _core.Engine.stmt_overlap(s.endpoint, d.endpoint, stmt)
+            if ov == 1 and _plan.overlap_checked_per_call():
+                checked = True  # a step plan's host indices: checked exactly before each replay
+            elif ov:
+                return self._copy_two_pass(dst, src, d, s, fn, ctx)
         with self._lock:
             if isinstance(dst, Lazy) or isinstance(src, Lazy):
                 native = _lazy_payload(dst, src, fn)
             else:
                 native = (self._native, dst, src) if _same_bits(dst, src, fn) else None
             self._e.copy_stmt(s.endpoint, d.endpoint, stmt, fn or _IDENTITY, ctx=ctx, stream=current_stream(d, s),
-                              native=native)
+                              native=native, overlap_checked=checked)
             self._after(s.obj, d.obj, src, dst)  # a lazy side holds its device index tables
+        return dst
+
+    def _copy_two_pass(self, dst, src, d, s, fn, ctx):
+        """dst = fn(src) through a temporary on the source's device: the gather completes
+        before anything is written (the source and destination may share bytes)."""
+        shape = list(d.access.shape)
+        base = s.obj
+        if torch is not None and is_tensor(base):
+            tmp = torch.empty(shape, dtype=base.dtype, device=base.device)
+        else:
+            tmp = np.empty(shape, dtype=np.asarray(base).dtype)
+        # A frozen plan of this flush reads and writes it: kept for the next freeze()
+        # (temporaries of older flushes are let go).
+        now = self._e.flushes
+        self._temps = [(f, t) for f, t in self._temps if f >= now - 1] + [(now, tmp)]
+        # Both passes in one flush (as a scope): planned together, frozen together.
+        with self._lock:
+            self._e.begin_scope()
+            self._set_depth(self._depth + 1)
+        try:
+            self.copy_(tmp, src, ctx=ctx)
+            self.copy_(dst, tmp, fn=fn, ctx=ctx)
+        finally:
+            with self._lock:
+                self._set_depth(self._depth - 1)
+                self._e.end_scope()
+                if self._depth == 0:  # like a scope's exit: keep buffers only while copies may be pending
+                    held, self._held = self._held, []
+                    if self._opts.allow_async:
+                        self._retire(held)
         return dst
 
     def copy_many(self, dsts: Sequence[Any], srcs: Sequence[Any], *, ctx: str = "") -> None:
@@ -421,7 +463,9 @@ class Engine:
                              non_blocking=True)
         if not self._opts.allow_async and torch.cuda.is_initialized():
             if any(map(_IS_CPU, dsts)) or any(map(_IS_CPU, srcs)):
-                torch.cuda.current_stream().synchronize()
+                # Host-side copies complete on return: the streams of the GPUs they ran on.
+                for dev in {t.device for t in itertools.chain(dsts, srcs) if t.is_cuda}:
+                    torch.cuda.current_stream(dev).synchronize()
 
     def _copy_many_site(self, dsts, srcs, op) -> bool:
         """copy_many at the top level: copyengine against torch._foreach_copy_ on
@@ -742,9 +786,10 @@ class Engine:
         d = view(out, writable=True)
         stmt = _core.Stmt(d.access, sacc)
         native = (_native_gather, out, src, dim, idx) if _flat_payload(out, src, fn) else None
+        checked = self._index_overlap(s, d, stmt)
         with self._lock:
             self._e.copy_stmt(s.endpoint, d.endpoint, stmt, fn or _IDENTITY, ctx=ctx, stream=current_stream(d, s),
-                              native=native)
+                              native=native, overlap_checked=checked)
             self._after(s.obj, d.obj, idx)
         return out
 
@@ -769,11 +814,23 @@ class Engine:
             dacc = d.access.index_select(dim, idx)
         stmt = _core.Stmt(dacc, broadcast_to(s.access, list(dacc.shape)))
         native = (_native_scatter, dst, src, dim, idx) if _flat_payload(dst, src, fn) else None
+        checked = self._index_overlap(s, d, stmt)
         with self._lock:
             self._e.copy_stmt(s.endpoint, d.endpoint, stmt, fn or _IDENTITY, ctx=ctx, stream=current_stream(d, s),
-                              native=native)
+                              native=native, overlap_checked=checked)
             self._after(s.obj, d.obj, idx)
         return dst
+
+    @staticmethod
+    def _index_overlap(s, d, stmt) -> bool:
+        """gather / scatter_ refuse a source sharing bytes with the destination, as torch's
+        index_select(out=) / index_copy_ do: now (host values) here, through GPU tables by
+        the engine; through a step plan's host tables the plan checks each call's values
+        (True: the engine need not refuse)."""
+        ov = _core.Engine.stmt_overlap(s.endpoint, d.endpoint, stmt)
+        if ov == 3:
+            raise _core.UnsafeCopy("source and destination overlap within one copy")
+        return ov == 1 and _plan.overlap_checked_per_call()
 
     @staticmethod
     def _fast_indexed(a, index, b, dtype) -> bool:
@@ -787,7 +844,7 @@ class Engine:
         if index.dtype is not torch.int64 or index.dim() != 1 or index.stride(0) != 1:
             index = device_table(index)
         a = list(args)
-        a.insert(3 if op is _torch_ops.gather_ else 1, index)
+        a.insert(3 if op is _torch_ops.gather_ else 1, note_table(index))
         try:
             op(*a, self._handle)
         except RuntimeError as e:
@@ -822,7 +879,11 @@ class Engine:
                     "freeze: the last copies ran as torch's own (that call site measured faster with torch), so "
                     "copyengine has nothing new to freeze; issue them through copyengine first, e.g. "
                     "`with eng.scope(): eng.copy_many(dsts, srcs)`, then freeze")
-            return FrozenPlan(self, self._e.freeze(), list(self._held))
+            frozen = self._e.freeze()
+            # Two-pass temporaries the frozen copies touch: the plan owns them.
+            starts = {lo for _, _, lo, _ in frozen.allocations}
+            temps = [t for _, t in self._temps if is_tensor(t) and t.untyped_storage().data_ptr() in starts]
+            return FrozenPlan(self, frozen, list(self._held) + owned_tables(frozen.tables) + temps)
 
     def stats(self) -> dict:
         out = json.loads(self._e.stats_json())

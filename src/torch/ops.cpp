@@ -100,11 +100,13 @@ uintptr_t current_stream(int device) {
 // The baseline: the same copy through torch's own aten::copy_.
 class TorchCopy final : public ce::NativeOp {
  public:
-  TorchCopy(Tensor dst, Tensor src) : dst_(std::move(dst)), src_(std::move(src)) {}
+  TorchCopy(Tensor dst, Tensor src, bool cpu) : dst_(std::move(dst)), src_(std::move(src)), cpu_(cpu) {}
   void run(uintptr_t) override { torch::stable::copy_(dst_, src_, true); }
+  bool cpu_host_access() const override { return cpu_; }
 
  private:
   Tensor dst_, src_;
+  bool cpu_;
 };
 
 void copy_with(Tensor dst, Tensor src, int64_t engine, const ce::Elementwise& fn) {
@@ -112,7 +114,11 @@ void copy_with(Tensor dst, Tensor src, int64_t engine, const ce::Elementwise& fn
   if (dst.numel() == 0) return;
   const ce::Endpoint de = endpoint(dst), se = endpoint(src);
   std::shared_ptr<ce::NativeOp> native;
-  if (fn.identity() && same_bits(dst.scalar_type(), src.scalar_type())) native = std::make_shared<TorchCopy>(dst, src);
+  if (fn.identity() && same_bits(dst.scalar_type(), src.scalar_type())) {
+    const bool dense = dst.is_contiguous() && src.is_contiguous() && dst.numel() == src.numel();
+    native = std::make_shared<TorchCopy>(
+        dst, src, !ce::torch_copy_stream_ordered(de, se, dst.scalar_type() == src.scalar_type(), dense));
+  }
   uintptr_t stream = 0;
   if (dst.is_cuda()) stream = current_stream(de.device.index);
   else if (src.is_cuda()) stream = current_stream(se.device.index);

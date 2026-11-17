@@ -7,204 +7,128 @@ _Deliver optimal copy performance effortless._
 </div>
 
 Hand the copies scattered through your code (`copy_`, gather / scatter, host ↔
-GPU transfers, layout changes, casts) to copyengine. It merges them, decides
-where to reorder and convert, and tunes itself to the hardware it runs on.
-Existing code mostly stays as it is.
+GPU transfers, layout changes, casts, quantization on the way) to copyengine.
+It merges them, picks how to move them on this machine, and keeps a choice
+only where it measured faster than torch's own copy, with torch's results.
 
-## Before / after
-
-```python
-# Before: layers × blocks small copies, each its own call (tens of thousands of calls)
-for layer in range(L):
-    for blk in blocks:
-        scale_k[layer][blk].copy_(k_qs_buf[blk].expand(N, S))
-
-# After: one line of wrapping. The loop is unchanged; its copies are merged
-# into a few transfers and kernels.
-with ce.scope():
-    for layer in range(L):
-        for blk in blocks:
-            scale_k[layer][blk].copy_(k_qs_buf[blk].expand(N, S))
-```
-
-Loops like this are usually rewritten by hand into a few vectorized copies or a
-custom kernel. copyengine aims to get that result without the rewrite, and
-without a new kernel for every new model or cache layout.
-
-## Where it helps
-
-- **Inference**: loading and offloading KV cache blocks between host and GPU,
-  paged caches (gather / scatter by block id), quantizing or dequantizing KV on
-  the way (FP8 or int8 with a scale), swapping LoRA weights in and out.
-- **Training**: offloading optimizer state and activations, dataloader H2D,
-  checkpoint save / load and resharding (pure reordering).
-- **Model code**: `x.permute(...).contiguous().cuda()`, copying after
-  `index_select`, permute-then-cast: write it as one `ce.copy_` into the
-  destination (with `ce.lazy` for gathers), and it happens in one pass, with
-  the reordering done on the GPU.
-
-copyengine moves and converts data. Computation such as reductions is out of
-scope: it runs as usual, ordered correctly around the copies.
-
-## What it guarantees
-
-1. **Not slower than the original.** Wherever torch has the same copy, torch's
-   own `copy_` is always a candidate. Anything else is measured against it,
-   including the time copyengine itself spends planning and submitting, and is
-   kept only if it is clearly faster. Decisions keep being re-checked while
-   your program runs. A scope as a whole is held to the same rule: each scope
-   call site compares running intercepted with not intercepting at all (host
-   and GPU time), and stops intercepting where that does not clearly win, for
-   example around ops copyengine does not take (`index_copy_`) or copies torch
-   already does best (`stats()["scopes"]`). The explicit API has the same protection where torch can
-   express the copy: `ce.lazy` views, `ce.gather`, `ce.scatter_`,
-   `ce.segments` and `ce.indices` are measured against the same copy written
-   with torch ops (indexing, `index_copy_`, slices) from the same host
-   indices. Conversions with `fn=` and views torch has no form for (a reversed
-   slice) have no torch equivalent: there copyengine picks the fastest of its
-   own strategies. Either way it cannot beat torch code that does less work,
-   for example indices already on the GPU, and each explicit call costs a few
-   microseconds of host time: for a few small copies per step, `freeze()` or
-   a CUDA graph is the fast path.
-2. **The same results.** copyengine only takes a copy when it can produce
-   exactly torch's result; otherwise torch runs it. Host and GPU conversions
-   are bit-identical. (NaN stays NaN, but its sign and payload bits are not
-   kept: torch's own differ between its CPU and CUDA conversions.) This is a
-   guarantee about copies: moving and converting values. Quantization
-   (`ce.quantize`) computes, and computation has no single "torch result":
-   the order and form of the arithmetic decide the last bit, and torch itself
-   gives different bits on the CPU and the GPU for the same expression. There
-   copyengine follows its own written recipe (`copyengine/_quant.py`), with
-   the same bits on the host and every GPU; torch code computing the same
-   formula another way may differ in the last bit.
-3. **Easy to turn off.** `CE_DISABLE=1` turns copyengine's choices off: every
-   copy runs through torch's own `copy_`, or exactly as submitted where torch
-   has no equivalent.
-4. **Bounded resources.** With torch installed, copyengine's own device memory
-   (staging, copy tables) comes from torch's caching allocator, so it shows in
-   `torch.cuda.memory_allocated()` and obeys torch's limits; its pinned host
-   buffers come from torch's pinned allocator (the one `pin_memory()` uses).
-   Device staging
-   has a budget (`CE_STAGING_MB`),
-   and `Engine(max_sms=N)` (or `CE_MAX_SMS`) keeps copy kernels on at most N
-   SMs per GPU, leaving the rest to your compute. Where the driver supports
-   green contexts the limit is hard (checked on start); otherwise copyengine
-   launches at most N thread blocks. DMA copies use the copy engines and no
-   SMs; memory bandwidth is still shared, unless you limit it:
-   `ce.scope(bandwidth=8e9)` (or `Engine(bandwidth=...)`) paces the copies on
-   the GPU to about 8 GB/s per direction, leaving the rest of the link to
-   other work.
-
-The first runs of each new copy pattern are a warmup: copyengine measures its
-options, then locks the fastest. Save the result with `eng.save_profile(path)`
-to skip the warmup next time on the same machine.
-
-## Install
+## Quick start
 
 ```bash
 pip install copyengine
 ```
 
-The wheels include the GPU kernels and the torch integration; they use the
-torch you already have. To build from source instead:
-
-```bash
-pip install .                      # needs CMake >= 3.26 and a C++20 compiler
-                                   # GPU support: CUDA toolkit headers + nvcc at build time
-pip install --no-build-isolation . # same, with torch already installed: also builds the torch integration
-```
-
-dtypes: float64/32/16, bfloat16, float8 (e4m3fn, e5m2, e8m0fnu), int64/32/16/8,
-uint8 and bool convert into each other; packed FP4 (`float4_e2m1fn_x2`) is
-copied unconverted.
-
-Requirements: Linux on x86_64 or aarch64 (server ARM such as Grace: GH200,
-GB200, GB10; not Jetson), Python ≥ 3.10. GPU support runs on CUDA 12.x and
-13.x drivers; the driver is loaded at runtime, nothing links against `libcuda`
-or `cudart`.
-
-The torch integration is built against the torch you have installed. If you
-later switch torch versions, the part that intercepts `copy_` is recompiled
-once on import (needs a C++ compiler, takes seconds, cached). If that is not
-possible, scopes fall back to a pure-Python interception with the same
-results, only slower, and a warning says so.
-
-**Use torch 2.10 or newer for the best performance.** Every torch from 2.9 on
-gives the same results, but from 2.10 the explicit API (`ce.copy_`,
-`ce.lazy`, ...) runs as a compiled torch op; on 2.9 it goes through Python and
-costs a few more microseconds per call, which matters for many small copies.
-`scope()` interception is compiled on every supported version.
-
-## Use
-
 ```python
 import copyengine as ce
-import torch
 
-# 1. Unchanged torch code: copy_ inside a scope is queued and merged.
+# A loop of copy_ calls: wrap it. The code stays as it is; its copies are
+# queued and merged into a few transfers and kernels when the scope ends.
 with ce.scope():
     for l in range(num_layers):
         for i, b in enumerate(block_ids):
-            kv_cache[l, b].copy_(host_slot[l, i])
+            kv_cache[l, b].copy_(host_kv[l, i])
 
-# 2. A copy torch cannot express as one view: gather + permute + cast in one pass.
-src = ce.lazy(cache).index_select(0, ids).permute(0, 2, 1, 3)
-ce.copy_(out_fp16, src)
+# Block ids that change every step (paged KV): plan the step once, pass the
+# whole pools and the ids; later calls replay it with the new ids.
+def load(dev_pools, host_pools, dev_ids, host_ids):
+    for d, h in zip(dev_pools, host_pools):
+        ce.copy_(ce.lazy(d)[dev_ids], ce.lazy(h)[host_ids])
 
-# 3. Quantize / dequantize on the way.
-ce.copy_(q_int8, x, fn=ce.Elementwise(scale=1 / qs, round=True, clamp=(-127, 127)))
+step = ce.plan(load)
+step(dev_pools, host_pools, dev_ids, host_ids)   # ids: lists, numpy arrays or int64 tensors
 
-# 4. Quantize while copying: FP8 / INT8 / INT4 / MXFP8 / NVFP4 per group of values.
+# Quantize while copying (FP8 / INT8 / INT4 / MXFP8 / NVFP4, a scale per group).
 ce.quantize(kv, q_cache, scales, fmt="fp8_e4m3", group=128, x_index=pages, index=slots)
-
-# 5. Ragged or CSR layouts: many segments in one call.
-ce.segments(src, dst, src_off, dst_off, length)
-
-# 6. Overlap copies with compute: run them on a copy stream, the host never waits.
-with ce.scope(stream="copy") as h:      # or stream=<a torch.cuda.Stream>
-    for l in range(num_layers):
-        next_kv[l].copy_(host_kv[l, ids])
-...                                     # compute keeps running on the current stream
-h.wait()                                # the current stream waits for the copies (GPU side)
-
-# 7. A step that runs every iteration with new indices: plan it once.
-def load_blocks(caches, pool, block_ids):      # caches: one tensor per layer
-    for l, cache in enumerate(caches):
-        ce.gather(cache, block_ids, 0, out=pool[l])
-
-step = ce.plan(load_blocks)
-step(caches, pool, block_ids)                  # block_ids: a CUDA int64 tensor, new each step
 ```
 
-`ce.plan(step)` (or `eng.plan`) traces `step` per argument layout until the
-engine has settled, then replays its copies without running `step` or
-planning. Index arguments are read anew on every call: CUDA int64 tensors
-directly, and host indices (numpy arrays, lists of ints, CPU integer tensors)
-when the step passes them straight to `ce.gather`, `ce.scatter_` or
-`ce.lazy(...).index_select` (indices the step computes from them are guarded
-by value instead). For host indices two strategies are measured against each
-other: DMA descriptors built at each call, and the statement kernel reading
-the indices on the GPU. Every other tensor the copies touch must be an
-argument and the same buffer (a new buffer or shape traces again). Only the copies replay, so a step should only
-copy. A replay is kept only where it beats running `step` plainly.
-`eng.freeze()` / `plan.run()` replays the last flush exactly (same buffers,
-same indices).
+## Pick by situation
 
-More: `ce.copy_many(dsts, srcs)` for lists of copies (one per layer) in one
-call, `ce.gather` / `ce.scatter_` for index-based copies, `ce.barrier()` to
-wait for queued work, `ce.probe()` to see which copy mechanisms this machine
-supports (each verified by a real copy). C and C++ callers use
+| Your code | Use |
+|---|---|
+| A loop of `copy_` calls you do not want to touch | `with ce.scope():` around it |
+| The same step every iteration, block ids changing (paged caches, offload) | `step = ce.plan(fn)`, with `ce.lazy(pool)[ids]` inside; pass pools and ids as arguments |
+| One copy per layer, the same tensors every step | `ce.copy_many(dsts, srcs)` |
+| Gather + permute + cast before a copy (`x[ids].permute(...).to(...)`) | `ce.copy_(out, ce.lazy(x)[ids].permute(...))`: one pass, no temporaries |
+| einops patterns on the way | `ce.rearrange(ce.lazy(x), "b h s d -> b s h d")`, also inside `torch.compile` |
+| Quantize / dequantize while copying | `ce.quantize(...)`, `ce.dequantize(...)`; a single scale: `ce.copy_(q, x, fn=ce.Elementwise(scale=...))` |
+| Copies that should overlap compute | `with ce.scope(stream="copy") as h:` ... `h.wait()` |
+| Background copies that must leave SMs or bandwidth to compute | `ce.Engine(max_sms=4)`, `ce.scope(bandwidth=8e9)` |
+| Ragged / CSR segments | `ce.segments(src, dst, src_off, dst_off, length)` |
+| Exactly the same copies every step | `eng.freeze()` once, then `plan.run()` (also inside CUDA graphs) |
+
+Inside `torch.compile`, the explicit calls (`ce.copy_`, `ce.copy_many`,
+`ce.gather`, `ce.scatter_`, `ce.quantize`, lazy views) are graph nodes, each
+measured against what torch.compile generates for the same operation, and the
+faster one is kept: adding copyengine never makes a compiled model slower.
+
+## Check that it works
+
+```python
+eng = ce.Engine()                         # or use the module functions above
+...                                       # run your step a few times
+eng.stats()["last"]["decisions"]          # per group: strategy and why ("locked: 63 us vs native 2632 us")
+```
+
+- `CE_DISABLE=1` runs every copy as torch's own: compare results and time.
+- The first runs of each copy pattern measure the options, then lock the
+  fastest. Warm up with `eng.warmup(step)` and `eng.save_profile(path)`; load
+  it in serving with `CE_EXPLORE=0` to never measure there.
+- `python bench/bench_torch.py` compares against torch on your GPU.
+
+## What it guarantees
+
+1. **Not slower than torch.** Torch's own copy is always a candidate where
+   torch has the same copy; anything else is kept only if it measured clearly
+   faster, counting copyengine's own planning and submission time, and is
+   re-checked while the program runs. A scope call site, a `copy_many` call
+   and a step plan are each compared with not using copyengine at all, and
+   fall back where that does not clearly win (`stats()["scopes"]`,
+   `stats()["copy_many"]`). Where torch has no equivalent (a conversion with
+   `fn=`, a reversed slice), copyengine picks the fastest of its own ways.
+2. **The same results.** Copies (moving and converting values) give exactly
+   torch's bits, on the host and every GPU (NaN stays NaN; its payload bits are
+   not kept, torch's own differ between CPU and CUDA). Torch's copy is used as
+   the baseline only where its bits are copyengine's. Quantization computes,
+   and computation has no single torch result: copyengine follows its written
+   recipe (`copyengine/_quant.py`), the same bits everywhere.
+3. **Easy to turn off.** `CE_DISABLE=1`: every copy through torch's `copy_`, or
+   exactly as submitted where torch has no equivalent.
+4. **Bounded resources.** With torch, copyengine's device memory and pinned
+   buffers come from torch's allocators (they show in
+   `torch.cuda.memory_allocated()`); device staging has a budget
+   (`CE_STAGING_MB`); `Engine(max_sms=N)` keeps copy kernels on at most N SMs
+   (a green context where the driver supports it, verified on start); DMA uses
+   the copy engines, and `bandwidth=` paces it.
+
+## Install details
+
+The wheels include the GPU kernels and the torch integration and use the torch
+you have. From source:
+
+```bash
+pip install .                      # CMake >= 3.26, a C++20 compiler; GPU: CUDA headers + nvcc
+pip install --no-build-isolation . # with torch installed: also builds the torch integration
+```
+
+- Linux on x86_64 or aarch64 (server ARM such as Grace; not Jetson), Python ≥
+  3.10, CUDA 12.x or 13.x drivers (loaded at runtime; nothing links `libcuda`
+  or `cudart`).
+- torch 2.9 or newer gives the same results; **2.10 or newer** runs the
+  explicit API as a compiled torch op (a few microseconds less per call).
+  After a torch upgrade, the `copy_` interception recompiles once on import
+  (needs a C++ compiler; else scopes intercept in Python, slower, with a
+  warning).
+- dtypes: float64/32/16, bfloat16, float8 (e4m3fn, e5m2, e8m0fnu),
+  int64/32/16/8, uint8 and bool convert into each other; packed FP4
+  (`float4_e2m1fn_x2`) is copied unconverted.
+- Host memory may be pinned (`pin_memory()`), registered
+  (`cudaHostRegister`) or pageable; pinned is fastest.
+
+More: `ce.gather` / `ce.scatter_` for index-based copies, `ce.indices`,
+`ce.barrier()` to wait for queued work, `ce.probe()` for the copy mechanisms
+this machine has (each verified by a real copy). C and C++ callers use
 `include/copyengine/copyengine.h` (a stable C ABI) or `copyengine::copyengine`
-from CMake.
-
-To see what copyengine did: `eng.stats()["last"]["decisions"]` lists each
-group of the last flush with its strategy and why (still exploring, the A/B
-result it locked on, an online re-check, a CUDA graph capture), and
-`stats()["declined"]` counts the intercepted copies it left to torch, by
-reason. In Nsight Systems every group is an NVTX range named
+from CMake. In Nsight Systems every group is an NVTX range
 `copyengine:<strategy>`.
-
-To compare against torch on your GPU: `python bench/bench_torch.py`.
 
 ## With an AI coding agent
 
@@ -263,8 +187,16 @@ fastest.
   next `synchronize()`; duplicate CUDA scatter indices are not detected
   (undefined, as in torch's `index_copy_`).
 - Each destination element must be written once per copy: duplicate scatter
-  indices and a source overlapping its own destination raise `UnsafeCopy` in
-  the explicit API (an intercepted `copy_` leaves those to torch).
+  indices raise `UnsafeCopy` in the explicit API (an intercepted `copy_`
+  leaves those to torch).
+- A source that shares bytes with its destination (judged by storage and
+  byte ranges, so views of one buffer count): a lazy copy
+  (`ce.copy_(ce.lazy(pool)[d], ce.lazy(pool)[s])`) gathers first and then
+  writes, as torch's `pool[d] = pool[s]` does, in two passes where the sides
+  may overlap and one where they cannot (disjoint column slices of one pool
+  stay one pass; with host indices the check uses this call's values).
+  `ce.gather` / `ce.scatter_` and plain views refuse it with `UnsafeCopy`, as
+  torch's `index_select(out=)`, `index_copy_` and `copy_` do.
 
 ## Environment
 

@@ -72,8 +72,12 @@ Read `why` in the decisions:
   no torch equivalent met a capture before its strategy was set up. Run the
   step (or `eng.warmup`) before `torch.cuda.graph`. Also create
   `eng.copy_stream()` before capturing async scopes.
-- `UnsafeCopy`: the explicit API refuses duplicate scatter indices or a source
-  overlapping its destination (an intercepted `copy_` leaves those to torch).
+- `UnsafeCopy`: the explicit API refuses duplicate scatter indices, and
+  `ce.gather` / `ce.scatter_` / plain views whose source may share bytes with
+  the destination (as torch's `index_copy_` and `copy_` refuse them). Write a
+  copy within one pool as a lazy copy, `ce.copy_(ce.lazy(pool)[d],
+  ce.lazy(pool)[s])`: it gathers first where the sides may overlap, as
+  `pool[d] = pool[s]` does (an intercepted `copy_` leaves those to torch).
 - `NeedsMaterialize`: a `reshape` of a lazy view that no strides express;
   materialize with torch first or restructure the view. Lazy views take
   `[...]` indexing and `.slice` / `.narrow`.

@@ -33,6 +33,9 @@ class Executor {
   virtual int64_t mark(uintptr_t /*stream*/, int /*device*/) { return -1; }
   virtual double elapsed(int64_t /*a*/, int64_t /*b*/) { return 0; }
   virtual void release(int64_t /*m*/) {}
+  // Work queued on `later` from now on runs after what is queued on `earlier`
+  // (an event: the host does not wait).
+  virtual void order(uintptr_t /*later*/, uintptr_t /*earlier*/, int /*device*/) {}
   // Whether the work before mark `m` has completed (does not release it).
   virtual bool ready(int64_t /*m*/) { return true; }
   // CUDA Graph capture. While `stream` is being captured, work may only be

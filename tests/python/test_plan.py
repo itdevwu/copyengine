@@ -249,3 +249,109 @@ def test_pageable_host_pools_replay_with_host_indices(h2d):
                 assert torch.equal(h[hi], d[di].cpu()), k
     tr = next(iter(p._layouts.values()))["traces"][0]
     assert tr.plain is None and tr.params, tr.plain
+
+
+def test_a_swap_through_a_temporary_replays_right():
+    def step(a, b):
+        tmp = torch.empty_like(a)
+        tmp.copy_(a)
+        a.copy_(b)
+        b.copy_(tmp)
+
+    p = ce.Engine().plan(step)
+    a = torch.full((64, 64), 1.0, device=DEV)
+    b = torch.full((64, 64), 2.0, device=DEV)
+    for k in range(200):
+        a0, b0 = a.clone(), b.clone()
+        p(a, b)
+        torch.cuda.synchronize()
+        assert torch.equal(a, b0) and torch.equal(b, a0), k
+
+
+def test_column_slices_of_one_pool_stay_one_pass():
+    # 8 layers as column slices of one pinned pool (bench make_views): source layer A and
+    # destination layer B share the storage, not the bytes, whatever the block ids.
+    import numpy as np
+    L, B, W = 8, 32, 64
+    pool = torch.randn(B, L * W).pin_memory()
+    dev = torch.zeros(B, W, device=DEV)
+    e = ce.Engine()
+    for _ in range(3):
+        ids = np.random.default_rng(0).permutation(B)[:6]
+        for a, b in [(0, 1), (3, 5)]:
+            src = ce.lazy(pool[:, a * W:(a + 1) * W]).index_select(0, ids)
+            dst = ce.lazy(pool[:, b * W:(b + 1) * W]).index_select(0, ids)
+            want = pool.clone()
+            want[ids, b * W:(b + 1) * W] = want[ids, a * W:(a + 1) * W]
+            e.copy_(dst, src)
+            torch.cuda.synchronize()
+            assert torch.equal(pool, want)
+            assert e.stats()["last"]["ops"] == 1  # one pass: no temporary
+    del dev
+
+
+def test_column_slices_with_run_time_indices_stay_one_pass():
+    # GPU indices: only the conservative footprint is known. It keeps the strides (the
+    # indexed dimension spans its bound, the columns stay exact), so layer A's columns and
+    # layer B's columns of one pool do not overlap: one pass, no temporary.
+    from copyengine import _core
+    from copyengine._tensor import view
+    L, B, W = 8, 32, 64
+    pool = torch.randn(B, L * W, device=DEV)
+    ids = torch.randperm(B, device=DEV)[:6]
+    src = ce.lazy(pool[:, 0:W]).index_select(0, ids)
+    dst = ce.lazy(pool[:, 3 * W:4 * W]).index_select(0, ids)
+    d, s = view(dst, writable=True), view(src)
+    assert _core.Engine.stmt_overlap(s.endpoint, d.endpoint, _core.Stmt(d.access, s.access)) == 0
+    same = ce.lazy(pool[:, 0:W]).index_select(0, ids.flip(0))  # the same columns: they may overlap
+    assert _core.Engine.stmt_overlap(view(same).endpoint, d.endpoint, _core.Stmt(view(same, writable=True).access,
+                                                                                  s.access)) == 2
+    want = pool.clone()
+    want[ids, 3 * W:4 * W] = want[ids, 0:W]
+    e = ce.Engine()
+    e.copy_(dst, src)
+    torch.cuda.synchronize()
+    assert torch.equal(pool, want) and e.stats()["last"]["ops"] == 1
+
+
+@pytest.mark.parametrize("where", ["cuda", "pinned"])
+def test_overlapping_block_copies_in_one_pool_match_torch(where):
+    import numpy as np
+    pool = torch.randn(32, 4, 16)
+    pool = pool.to(DEV) if where == "cuda" else pool.pin_memory()
+    rng = np.random.default_rng(3)
+    e = ce.Engine()
+    for k in range(30):
+        d, s = rng.permutation(32)[:8], rng.permutation(32)[:8]  # the id sets intersect most of the time
+        want = pool.clone()
+        want[torch.as_tensor(d)] = want[torch.as_tensor(s)]
+        di = torch.as_tensor(d, device=DEV) if where == "cuda" and k % 2 else d  # GPU or host indices
+        si = torch.as_tensor(s, device=DEV) if where == "cuda" and k % 2 else s
+        e.copy_(ce.lazy(pool).index_select(0, di), ce.lazy(pool).index_select(0, si))
+        torch.cuda.synchronize()
+        assert torch.equal(pool.cpu(), want.cpu()), k
+
+
+def test_step_plan_host_indices_one_or_two_passes_per_call():
+    import numpy as np
+    pool = torch.randn(32, 4, 16, device=DEV)
+    e = ce.Engine()
+
+    def step(pool, d, s):
+        e.copy_(ce.lazy(pool).index_select(0, d), ce.lazy(pool).index_select(0, s))
+
+    p = e.plan(step)
+    rng = np.random.default_rng(5)
+    for k in range(200):
+        if k % 3:  # disjoint id sets: one pass
+            perm = rng.permutation(32)
+            d, s = perm[:8], perm[8:16]
+        else:      # intersecting: two passes
+            d, s = rng.permutation(32)[:8], rng.permutation(32)[:8]
+        want = pool.clone()
+        want[torch.as_tensor(d, device=DEV)] = want[torch.as_tensor(s, device=DEV)]
+        p(pool, d, s)
+        torch.cuda.synchronize()
+        assert torch.equal(pool, want), k
+    tr = next(iter(p._layouts.values()))["traces"][0]
+    assert tr.plain is None and tr.checks

@@ -124,8 +124,9 @@ const c10::TypedOperatorHandle<at::Tensor&(at::Tensor&, const at::Tensor&, bool)
 // so it does not come back here.
 class TorchCopy final : public ce::NativeOp {
  public:
-  TorchCopy(at::Tensor dst, at::Tensor src, bool non_blocking)
-      : dst_(std::move(dst)), src_(std::move(src)), non_blocking_(non_blocking) {}
+  TorchCopy(at::Tensor dst, at::Tensor src, bool non_blocking, bool cpu)
+      : dst_(std::move(dst)), src_(std::move(src)), non_blocking_(non_blocking), cpu_(cpu) {}
+  bool cpu_host_access() const override { return cpu_; }
   void run(uintptr_t) override { run(0, false); }
   void run(uintptr_t, bool host_async) override {
     c10::impl::ExcludeDispatchKeyGuard guard(kKey);
@@ -135,6 +136,7 @@ class TorchCopy final : public ce::NativeOp {
  private:
   at::Tensor dst_, src_;
   bool non_blocking_;
+  bool cpu_;
 };
 
 at::Tensor& native_copy(c10::DispatchKeySet ks, at::Tensor& self, const at::Tensor& src, bool non_blocking) {
@@ -183,7 +185,11 @@ at::Tensor& intercepted_copy(c10::DispatchKeySet ks, at::Tensor& self, const at:
   const int rc = g_api->copy_strided(
       *e, se, de, ss.data(), st.data(), static_cast<int>(ss.size()), src.storage_offset(), ds.data(), dt.data(),
       static_cast<int>(ds.size()), self.storage_offset(), ce::Elementwise{},
-      std::make_shared<TorchCopy>(self, src, non_blocking), non_blocking ? ce::FrontendApi::kHostAsync : 0u, stream,
+      std::make_shared<TorchCopy>(
+          self, src, non_blocking,
+          !ce::torch_copy_stream_ordered(de, se, self.scalar_type() == src.scalar_type(),
+                                         self.is_contiguous() && src.is_contiguous() && self.sizes() == src.sizes())),
+      non_blocking ? ce::FrontendApi::kHostAsync : 0u, stream,
       &err);
   if (rc != 0) {
     g_api->decline(*e, refusal(rc));

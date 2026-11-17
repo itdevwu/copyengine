@@ -107,6 +107,15 @@ class Engine {
   void copy(const Endpoint& src, const Endpoint& dst, const Stmt& stmt, const Elementwise& fn = {},
             const Hints& hints = {}, uintptr_t stream = 0);
 
+  // Whether a statement's source and destination share bytes, by storage and
+  // byte ranges (views of one buffer included): 0 never; 3 they do now
+  // (exact, from the index values on the host, host tables included); 1 they
+  // may through host tables read at run time but do not with their values
+  // now; 2 they may through GPU index tables. Footprints keep strides:
+  // disjoint column slices of one pool stay disjoint. Lazy copies that may
+  // overlap run in two passes (gather, then write), as torch's indexing does.
+  static int stmt_overlap(const Endpoint& src, const Endpoint& dst, const Stmt& stmt);
+
   // Quantization / dequantization while copying (TileSpec). All tensors on one
   // device (a GPU, or the host).
   void tile(const TileSpec& spec, const Hints& hints = {}, uintptr_t stream = 0);
@@ -196,6 +205,10 @@ class Frozen {
   virtual std::vector<uintptr_t> tables() const = 0;
   // Every allocation the frozen copies touch: {device kind, device index, lo, hi} (bytes).
   virtual std::vector<std::array<int64_t, 4>> allocations() const = 0;
+  // Whether, with the values now in their host index tables (a step plan's
+  // parameter buffers), some copy's source and destination share bytes
+  // (exact, by the rows those values select; an index out of range: true).
+  virtual bool host_overlap() const = 0;
 };
 
 }  // namespace ce

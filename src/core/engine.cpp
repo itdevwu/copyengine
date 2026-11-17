@@ -227,6 +227,14 @@ struct Engine::Impl {
            "this engine has a scope open on another thread; give each thread its own engine");
   }
   bool host_pending = false;
+  // GPU work that reads or writes host memory may still be running (any stream).
+  bool host_inflight = false;
+  // torch's copy (a native) that touches host memory on the CPU when called
+  // runs only after GPU work on host memory finished: it is not stream-ordered.
+  void before_cpu_native(const Op& op) {
+    const bool host = op.src.device.kind == DeviceKind::host || op.dst.device.kind == DeviceKind::host;
+    if (host && host_inflight && !capturing && op.native && op.native->cpu_host_access()) synchronize();
+  }
   FlushStats last;
   int64_t total_flushes = 0, total_ops = 0, total_calls = 0, total_bytes = 0, plan_hits = 0;
   int64_t tuning_runs = 0;  // see Engine::tuning_runs
@@ -452,16 +460,48 @@ struct Engine::Impl {
       cuda_streams.emplace_back(strm, dev);
     if (std::find(pending_at.begin(), pending_at.end(), std::make_pair(strm, dev)) == pending_at.end())
       pending_at.emplace_back(strm, dev);
-    if (host_wait && (s.device.kind == DeviceKind::host || d.device.kind == DeviceKind::host)) host_pending = true;
+    const bool host = s.device.kind == DeviceKind::host || d.device.kind == DeviceKind::host;
+    if (host) host_inflight = true;
+    if (host_wait && host) host_pending = true;
+  }
+
+  static int gpu_of(const Op& op) {
+    if (op.dst.device.kind == DeviceKind::cuda) return op.dst.device.index;
+    return op.src.device.kind == DeviceKind::cuda ? op.src.device.index : -1;
+  }
+
+  // The queue (on `stream`) is flushed because work arrives on `strm`. Natives
+  // run on the framework's current stream, which is `strm` now, not `stream`:
+  // `strm` waits for what `stream` had, and `stream` for what the flush put on
+  // `strm`, so either stream's later work sees the flushed copies.
+  // `strm_dev`: the GPU of the work arriving on `strm` (-1: none). Streams of
+  // two GPUs are not ordered here (an event belongs to one device's context;
+  // torch orders cross-device work itself).
+  void flush_for_stream(uintptr_t strm, int strm_dev) {
+    const bool other = !queue.empty() && strm != stream;
+    int dev = -1;
+    if (other && cuda && strm_dev >= 0 && !capturing && !is_capturing(strm) && !is_capturing(stream))
+      for (const Op& op : queue) {
+        if (op.dst.device.kind == DeviceKind::cuda) dev = op.dst.device.index;
+        else if (op.src.device.kind == DeviceKind::cuda) dev = op.src.device.index;
+        if (dev >= 0) break;
+      }
+    if (dev != strm_dev) dev = -1;
+    const uintptr_t was = stream;
+    if (dev >= 0) cuda->order(strm, was, dev);
+    flush();
+    if (dev >= 0) cuda->order(was, strm, dev);
   }
 
   // torch's own copy keeps its buffers safe itself (it records events on pinned memory).
   void run_native_now(Op& op, uintptr_t strm) {
-    if (!queue.empty() && (strm != stream || !op.extras.empty() ||
+    if (!queue.empty() && strm != stream) flush_for_stream(strm, gpu_of(op));
+    if (!queue.empty() && (!op.extras.empty() ||
                            conflicts(op.src.device, op.src_lo, op.src_hi, op.dst.device, op.dst_lo, op.dst_hi)))
       flush();
     const bool host_only = op.src.device.kind == DeviceKind::host && op.dst.device.kind == DeviceKind::host;
     if (host_only && host_pending && !capturing) synchronize();  // host work may touch what CUDA work still uses
+    before_cpu_native(op);
     op.native->run(strm, op.host_async);
     note_pending(op.src, op.dst, strm, !op.host_async);
     bury(std::move(op.native));
@@ -498,7 +538,7 @@ struct Engine::Impl {
       run_native_now(op, strm);
       return;
     }
-    if (!queue.empty() && strm != stream) flush();
+    if (!queue.empty() && strm != stream) flush_for_stream(strm, gpu_of(op));
     stream = strm;
     add_alloc(q_reads, op.src.device, op.src_lo, op.src_hi);
     add_alloc(q_writes, op.dst.device, op.dst_lo, op.dst_hi);
@@ -591,6 +631,16 @@ struct Engine::Impl {
     std::shared_ptr<const Form> form = make_form(src, dst, stmt, &op.stab, &op.dtab);
     if (!form)
       fail(Errc::needs_materialize, "a copy with device indices needs at most 6 dimensions and one index table per side");
+    // One pass reads and writes concurrently: a source that may share bytes
+    // with the destination (as far as the indices can reach) is refused, as
+    // torch's index_select(out=) / index_copy_ refuse overlapping tensors;
+    // lazy copies take two passes instead (Engine::stmt_overlap).
+    const bool same_storage = src.device == dst.device && src.base < dst.base + static_cast<uintptr_t>(dst.nbytes) &&
+                              dst.base < src.base + static_cast<uintptr_t>(src.nbytes);
+    if (!hints.overlap_checked && same_storage && device_tables_reach(stmt) &&
+        intersects(form->src_bytes(), form->dst_bytes()))
+      fail(Errc::unsafe_copy, "source and destination may overlap (indices read at run time): one pass would read "
+                              "what it writes");
     const auto [slo, shi] = form->src_extent();
     const auto [dlo, dhi] = form->dst_extent();
     const i64 ss = static_cast<i64>(itemsize(src.dtype)), ds = static_cast<i64>(itemsize(dst.dtype));
@@ -960,6 +1010,10 @@ struct Engine::Impl {
                     FlushStats* st) {
     Executor& ex = exec_for(g.src, g.dst);
     if (&ex == &host && host_pending && !capturing) synchronize();  // host work may touch what CUDA work still uses
+    // A native that reads host memory on the CPU waits for GPU work there now,
+    // outside the measured window (torch alone would not pay for that wait).
+    if (s == Strategy::native)
+      for (int k : g.ops) before_cpu_native(ops[k]);
     const int64_t a = measure ? ex.mark(strm, device_of(g)) : -1;
     // Setup on a strategy's first run for this group (tables made resident,
     // descriptors built) is paid once, not per run: such a run is no sample.
@@ -1153,6 +1207,14 @@ struct Engine::Impl {
     return {all.empty() ? p.strategy : all.front(), false};
   }
 
+  // GPU index tables are involved (their values are never on the host).
+  static bool device_tables_reach(const Stmt& stmt) {
+    for (const Access* a : {&stmt.src, &stmt.dst})
+      for (const Term& t : a->terms())
+        if (t.dev.ptr && !t.dev.host()) return true;
+    return false;
+  }
+
   // A plan-cache miss: is it one more of a structure that keeps missing?
   bool churned(const std::vector<Op>& ops) {
     if (capturing || recording || opt.disable || opt.prior_only || !opt.force.empty()) return false;
@@ -1164,12 +1226,16 @@ struct Engine::Impl {
   }
 
   void synchronize() {
-    if (cuda_streams.empty()) return;
+    if (cuda_streams.empty()) {
+      host_inflight = false;  // nothing of ours in flight
+      return;
+    }
     cuda->sync(cuda_streams);
     cuda_streams.clear();
     pending_at.clear();
     reap(true);
     host_pending = false;
+    host_inflight = false;
     poll_samples();
   }
 
@@ -1245,6 +1311,40 @@ void Engine::copy(const Endpoint& src, const Endpoint& dst, const Stmt& stmt, co
   Locked lk(*impl_);
   impl_->check_thread();
   impl_->enqueue_stmt(src, dst, stmt, fn, hints, stream, t0);
+}
+
+int Engine::stmt_overlap(const Endpoint& src, const Endpoint& dst, const Stmt& stmt) {
+  if (!(src.device == dst.device)) return 0;
+  const auto slo = src.base, shi = src.base + static_cast<uintptr_t>(src.nbytes);
+  const auto dlo = dst.base, dhi = dst.base + static_cast<uintptr_t>(dst.nbytes);
+  if (shi <= dlo || dhi <= slo) return 0;  // other storage
+  if (stmt.src.has_device_table() || stmt.dst.has_device_table()) {
+    uintptr_t st = 0, dt = 0;
+    const auto form = Impl::make_form(src, dst, stmt, &st, &dt);
+    bool device = false;
+    for (const Access* a : {&stmt.src, &stmt.dst})
+      for (const Term& t : a->terms())
+        if (t.dev.ptr && !t.dev.host()) device = true;
+    if (!form) return device ? 2 : 3;  // not describable: assume they do
+    if (!intersects(form->src_bytes(), form->dst_bytes())) return 0;
+    if (device) return 2;
+    // Host tables (a step plan's parameter buffers): their values are there now.
+    try {
+      const Runs r = lower_form(*form, reinterpret_cast<const int64_t*>(st), reinterpret_cast<const int64_t*>(dt));
+      if (intersects(interval_union(r.src, r.len, static_cast<i64>(itemsize(form->sdt))),
+                     interval_union(r.dst, r.len, static_cast<i64>(itemsize(form->ddt)))))
+        return 3;
+    } catch (const Error&) {
+      return 3;  // an index out of range: the copy says so; two passes meanwhile
+    }
+    return 1;
+  }
+  const Runs r = lower(stmt);
+  const i64 ss = static_cast<i64>(itemsize(src.dtype)), ds = static_cast<i64>(itemsize(dst.dtype));
+  std::vector<i64> so(r.src.begin(), r.src.end()), dof(r.dst.begin(), r.dst.end());
+  for (i64& x : so) x += static_cast<i64>(src.base) / ss;  // absolute elements (bases are dtype-aligned)
+  for (i64& x : dof) x += static_cast<i64>(dst.base) / ds;
+  return intersects(interval_union(so, r.len, ss), interval_union(dof, r.len, ds)) ? 3 : 0;
 }
 
 void Engine::tile(const TileSpec& spec, const Hints& hints, uintptr_t stream) {
@@ -1437,7 +1537,17 @@ namespace {
 class FrozenImpl final : public Frozen {
  public:
   FrozenImpl(Engine::Impl* eng, std::shared_ptr<std::vector<Op>> ops, Ran ran)
-      : eng_(eng), ops_(std::move(ops)), ran_(std::move(ran)) {}
+      : eng_(eng), ops_(std::move(ops)), ran_(std::move(ran)) {
+    // Copies host_overlap() checks per call: host index tables only (a GPU table's
+    // values are not on the host), one device, and footprints that may intersect.
+    for (size_t k = 0; k < ops_->size(); ++k) {
+      const Op& op = (*ops_)[k];
+      if (!op.form || !op.form->host_tables() || !(op.src.device == op.dst.device)) continue;
+      const Form& f = *op.form;
+      if ((f.stab_dim >= 0 && !f.stab_host) || (f.dtab_dim >= 0 && !f.dtab_host)) continue;
+      if (intersects(f.src_bytes(), f.dst_bytes())) checked_.push_back(k);
+    }
+  }
   void run(uintptr_t stream) override { run(stream, {}); }
   void run(uintptr_t stream, std::span<const Rebind> rebinds) override {
     Locked lk(*eng_);
@@ -1471,6 +1581,22 @@ class FrozenImpl final : public Frozen {
     }
     eng_->finish(stream);
   }
+  bool host_overlap() const override {
+    for (size_t k : checked_) {
+      const Op& op = (*ops_)[k];
+      try {
+        const Runs r = lower_form(*op.form, reinterpret_cast<const int64_t*>(op.stab),
+                                  reinterpret_cast<const int64_t*>(op.dtab));
+        // The form's runs are in its own dtypes' elements (a pure copy's op sides are bytes).
+        if (intersects(interval_union(r.src, r.len, static_cast<i64>(itemsize(op.form->sdt))),
+                       interval_union(r.dst, r.len, static_cast<i64>(itemsize(op.form->ddt)))))
+          return true;
+      } catch (const Error&) {
+        return true;  // an index out of range: the copy will say so; assume the worst
+      }
+    }
+    return false;
+  }
   std::vector<uintptr_t> tables() const override {
     std::vector<uintptr_t> t;
     for (const Op& op : *ops_) {
@@ -1494,6 +1620,7 @@ class FrozenImpl final : public Frozen {
   }
 
  private:
+  std::vector<size_t> checked_;  // see the constructor
   Engine::Impl* eng_;
   std::shared_ptr<std::vector<Op>> ops_;
   std::vector<Op> work_;  // ops_ with this call's table pointers
@@ -1545,8 +1672,21 @@ std::shared_ptr<Frozen> Engine::freeze_composed(const std::vector<std::array<int
     int64_t d, len, s;
     Side side;
     int64_t lo, hi;  // the source allocation
+    bool stale = false;  // its source bytes were overwritten since: they are not what dead memory holds
   };
   std::vector<Piece> written;
+  // An op wrote live memory: pieces whose source bytes it overwrote no longer
+  // say what the dead memory holds (a swap through a temporary: tmp = a; a = b; b = tmp).
+  auto overwrite = [&](const Op& op) {
+    auto hit = [&](Device dev, int64_t lo, int64_t hi) {
+      for (Piece& p : written)
+        if (p.side.device == dev && p.s < hi && lo < p.s + p.len) p.stale = true;
+    };
+    const Intervals& w = op.write();
+    for (size_t i = 0; i < w.start.size(); ++i) hit(op.dst.device, w.start[i], w.end[i]);
+    for (const Op::Extra& x : op.extras)
+      if (x.write) hit(x.device, x.lo, x.hi);
+  };
   // The sources of [s, s + len) of dead memory, in order; false if a byte was never written.
   auto resolve = [&](int64_t s, int64_t len, std::vector<Piece>& out) {
     int64_t at = s;
@@ -1558,7 +1698,7 @@ std::shared_ptr<Frozen> Engine::freeze_composed(const std::vector<std::array<int
           best = &*it;
           break;
         }
-      if (!best) return false;
+      if (!best || best->stale) return false;  // never written, or its source changed since
       // up to the end of this piece, or where a later write starts covering
       int64_t stop = std::min(end, best->d + best->len);
       for (auto it = written.rbegin(); &*it != best; ++it)
@@ -1574,6 +1714,7 @@ std::shared_ptr<Frozen> Engine::freeze_composed(const std::vector<std::array<int
     bool extra_dead = false;
     for (const Op::Extra& x : op.extras) extra_dead = extra_dead || dead_of({x.device, DType::u8, false}, x.lo, x.hi) != -1;
     if (sd == -1 && dd == -1 && !extra_dead) {
+      overwrite(op);
       out.push_back(op);
       continue;
     }
@@ -1615,8 +1756,12 @@ std::shared_ptr<Frozen> Engine::freeze_composed(const std::vector<std::array<int
       Hints h;
       h.ctx = op.ctx;
       Op c = m.make_op(se, de, std::move(o.runs), Elementwise{}, h);
+      // Composing away a temporary whose source overlaps the final destination
+      // would turn two passes into one that reads what it writes: not composed.
+      if (c.src.device == c.dst.device && intersects(c.read(), c.write())) return nullptr;
       if (!c.runs().empty()) out.push_back(std::move(c));
     }
+    if (dd < 0) overwrite(op);  // it wrote live memory (after reading its sources)
   }
   if (out.empty()) return nullptr;
   auto plan = std::make_shared<Plan>(build_plan(out));
@@ -1645,10 +1790,13 @@ std::shared_ptr<Frozen> Engine::freeze(bool rebindable) const {
   Ran ran = m.last_ran;
   for (size_t i = 0; i < ran.plan->groups.size(); ++i) {
     const Group& g = ran.plan->groups[i];
-    auto runnable = [&](Strategy s) {
-      return s != Strategy::native || std::all_of(g.ops.begin(), g.ops.end(), [&](int k) { return ops[k].native; });
-    };
     const Choice c = m.choice_for(g, ops);
+    // A strategy this group offers (a bucket's lock may come from another group), native only with payloads.
+    auto runnable = [&](Strategy s) {
+      if (s == Strategy::native)
+        return std::all_of(g.ops.begin(), g.ops.end(), [&](int k) { return ops[k].native != nullptr; });
+      return s == c.reference() || std::find(c.cands.begin(), c.cands.end(), s) != c.cands.end();
+    };
     if (auto l = m.tuner.locked_strategy(g.bucket); l && runnable(*l)) ran.strategies[i] = *l;
     else if (runnable(c.reference())) ran.strategies[i] = c.reference();
     if (rebindable && g.opaque() && ran.strategies[i] == Strategy::native) {

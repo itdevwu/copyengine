@@ -65,3 +65,69 @@ def test_zero_dimensional_host_index_in_a_step_plan():
         p(out, src, i)
         torch.cuda.synchronize()
         assert torch.equal(out[0], src[k % 16]), k
+
+
+def test_frozen_plan_owns_its_index_tensors():
+    import gc
+    src = torch.randn(64, 32, device=DEV)
+    dst = torch.zeros(8, 32, device=DEV)
+    e = ce.Engine()
+    for _ in range(30):
+        e.copy_(dst, ce.lazy(src).index_select(0, torch.arange(8, device=DEV) * 3))  # a temporary index tensor
+    torch.cuda.synchronize()
+    fr = e.freeze()
+    gc.collect()
+    junk = [torch.full((8,), 10**6, dtype=torch.int64, device=DEV) for _ in range(64)]  # would reuse a freed block
+    dst.zero_()
+    fr.run()
+    torch.cuda.synchronize()
+    assert torch.equal(dst, src[torch.arange(8, device=DEV) * 3])
+    del junk
+
+
+def test_step_plan_notices_new_memory_behind_the_same_tensor():
+    src = torch.randn(64, 32, device=DEV)
+    out = torch.zeros(8, 32, device=DEV)
+    p = ce.Engine().plan(lambda out, src, ids: ce.gather(src, ids, 0, out=out))
+    ids = torch.arange(8, device=DEV)
+    for _ in range(300):
+        p(out, src, ids)
+    torch.cuda.synchronize()
+    assert next(iter(p._layouts.values()))["traces"]
+    out.data = torch.zeros(8, 32, device=DEV)  # the same Python object, other memory
+    p(out, src, ids)
+    torch.cuda.synchronize()
+    assert torch.equal(out, src[ids])
+
+
+def test_index_copies_refuse_overlap_as_torch_does():
+    # torch's index_copy_ refuses a source overlapping its destination; so does ce.scatter_
+    # with GPU indices (one pass would read what it writes). Lazy copies take two passes instead.
+    pool = torch.randn(32, 16, device=DEV)
+    idx = torch.randperm(32, device=DEV)[:8]
+    with pytest.raises(RuntimeError):
+        pool.index_copy_(0, idx, pool[:8])
+    with pytest.raises(ce.UnsafeCopy):
+        ce.Engine().scatter_(pool, idx, pool[:8], 0)
+
+
+def test_frozen_two_pass_copy_owns_its_temporary():
+    import gc
+    pool = torch.randn(32, 4, 16, device=DEV)
+    d = torch.tensor([3, 7, 1, 9], device=DEV)
+    s = torch.tensor([7, 2, 3, 1], device=DEV)  # intersects d: two passes through a temporary
+    e = ce.Engine()
+    for _ in range(30):
+        e.copy_(ce.lazy(pool).index_select(0, d), ce.lazy(pool).index_select(0, s))
+    torch.cuda.synchronize()
+    fr = e.freeze()
+    gc.collect()
+    junk = [torch.full((4, 4, 16), 1e6, device=DEV) for _ in range(64)]  # would reuse a freed temporary
+    start = torch.randn_like(pool)
+    pool.copy_(start)
+    want = start.clone()
+    want[d] = want[s]
+    fr.run()
+    torch.cuda.synchronize()
+    assert torch.equal(pool, want)
+    del junk

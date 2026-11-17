@@ -237,6 +237,7 @@ class CudaExecutor final : public Executor {
         if (b.done) d_->cuEventDestroy(b.done);
       }
       if (s.ev_free) d_->cuEventDestroy(s.ev_free);
+      if (s.ev_order) d_->cuEventDestroy(s.ev_order);
       if (s.ev_alloc) d_->cuEventDestroy(s.ev_alloc);
       for (Staging& g : s.stagings) {
         if (g.done) d_->cuEventDestroy(g.done);
@@ -474,6 +475,15 @@ class CudaExecutor final : public Executor {
 
   bool async() const override { return true; }
 
+  void order(uintptr_t later, uintptr_t earlier, int device) override {
+    if (later == earlier) return;
+    Dev& s = state(device);
+    Push push(*d_, s.ctx);
+    if (!s.ev_order) check(d_->cuEventCreate(&s.ev_order, CU_EVENT_DISABLE_TIMING), "cuEventCreate");
+    check(d_->cuEventRecord(s.ev_order, reinterpret_cast<CUstream>(earlier)), "cuEventRecord");
+    check(d_->cuStreamWaitEvent(reinterpret_cast<CUstream>(later), s.ev_order, 0), "cuStreamWaitEvent");
+  }
+
   int64_t mark(uintptr_t stream, int device) override {
     Dev& s = state(device);
     Push push(*d_, s.ctx);
@@ -628,6 +638,7 @@ class CudaExecutor final : public Executor {
     std::vector<uintptr_t> streams;
     bool many_streams = false;
     CUevent ev_free{};
+    CUevent ev_order{};  // order(): one stream after another
     CUevent ev_alloc{};  // dev_alloc: orders a first use after the framework's allocation stream
     DevMem err;               // set by kernels that meet an out-of-range device index
     bool err_armed = false;   // such kernels ran since the last check

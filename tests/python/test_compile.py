@@ -278,3 +278,19 @@ def test_reshape_of_a_split_tensor_stays_in_the_graph():
     torch.compile(f)(qkv, o)
     torch.cuda.synchronize()
     assert torch.equal(o, qkv[..., 128:].reshape(4, 16, 2, 32).permute(0, 2, 1, 3))
+
+
+def test_block_copy_within_one_pool_matches_eager():
+    pool = torch.randn(32, 4, 16, device="cuda")
+    d = torch.tensor([3, 7, 1, 9], device="cuda")
+    s = torch.tensor([7, 2, 3, 1], device="cuda")  # intersects d: torch gathers first
+
+    def f(pool, d, s):
+        ce.copy_(ce.lazy(pool).index_select(0, d), ce.lazy(pool).index_select(0, s).permute(0, 1, 2))
+        return pool
+
+    want = pool.clone()
+    want[d] = want[s]
+    got = torch.compile(f)(pool.clone(), d, s)
+    torch.cuda.synchronize()
+    assert torch.equal(got, want)

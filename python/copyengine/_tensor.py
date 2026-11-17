@@ -185,6 +185,62 @@ def apply_index(x, key):
     return x
 
 
+# Index tensors whose device addresses went into copies (a frozen plan replays
+# those addresses): kept alive, by address, until evicted, so an address in a
+# recent flush still names the tensor it was taken from. freeze() takes them
+# over (owned_tables); an evicted one makes freeze refuse, never replay a
+# dangling address.
+_TABLES: "collections.OrderedDict[int, Any]" = None
+_TABLES_MAX = 1024           # tensors kept, at most
+_TABLES_BYTES = 64 << 20     # and bytes (index tensors are usually small)
+_tables_bytes = 0
+
+
+def note_table(t):
+    """`t`'s data_ptr is about to go into a copy as an index table (GPU or pinned buffer)."""
+    global _TABLES, _tables_bytes
+    import collections
+    if _TABLES is None:
+        _TABLES = collections.OrderedDict()
+    p = t.data_ptr()
+    if p in _TABLES:
+        _tables_bytes -= _TABLES[p].numel() * _TABLES[p].element_size()
+    _TABLES[p] = t
+    _TABLES.move_to_end(p)
+    _tables_bytes += t.numel() * t.element_size()
+    while len(_TABLES) > 1 and (len(_TABLES) > _TABLES_MAX or _tables_bytes > _TABLES_BYTES):
+        _, old = _TABLES.popitem(last=False)
+        _tables_bytes -= old.numel() * old.element_size()
+    return t
+
+
+def _table_at(p):
+    """The noted tensor whose memory holds address `p` (a sliced or flipped index dimension
+    moves the table pointer into the tensor)."""
+    if _TABLES is None:
+        return None
+    t = _TABLES.get(p)
+    if t is not None:
+        return t
+    for q, t in reversed(_TABLES.items()):
+        if q <= p < q + max(1, t.numel()) * t.element_size():
+            return t
+    return None
+
+
+def owned_tables(pointers):
+    """The index tensors behind a frozen plan's table addresses (see note_table)."""
+    out = []
+    for p in pointers:
+        t = _table_at(p)
+        if t is None:
+            raise RuntimeError("freeze: an index tensor of the last flush is no longer known (more than "
+                               f"{_TABLES_MAX} index tensors since): freeze right after the copies, or use a step "
+                               "plan (Engine.plan), which takes index tensors as arguments")
+        out.append(t)
+    return out
+
+
 def device_table(index, host_ok: bool = False):
     """An index read when the copy runs: a CUDA index tensor as a 1-D
     contiguous int64 tensor on its GPU (no sync, nothing leaves the device),
@@ -193,7 +249,7 @@ def device_table(index, host_ok: bool = False):
     from . import _plan
     buf = _plan.param_for(index) if host_ok else None
     if buf is not None:
-        return buf
+        return note_table(buf)
     if not (is_tensor(index) and index.is_cuda):
         return None
     if index.dim() > 1:
@@ -201,7 +257,7 @@ def device_table(index, host_ok: bool = False):
     t = index.detach().reshape(-1)
     if t.dtype != torch.int64:
         t = t.to(torch.int64)
-    return t.contiguous()
+    return note_table(t.contiguous())
 
 
 def select_device(access, dim: int, t):
@@ -212,7 +268,9 @@ def device_index(idx, device) -> "torch.Tensor":
     """`idx` as an int64 tensor on `device`, sent from pinned memory without
     making the host wait (what a torch user would do with host indices)."""
     if is_tensor(idx):  # a device table: already there; a host one (a plan's buffer, reused): copied now
-        return idx.to(device, non_blocking=idx.is_cuda)
+        # Non-blocking only GPU to GPU: the CPU reads indices brought to the host right away
+        # (a CPU baseline gathering by them), and a plan's host buffer is refilled next call.
+        return idx.to(device, non_blocking=idx.is_cuda and device.type == "cuda")
     t = torch.from_numpy(idx)
     if device.type == "cuda":
         return t.pin_memory().to(device, non_blocking=True)

@@ -6,6 +6,30 @@ change incompatibly only in a new minor (0.x) or major release.
 
 ## Unreleased
 
+- Lazy copies whose source may share bytes with their destination (block
+  copies within one pool, `ce.copy_(ce.lazy(pool)[d], ce.lazy(pool)[s])`)
+  give torch's `pool[d] = pool[s]` result: two passes through a temporary
+  where the sides may overlap, one where they cannot. Overlap is judged by
+  storage and byte ranges with stride-preserving footprints (column slices of
+  one pool stay one pass); host indices are checked with their values, in
+  step plans before every replay. GPU-index gathers and scatters that may
+  overlap are refused, as torch refuses them (before: a race).
+
+- torch's own copy that converts, gathers or copies pageable memory on the CPU
+  now waits for GPU work on that host memory (a stale read about one run in
+  twenty, found by the fuzzer); a queue flushed because work arrives on another
+  stream orders the two streams; CPU baselines no longer read indices still
+  on their way from the GPU.
+
+- Frozen plans keep the index tensors they read (a temporary index tensor's
+  memory could be reused before a replay); step plans notice a tensor
+  argument that now holds other memory (`.data =`, `set_`, `resize_`); a step
+  plan swapping through a temporary (`tmp = a; a = b; b = tmp`) replays
+  right; replays run on the stream of their tensors' GPU; plan keys cover the
+  destination's allocation.
+
+- README: quick start and a table of situations first.
+
 - Host memory registered with `cudaHostRegister` (pinned, but possibly at
   another device address, as under WSL2) is no longer handed to kernels or
   batched DMA at its host address (an illegal-address fault): copyengine asks

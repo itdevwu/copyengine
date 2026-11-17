@@ -48,6 +48,17 @@ def param_for(obj):
     return buf
 
 
+def overlap_checked_per_call() -> bool:
+    """While a step plan traces with host index parameters: a copy whose sides may share
+    bytes only through those indices is traced as one pass, and the plan checks the
+    values exactly before each replay (Frozen.host_overlap); where they do overlap,
+    that call runs the step plainly (two passes, decided with the values)."""
+    if getattr(_tracing, "params", None) is None:
+        return False
+    _tracing.overlaps += 1
+    return True
+
+
 def note_values() -> None:
     """While a step traces: its copies took index values (not parameters)."""
     if getattr(_tracing, "params", None) is not None:
@@ -161,7 +172,7 @@ def _describe(x):
 class _Trace:
     """One frozen layout: identities it needs, index tensors it rebinds."""
 
-    __slots__ = ("frozen", "ident", "tables", "params", "vguard", "consts", "site", "plain")
+    __slots__ = ("frozen", "ident", "tables", "params", "vguard", "consts", "site", "plain", "device", "checks")
 
     def __init__(self):
         self.frozen = None
@@ -170,6 +181,8 @@ class _Trace:
         self.params: list = []  # (leaf index, pinned buffer): host index parameters, refilled each call
         self.vguard: list = []  # (leaf index, values): host indices whose values the plan depends on
         self.consts: list = []  # (getter, view signature): tensors reached by name, not as arguments
+        self.device = None      # the GPU of its CUDA tensors: replays run on that device's current stream
+        self.checks = False     # copies that may overlap through host indices: frozen.host_overlap() per call
         self.site = None        # replay-or-plain decision (a _Site)
         self.plain = None       # why this layout always runs plainly (None: it replays)
 
@@ -182,11 +195,14 @@ class StepPlan:
         self._engine, self._step = engine, step
         self._layouts: OrderedDict = OrderedDict()  # layout key -> {"warm": int, "traces": [_Trace]}
         self._last = None                           # (leaves, trace) of the previous call
+        self._last_memory = None                    # its tensors' memory signature, see _fast
+        self._mem_now = None
 
     # ---- calls -------------------------------------------------------------------------
 
     def __call__(self, *args, **kw) -> None:
         leaves = _flatten(args, kw)
+        self._mem_now = None
         tr = self._fast(leaves)
         if tr is None:
             key = tuple(_describe(x) for x in leaves)
@@ -209,20 +225,25 @@ class StepPlan:
             self(*args, **kw)
             return
         self._last = (leaves, tr)
+        self._last_memory = self._mem_now if self._mem_now is not None else _memory(leaves)
         if tr.plain is not None:
             self._step(*args, **kw)
             return
         self._run(tr, args, kw, leaves)
 
     def _fast(self, leaves):
-        """The previous call's trace when every leaf is the same object."""
+        """The previous call's trace when every leaf is the same object over the same memory."""
         if self._last is None:
             return None
         prev, tr = self._last
         # Same objects only for tensors, tensor lists and immutable scalars: a
-        # numpy array or list may hold new host indices in place.
+        # numpy array or list may hold new host indices in place. The same tensor
+        # object may hold other memory now (`.data =`, set_, resize_): the
+        # addresses and shapes are checked too (the object is a proxy for them).
         if len(prev) == len(leaves) and all(map(_same_leaf, prev, leaves)):
-            return tr
+            self._mem_now = _memory(leaves)
+            if self._mem_now == self._last_memory:
+                return tr
         return None
 
     @staticmethod
@@ -243,14 +264,21 @@ class StepPlan:
         if kind == "replay":
             for i, buf in tr.params:  # read on the host when the copies are issued: refilled at once
                 _fill(buf, leaves[i])
-            stream = torch.cuda.current_stream().cuda_stream if torch is not None and torch.cuda.is_available() else 0
+            if tr.checks and tr.frozen.host_overlap():
+                # This call's indices make a copy read what it writes: two passes, plainly
+                # (no A/B sample: it is not the replay's alternative).
+                kind, timed = None, False
+        if kind == "replay":
+            stream = 0
+            if torch is not None and torch.cuda.is_available():
+                stream = torch.cuda.current_stream(tr.device).cuda_stream
             rebinds = [(p, p + n, leaves[i].data_ptr()) for i, p, n in tr.tables]
             with e._lock:
                 if e._depth:
                     raise RuntimeError("a step plan replays outside scopes (it would reorder the queued copies)")
                 tr.frozen.run_rebound(stream, rebinds)
                 e._after(*leaves)
-        else:
+        if kind != "replay":
             self._step(*args, **kw)
         if timed:
             site.sample(kind == "replay", *_stop(ev0, t0))
@@ -271,7 +299,7 @@ class StepPlan:
         e._e.set_recording(True)
         try:
             for attempt in (0, 1):
-                _tracing.params, _tracing.used, _tracing.values = params, set(), 0
+                _tracing.params, _tracing.used, _tracing.values, _tracing.overlaps = params, set(), 0, 0
                 try:
                     with e.scope():
                         self._step(*args, **kw)
@@ -280,7 +308,7 @@ class StepPlan:
                     if attempt or not params:
                         raise
                     params = {}  # host index tables this copy cannot take: index values instead
-            used, values = _tracing.used, _tracing.values
+            used, values, overlaps = _tracing.used, _tracing.values, _tracing.overlaps
         finally:
             _tracing.params = None
             e._e.set_recording(False)
@@ -310,13 +338,15 @@ class StepPlan:
                 else:  # not a parameter (or the step derived indices from values): guarded by value
                     tr.vguard.append((i, _values(leaves[i])))
             tr.plain = self._bind(tr, leaves, caps)
+            tr.device = next((x.device for x in leaves if _is_tensor(x) and x.is_cuda), None)
+            tr.checks = overlaps > 0
             tr.site = _Site("replay")
             tr.site.settled = _Site.SETTLE  # the engine already settled while tracing
         lay["warm"] = 0
         lay["traces"].append(tr)
         if len(lay["traces"]) > self.MAX_TRACES:
             lay["traces"].pop(0)
-        self._last = (leaves, tr)
+        self._last, self._last_memory = (leaves, tr), _memory(leaves)
 
     @staticmethod
     def _storages(leaves):
@@ -429,6 +459,12 @@ def _sig_now(get):
     except Exception:
         return None
     return _sig(t) if _is_tensor(t) else None
+
+
+def _memory(leaves):
+    """(data_ptr, shape, strides, storage offset) of every tensor leaf: what a replay's
+    addresses depend on."""
+    return [(x.data_ptr(), x.shape, x.stride(), x.storage_offset()) for x in leaves if _is_tensor(x)]
 
 
 def _same_leaf(a, b) -> bool:

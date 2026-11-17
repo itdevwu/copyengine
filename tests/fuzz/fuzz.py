@@ -52,8 +52,10 @@ def registered_like(t):
     addr = ctypes.addressof(ctypes.c_char.from_buffer(buf))
     rt = torch.cuda.cudart()
     err = rt.cudaHostRegister(addr, len(buf), 1)
-    if err != rt.cudaError.success:
-        raise RuntimeError(f"fuzz: cudaHostRegister failed ({err}): the registered kind would go untested")
+    if err != rt.cudaError.success:  # (rarely, a resource limit): this base is pinned instead, said so
+        print(f"WARN fuzz: cudaHostRegister failed ({err}): a registered base is pinned memory instead",
+              file=sys.stderr, flush=True)
+        return t.pin_memory()
     _REGISTERED.append((buf, addr))
     r = torch.frombuffer(buf, dtype=torch.uint8)[:n].view(t.dtype).view(t.shape)
     r.copy_(t)
@@ -203,8 +205,12 @@ def make_program(seed):
 
 def reference(bases, ops):
     bs = [b.clone() for b in bases]
-    for _, dv, sv in ops:
-        dv.torch_write(bs[dv.base], sv.torch_read(bs[sv.base]).clone())  # torch's overlap check is conservative
+    for kind, dv, sv in ops:
+        a = sv.torch_read(bs[sv.base]).clone()  # torch's overlap check is conservative
+        if kind == "swap":  # dv and sv exchange contents
+            b = dv.torch_read(bs[dv.base]).clone()
+            sv.torch_write(bs[sv.base], b)
+        dv.torch_write(bs[dv.base], a)
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     return bs
@@ -341,10 +347,15 @@ def fuzz_plan(seed, init, ops, fresh, calls=90):
     errs = []
     eng = ce.Engine()
 
+    # Index-free ops of one dtype, in a swappable layout, become swaps through a temporary
+    # (tmp = s; s = d; d = tmp): the step-plan composition must not read s after it changed.
+    swaps = {j for j, (_, dv, sv) in enumerate(ops) if not dv.indexed() and not sv.indexed()
+             and init[dv.base].dtype == init[sv.base].dtype and rng.random() < 0.4}
+
     def step(bases, *idx):
         k = 0
         with eng.scope():
-            for _, dv, sv in ops:
+            for j, (_, dv, sv) in enumerate(ops):
                 sel_d, sel_s = [], []
                 for v, out in ((dv, sel_d), (sv, sel_s)):
                     for s in v.sel:
@@ -352,7 +363,12 @@ def fuzz_plan(seed, init, ops, fresh, calls=90):
                             out.append(idx[k]); k += 1
                 v_d = _with_idx(dv, sel_d).lazy(bases[dv.base], False)
                 v_s = _with_idx(sv, sel_s).lazy(bases[sv.base], False)
-                if dv.indexed() or sv.indexed():
+                if j in swaps:
+                    tmp = torch.empty(sv.shape(bases), dtype=bases[sv.base].dtype, device=DEV)
+                    eng.copy_(tmp, v_s)
+                    eng.copy_(v_s, v_d)
+                    eng.copy_(v_d, ce.lazy(tmp))
+                elif dv.indexed() or sv.indexed():
                     eng.copy_(v_d, v_s)
                 else:  # through a temporary the step allocates and drops
                     shape = sv.shape(bases)
@@ -375,7 +391,7 @@ def fuzz_plan(seed, init, ops, fresh, calls=90):
                         n, m = len(s[1]), pshape[d]
                         a = (rng.permutation(m)[:n] if dst else rng.integers(0, m, n)).astype(np.int64)
                         out.append(a)
-            cur_ops.append(("copy", _with_idx(dv, nd), _with_idx(sv, ns)))
+            cur_ops.append(("swap" if len(cur_ops) in swaps else "copy", _with_idx(dv, nd), _with_idx(sv, ns)))
             idx += nd + ns
         bad = [op for op in cur_ops if op[1].base == op[2].base and
                np.intersect1d(op[1].offsets(init).numpy(), op[2].offsets(init).numpy()).size]

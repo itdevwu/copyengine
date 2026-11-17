@@ -63,7 +63,8 @@ std::atomic<bool> g_python_gone{false};
 // The engine holds the tuple only while the op is queued or frozen.
 class PyNativeOp final : public ce::NativeOp {
  public:
-  explicit PyNativeOp(PyObject* t) : t_(t) { Py_INCREF(t_); }
+  explicit PyNativeOp(PyObject* t, bool cpu = true) : t_(t), cpu_(cpu) { Py_INCREF(t_); }
+  bool cpu_host_access() const override { return cpu_; }
   ~PyNativeOp() override {
     if (g_python_gone.load()) return;  // the interpreter is gone: nothing to release
     const PyGILState_STATE g = PyGILState_Ensure();
@@ -80,11 +81,22 @@ class PyNativeOp final : public ce::NativeOp {
 
  private:
   PyObject* t_;
+  bool cpu_;
 };
 
-std::shared_ptr<ce::NativeOp> py_payload(nb::handle obj) {
+std::shared_ptr<ce::NativeOp> py_payload(nb::handle obj, bool cpu = true) {
   if (obj.is_none()) return nullptr;
-  return std::make_shared<PyNativeOp>(obj.ptr());
+  return std::make_shared<PyNativeOp>(obj.ptr(), cpu);
+}
+
+// Row-major contiguous.
+bool dense(const std::vector<i64>& shape, const std::vector<i64>& strides) {
+  i64 want = 1;
+  for (size_t k = shape.size(); k-- > 0;) {
+    if (shape[k] != 1 && strides[k] != want) return false;
+    want *= shape[k];
+  }
+  return true;
 }
 
 }  // namespace
@@ -312,7 +324,8 @@ NB_MODULE(_core, m) {
            },
            "stream"_a, "rebinds"_a)
       .def_prop_ro("tables", &ce::Frozen::tables)
-      .def_prop_ro("allocations", &ce::Frozen::allocations);
+      .def_prop_ro("allocations", &ce::Frozen::allocations)
+      .def("host_overlap", &ce::Frozen::host_overlap);
 
   auto make_hints = [](nb::handle valid_start, nb::handle valid_len, const std::string& ctx) {
     ce::Hints h;
@@ -349,15 +362,17 @@ NB_MODULE(_core, m) {
         nb::gil_scoped_release release;
         e.copy(src, dst, runs, fn, h, stream);
       }, "src"_a, "dst"_a, "src_idx"_a, "dst_idx"_a, "fn"_a, "ctx"_a = "", "stream"_a = 0, "native"_a = nb::none())
+      .def_static("stmt_overlap", &ce::Engine::stmt_overlap, "src"_a, "dst"_a, "stmt"_a)
       .def("copy_stmt", [make_hints](ce::Engine& e, const ce::Endpoint& src, const ce::Endpoint& dst, const ce::Stmt& stmt,
                                      const ce::Elementwise& fn, nb::handle valid_start, nb::handle valid_len,
-                                     const std::string& ctx, uintptr_t stream, nb::handle native) {
+                                     const std::string& ctx, uintptr_t stream, nb::handle native, bool overlap_checked) {
         ce::Hints h = make_hints(valid_start, valid_len, ctx);
         h.native = py_payload(native);
+        h.overlap_checked = overlap_checked;
         nb::gil_scoped_release release;
         e.copy(src, dst, stmt, fn, h, stream);
       }, "src"_a, "dst"_a, "stmt"_a, "fn"_a, "valid_start"_a = nb::none(), "valid_len"_a = nb::none(),
-         "ctx"_a = "", "stream"_a = 0, "native"_a = nb::none())
+         "ctx"_a = "", "stream"_a = 0, "native"_a = nb::none(), "overlap_checked"_a = false)
       .def("tile", [](ce::Engine& e, const ce::TileSpec& spec, const std::string& ctx, uintptr_t stream,
                       nb::handle native) {
         ce::Hints h;
@@ -374,7 +389,10 @@ NB_MODULE(_core, m) {
         ce::Access sa = ce::broadcast_to(ce::Access::strided(s_shape, s_strides, s_off), d_shape);
         ce::Stmt stmt(std::move(da), std::move(sa));
         ce::Hints h;
-        h.native = py_payload(native);
+        // torch's copy (the payload) in stream order or on the CPU: the same rule as the torch op's
+        const bool ordered = ce::torch_copy_stream_ordered(
+            dst, src, dst.dtype == src.dtype, s_shape == d_shape && dense(s_shape, s_strides) && dense(d_shape, d_strides));
+        h.native = py_payload(native, !ordered);
         h.host_async = host_async;
         nb::gil_scoped_release release;
         e.copy(src, dst, stmt, fn, h, stream);

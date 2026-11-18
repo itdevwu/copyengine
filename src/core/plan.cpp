@@ -86,7 +86,16 @@ Hash128 fingerprint(const Op& op) {
     for (int v : {t.g, t.upr, t.fmt, t.xdt, t.scale_byte, t.quantize, t.static_scale, t.bh}) h.add(static_cast<uint64_t>(v));
     h.add(static_cast<uint64_t>(t.xp)), h.add(static_cast<uint64_t>(t.qp));
     h.add(std::bit_cast<uint32_t>(t.eps)), h.add(std::bit_cast<uint32_t>(t.gs));
+    // Each index role's kind (host values, a host pointer, a GPU table) and what
+    // admits staging: strategies and their tables are built from them.
+    for (int r = 0; r < 2; ++r)
+      h.add(uint64_t{op.tile_index[r] != nullptr} | (uint64_t{op.tile_host_ptr[r]} << 1));
+    h.add(uint64_t{op.tile_dev_index} | (uint64_t{op.tile_host} << 1) | (uint64_t{op.tile_staged_ok} << 2) |
+          (uint64_t{op.tile_mapped} << 3));
   }
+  // Which GPU index tables the op reads (dependencies see them), not where they are.
+  for (const Op::Extra& x : op.extras)
+    if (x.table) h.add(uint64_t{0x7ab1e} ^ (static_cast<uint64_t>(x.device.index) << 20));
   if (op.opaque && op.form) {  // the structure, not this call's table pointers: new indices hit the same plan
     const Form& f = *op.form;
     h.add(static_cast<uint64_t>(f.rank));

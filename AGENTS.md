@@ -167,7 +167,10 @@ it merges, against these:
   within the full suite), make its assertion say what happened (the engine's
   `stats()` in the message), and check that its premises hold (a plan already
   built, a GPU still busy). New concurrency tests and fixes of fuzzer seeds
-  pass repeatedly (tens of runs) before they count.
+  pass repeatedly (tens of runs) before they count. A test skips only for
+  what the machine lacks (GPUs, a generation, a pair's admission it reads);
+  `Unsupported` on a path the docs or the admission say is supported fails
+  it, never skips it.
 - A fuzzer failure: reproduce it with `python tests/fuzz/fuzz.py <seed> 1
   <mode>`, then bisect with switches (strategies forced, a synchronization
   after every step) to tell ordering from timing. To observe the engine

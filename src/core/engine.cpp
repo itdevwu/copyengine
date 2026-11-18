@@ -524,6 +524,24 @@ struct Engine::Impl {
     return opt.bandwidth;
   }
 
+  // A copy between two GPUs runs on the source GPU's stream current when it is
+  // made, as torch's would (not the one current at the flush). Queued copies from
+  // that GPU made on another of its streams run first.
+  void note_peer_stream(Op& op) {
+    if (!cuda || op.src.device.kind != DeviceKind::cuda || op.dst.device.kind != DeviceKind::cuda ||
+        op.src.device.index == op.dst.device.index)
+      return;
+    const StreamProvider p = stream_provider();
+    uintptr_t ss = 0;
+    if (!p || !p(op.src.device.index, &ss)) return;  // peer_run reports it
+    op.peer_stream = ss, op.peer_set = true;
+    for (auto it = queue.rbegin(); it != queue.rend(); ++it)
+      if (it->peer_set && it->src.device == op.src.device) {
+        if (it->peer_stream != ss) flush();
+        break;
+      }
+  }
+
   void push(Op op, uintptr_t strm) {
     if (op.runs().empty() && !op.opaque) return;
     if (async_depth > 0) op.host_async = true;
@@ -542,6 +560,7 @@ struct Engine::Impl {
     std::optional<Capture> cap;
     if (depth == 0 || op.native || !kept.empty()) cap.emplace(*this, strm);
     if (!kept.empty() && !capturing) reap();
+    note_peer_stream(op);
     if (native_now(op)) {
       run_native_now(op, strm);
       return;
@@ -633,12 +652,25 @@ struct Engine::Impl {
             fail(Errc::unsupported, "device indices on another GPU than the tensors");
     }
     if (on_host && !scuda && !dcuda) fail(Errc::unsupported, "host index tables need a GPU on one side");
-    if (scuda && dcuda && !(src.device == dst.device))
+    if (on_host && scuda && dcuda && !(src.device == dst.device))
       fail(Errc::unsupported, "host index tables between two GPUs");
+    // Host tables run as DMA expanded per call (pure copies, no GPU table) or in
+    // the statement kernel, which must reach host memory at its address: refused
+    // now otherwise, not at the flush (a step plan's copy then takes values).
+    if (on_host && !(fn.identity() && src.dtype == dst.dtype && !on_gpu) &&
+        !((scuda || src.mapped) && (dcuda || dst.mapped)))
+      fail(Errc::unsupported, "host index tables with a conversion or a GPU index table need host memory kernels "
+                              "reach at its address (pin_memory())");
     Op op;
     std::shared_ptr<const Form> form = make_form(src, dst, stmt, &op.stab, &op.dtab);
     if (!form)
       fail(Errc::needs_materialize, "a copy with device indices needs at most 6 dimensions and one index table per side");
+    // A broadcast destination (stride 0) writes one element many times: refused, as
+    // torch's index_copy_ refuses internal overlap (runs are checked by check_safe; an
+    // index into a stride-0 dimension is refused when the access is built).
+    for (int k = 0; k < form->rank; ++k)
+      if (k != form->dtab_dim && form->shape[k] > 1 && form->ds[k] == 0)
+        fail(Errc::unsafe_copy, "destination written more than once (a stride-0 dimension)");
     // One pass reads and writes concurrently: a source that may share bytes
     // with the destination (as far as the indices can reach) is refused, as
     // torch's index_select(out=) / index_copy_ refuse overlapping tensors;
@@ -670,6 +702,12 @@ struct Engine::Impl {
     op.body = std::make_shared<OpBody>();
     op.form = std::move(form);
     op.opaque = true;
+    // The GPU index tables the kernel reads when it runs: reads like any other,
+    // so a queued copy that writes a table is ordered before (waves, fences).
+    for (const Access* a : {&stmt.src, &stmt.dst})
+      for (const Term& t : a->terms())
+        if (t.dev.ptr && !t.dev.host() && t.size > 0) add_table_read(op, t.dev.ptr, t.size, t.dev.step, t.dev.device);
+    refuse_writing_own_tables(op);
     op.fp = fingerprint(op);
     Hasher kh;
     kh.add(fingerprint_sides(op));
@@ -680,6 +718,31 @@ struct Engine::Impl {
     op.host_async = hints.host_async;
     op.enqueue_us = us_since(t0);
     push(std::move(op), strm);
+  }
+
+  // A kernel writing an index table it reads would race with its own reads:
+  // its destination and every tensor it writes (scales, zero points) checked.
+  static void refuse_writing_own_tables(const Op& op) {
+    for (const Op::Extra& x : op.extras) {
+      if (!x.table) continue;
+      const Intervals tab{{x.lo}, {x.hi}};
+      bool hit = op.dst.device == x.device && op.dst_lo < x.hi && x.lo < op.dst_hi && intersects(op.write(), tab);
+      for (const Op::Extra& w : op.extras)
+        hit = hit || (w.write && w.device == x.device &&
+                      (w.bytes ? intersects(*w.bytes, tab) : (w.lo < x.hi && x.lo < w.hi)));
+      if (hit) fail(Errc::unsafe_copy, "the copy writes an index table it reads");
+    }
+  }
+
+  // A GPU index table of `n` int64 `step` apart from `ptr` on GPU `device`: a read
+  // of the op (dependencies and fences see it).
+  static void add_table_read(Op& op, uintptr_t ptr, int64_t n, int64_t step, int device) {
+    const int64_t span = (n - 1) * (step < 0 ? -step : step) * 8;
+    const auto p = static_cast<int64_t>(ptr);
+    const int64_t lo = step < 0 ? p - span : p, hi = (step < 0 ? p : p + span) + 8;
+    Op::Extra x{Device{DeviceKind::cuda, device}, lo, hi, false, nullptr};
+    x.table = true;
+    op.extras.push_back(std::move(x));
   }
 
   // Byte range [lo, hi) a tile tensor's layout touches: rows, a box's rows
@@ -857,6 +920,10 @@ struct Engine::Impl {
     if (zero)
       op.extras.push_back({t.zero.ep.device, zr.first, zr.second, writes_scale,
                            std::make_shared<const Intervals>(tile_bytes(tc, t.zero, t.upr, 1))});
+    // Its GPU index tables (rows[0] contiguous int64 each), read when the kernel runs.
+    if (t.x_index.dev) add_table_read(op, t.x_index.dev, t.x_index.count, 1, dev.index);
+    if (t.index.dev) add_table_read(op, t.index.dev, t.index.count, 1, dev.index);
+    refuse_writing_own_tables(op);
     op.tile = std::move(k);
     op.tile_index[0] = std::move(hx), op.tile_index[1] = std::move(hc);
     op.tile_host_ptr[0] = by_ptr[0], op.tile_host_ptr[1] = by_ptr[1];
@@ -998,7 +1065,10 @@ struct Engine::Impl {
     Choice c;
     c.cands = g.candidates;
     const bool nat = std::all_of(g.ops.begin(), g.ops.end(), [&](int k) { return ops[k].native != nullptr; });
-    c.baseline = nat ? Strategy::native : Strategy::passthrough;
+    // Without torch's copy: passthrough, except for groups it cannot run (ops with
+    // no runs: indices read at run time, tile ops), whose baseline is their own strategy.
+    const bool runs_only = !g.opaque() && !g.tiles;
+    c.baseline = nat ? Strategy::native : (runs_only || c.cands.empty() ? Strategy::passthrough : c.cands.front());
     if (dominance_safe(g)) c.safe = Strategy::runs;
     if (!nat && !c.safe && !c.cands.empty()) {
       // No native copy: nothing the caller would otherwise run. The prior's
@@ -1029,20 +1099,31 @@ struct Engine::Impl {
     int dev = -1;        // its GPU
     uintptr_t given = 0;
     int given_dev = -1;  // >= 0: ordered with `given` before and after
+    bool bridge = false;          // torch's copy: the source GPU's stream when made (`made`) is not current (`now`)
+    uintptr_t made = 0, now = 0;
   };
-  PeerRun peer_run(const Group& g, Strategy s, uintptr_t strm) {
+  PeerRun peer_run(const Group& g, Strategy s, uintptr_t strm, const std::vector<Op>& ops) {
     PeerRun r{strm, device_of(g)};
     const bool two = g.src.device.kind == DeviceKind::cuda && g.dst.device.kind == DeviceKind::cuda &&
                      g.src.device.index != g.dst.device.index;
     if (!two || !cuda) return r;
     r.given_dev = cuda->stream_device(strm, g.dst.device.index);
     const StreamProvider p = stream_provider();
+    const Op& first = ops[g.ops.front()];  // one source stream per group (note_peer_stream)
     if (s == Strategy::native || capturing || !p) {
       r.dev = r.given_dev, r.given_dev = -1;  // runs on the given stream: timed on its GPU
+      // torch's copy orders itself with the source GPU's stream current now: after
+      // the one current when the copy was made, and that one's later work after it.
+      uintptr_t now = 0;
+      if (s == Strategy::native && !capturing && p && first.peer_set && p(g.src.device.index, &now) &&
+          now != first.peer_stream) {
+        r.bridge = true, r.made = first.peer_stream, r.now = now;
+        cuda->order(now, g.src.device.index, r.made, g.src.device.index);
+      }
       return r;
     }
-    uintptr_t ss = 0;
-    if (!p(g.src.device.index, &ss))
+    uintptr_t ss = first.peer_stream;
+    if (!first.peer_set && !p(g.src.device.index, &ss))
       fail(Errc::backend, "cannot tell the current stream of GPU " + std::to_string(g.src.device.index) +
                               " (a copy between two GPUs is ordered with both)");
     r.strm = ss, r.dev = g.src.device.index, r.given = strm;
@@ -1053,7 +1134,7 @@ struct Engine::Impl {
   int64_t run_group(const Group& g, Strategy s, const std::vector<Op>& ops, uintptr_t given, bool measure,
                     FlushStats* st) {
     Executor& ex = exec_for(g.src, g.dst);
-    const PeerRun pr = peer_run(g, s, given);
+    const PeerRun pr = peer_run(g, s, given, ops);
     const uintptr_t strm = pr.strm;
     if (&ex == &host && host_pending && !capturing) synchronize();  // host work may touch what CUDA work still uses
     // A native that reads host memory on the CPU waits for GPU work there now,
@@ -1086,6 +1167,7 @@ struct Engine::Impl {
       samples.push_back({g.bucket, s, us_since(t0) + submit, submit, a, b, &ex});
     }
     if (pr.given_dev >= 0) cuda->order(pr.given, pr.given_dev, strm, pr.dev);  // the given stream's later work
+    if (pr.bridge) cuda->order(pr.made, g.src.device.index, pr.now, g.src.device.index);
     note_pending(g.src, g.dst, strm,
                  std::any_of(g.ops.begin(), g.ops.end(), [&](int k) { return !ops[k].host_async; }), pr.dev);
     if (st) {
@@ -1148,10 +1230,21 @@ struct Engine::Impl {
     }
     std::vector<Op> ops;
     ops.swap(queue);
+    // Fingerprints leave index tables' addresses out (new tables hit the same
+    // plan); the waves depend on them only where a copy of this flush may write
+    // a table: then the plan is keyed by every table's place too.
+    bool table_written = false;
+    for (const Op& op : ops)
+      for (const Op::Extra& x : op.extras)
+        table_written = table_written || (x.table && overlaps(q_writes, x.device, x.lo, x.hi));
     q_reads.clear();
     q_writes.clear();
     Hasher h;
     for (const Op& op : ops) h.add(op.fp.a), h.add(op.fp.b);
+    if (table_written)  // each op's tables, by its place in the queue
+      for (size_t k = 0; k < ops.size(); ++k)
+        for (const Op::Extra& x : ops[k].extras)
+          if (x.table) h.add(uint64_t{k}), h.add(static_cast<uint64_t>(x.lo)), h.add(static_cast<uint64_t>(x.hi));
     const Hash128 key = h.done();
     const std::shared_ptr<const Plan>* found = plans.find(key);
     const bool hit = found != nullptr;
@@ -1703,6 +1796,7 @@ class FrozenImpl final : public Frozen {
  public:
   FrozenImpl(Engine::Impl* eng, std::shared_ptr<std::vector<Op>> ops, Ran ran)
       : eng_(eng), ops_(std::move(ops)), ran_(std::move(ran)) {
+    for (Op& op : *ops_) op.peer_set = false;  // replays run on the streams current then
     // Copies host_overlap() checks per call: host index tables only (a GPU table's
     // values are not on the host), one device, and footprints that may intersect.
     for (size_t k = 0; k < ops_->size(); ++k) {
@@ -1718,6 +1812,10 @@ class FrozenImpl final : public Frozen {
     Locked lk(*eng_);
     const std::vector<Op>* ops = ops_.get();
     if (!rebinds.empty()) {
+      // The waves were planned with the traced tables: a new table in memory the
+      // plan writes could be written before (or by) the copy that reads it.
+      if (rebind_aliases(rebinds))
+        fail(Errc::invalid_argument, "a rebound index table lies in memory the plan writes (check rebind_aliases)");
       if (work_.empty()) work_ = *ops_;
       auto remap = [&](uintptr_t p) {
         for (const Rebind& r : rebinds)
@@ -1745,6 +1843,16 @@ class FrozenImpl final : public Frozen {
       eng_->run_group(groups[i], s, *ops, stream, false, nullptr);
     }
     eng_->finish(stream);
+  }
+  bool rebind_aliases(std::span<const Rebind> rebinds) override {
+    const Intervals& w = writes();
+    for (const Rebind& r : rebinds) {
+      const auto a = static_cast<i64>(r.to), b = static_cast<i64>(r.to + (r.hi - r.lo));
+      // The first written interval ending after a: it intersects [a, b) iff it starts before b.
+      const auto it = std::upper_bound(w.end.begin(), w.end.end(), a);
+      if (it != w.end.end() && w.start[static_cast<size_t>(it - w.end.begin())] < b) return true;
+    }
+    return false;
   }
   bool host_overlap() const override {
     for (size_t k : checked_) {
@@ -1785,6 +1893,26 @@ class FrozenImpl final : public Frozen {
   }
 
  private:
+  // Every byte the plan's ops may write (any device: addresses are unified), built once.
+  const Intervals& writes() {
+    if (!writes_) {
+      std::vector<i64> off, len;
+      auto add = [&](const Intervals& iv) {
+        for (size_t i = 0; i < iv.start.size(); ++i) off.push_back(iv.start[i]), len.push_back(iv.end[i] - iv.start[i]);
+      };
+      for (const Op& op : *ops_) {
+        add(op.write());
+        for (const Op::Extra& x : op.extras)
+          if (x.write) {
+            if (x.bytes) add(*x.bytes);
+            else off.push_back(x.lo), len.push_back(x.hi - x.lo);
+          }
+      }
+      writes_ = std::make_unique<Intervals>(interval_union(off, len));
+    }
+    return *writes_;
+  }
+  std::unique_ptr<Intervals> writes_;
   std::vector<size_t> checked_;  // see the constructor
   Engine::Impl* eng_;
   std::shared_ptr<std::vector<Op>> ops_;
@@ -1962,7 +2090,9 @@ std::shared_ptr<Frozen> Engine::freeze(bool rebindable) const {
         return std::all_of(g.ops.begin(), g.ops.end(), [&](int k) { return ops[k].native != nullptr; });
       return s == c.reference() || std::find(c.cands.begin(), c.cands.end(), s) != c.cands.end();
     };
-    if (auto l = m.tuner.locked_strategy(g.bucket); l && runnable(*l)) ran.strategies[i] = *l;
+    if (!m.opt.force.empty() && g.bandwidth == 0 && runnable(parse_strategy(m.opt.force)))
+      ran.strategies[i] = parse_strategy(m.opt.force);  // tests: the forced strategy replays too
+    else if (auto l = m.tuner.locked_strategy(g.bucket); l && runnable(*l)) ran.strategies[i] = *l;
     else if (runnable(c.reference())) ran.strategies[i] = c.reference();
     if (rebindable && g.opaque() && ran.strategies[i] == Strategy::native) {
       if (c.cands.empty()) fail(Errc::unsupported, "freeze: a copy with device indices has no strategy but torch's");

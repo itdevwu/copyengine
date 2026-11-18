@@ -189,6 +189,19 @@ def _bandwidth(b) -> float:
     return b
 
 
+def _host_tables_help(dst, src) -> bool:
+    """A lazy copy refused because host index values (a table of values, lowered to runs) meet
+    an index table read on the GPU: the statement kernel takes one table per side, the host
+    ones as host tables (snapshots of the values)."""
+    sides = [x for x in (dst, src) if isinstance(x, Lazy)]
+    return any(x.device_tables() for x in sides) and any(x.value_indices() for x in sides)
+
+
+def _host_param(idx) -> bool:
+    """A step plan's host index parameter (its pinned buffer), as device_table returns it."""
+    return is_tensor(idx) and not idx.is_cuda
+
+
 def _capturing() -> bool:
     return torch is not None and torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
 
@@ -419,7 +432,7 @@ class Engine:
         d, s = view(dst, writable=True), view(src)
         sacc = broadcast_to(s.access, list(d.access.shape))
         stmt = _core.Stmt(d.access, sacc)
-        checked = gather_first = False
+        checked = gather_first = params_refused = host_tables = False
         if isinstance(dst, Lazy) or isinstance(src, Lazy):
             # torch's equivalent (dst[ids] = src[ids2]) gathers first: where the two sides
             # may share bytes, so does copyengine (two passes through a temporary).
@@ -438,12 +451,27 @@ class Engine:
             try:
                 self._e.copy_stmt(s.endpoint, d.endpoint, stmt, fn or _IDENTITY, ctx=ctx, stream=current_stream(d, s),
                                   native=native, overlap_checked=checked, overlap_gather=gather_first)
-            except _core.Unsupported:
-                if not gather_first:
+            except _core.NeedsMaterialize:
+                if not _host_tables_help(dst, src):
                     raise
-                gather_first = None  # not rows of one layout: two passes
+                host_tables = True  # host index values beside a GPU index table: as host tables
+            except _core.Unsupported:
+                if (isinstance(dst, Lazy) and dst.params()) or (isinstance(src, Lazy) and src.params()):
+                    params_refused = True  # a step plan's host index parameters this copy cannot read when it runs
+                elif not gather_first:
+                    raise
+                else:
+                    gather_first = None  # not rows of one layout: two passes
             else:
                 self._after(s.obj, d.obj, src, dst)  # a lazy side holds its device index tables
+        if host_tables:
+            self.copy_(dst.with_host_tables(unique=True) if isinstance(dst, Lazy) else dst,
+                       src.with_host_tables() if isinstance(src, Lazy) else src, fn=fn, ctx=ctx)
+            return dst
+        if params_refused:  # this copy alone takes the index values now (the step runs once)
+            self.copy_(dst.with_values() if isinstance(dst, Lazy) else dst,
+                       src.with_values() if isinstance(src, Lazy) else src, fn=fn, ctx=ctx)
+            return dst
         if gather_first is None:
             return self._copy_two_pass(dst, src, d, s, fn, ctx)
         return dst
@@ -820,29 +848,35 @@ class Engine:
             if self._indexed(_torch_ops.gather_, out, src, dim, index, (out, src, dim)):
                 return out
         s = view(src)
-        idx = device_table(index, host_ok=s.is_cuda or (is_tensor(out) and out.is_cuda))
-        if idx is not None and idx.is_cuda and not s.is_cuda:
-            idx = None  # GPU indices need the source on the GPU
-        if idx is not None:
-            sacc = select_device(s.access, dim, idx)
-        else:
-            idx = index_array(index)
-            sacc = s.access.index_select(dim, idx)
-        if out is None:
-            shape = list(sacc.shape)
-            if is_tensor(src):
-                out = torch.empty(shape, dtype=dtype or src.dtype, device=src.device)
+        for values in (False, True):
+            idx = None if values else device_table(index, host_ok=s.is_cuda or (is_tensor(out) and out.is_cuda))
+            if idx is not None and idx.is_cuda and not s.is_cuda:
+                idx = None  # GPU indices need the source on the GPU
+            if idx is not None:
+                sacc = select_device(s.access, dim, idx)
             else:
-                out = np.empty(shape, dtype=dtype or src.dtype)
-        d = view(out, writable=True)
-        stmt = _core.Stmt(d.access, sacc)
-        native = (_native_gather, out, src, dim, idx) if _flat_payload(out, src, fn) else None
-        checked = self._index_overlap(s, d, stmt)
-        with self._lock:
-            self._e.copy_stmt(s.endpoint, d.endpoint, stmt, fn or _IDENTITY, ctx=ctx, stream=current_stream(d, s),
-                              native=native, overlap_checked=checked)
-            self._after(s.obj, d.obj, idx)
-        return out
+                idx = index_array(index)
+                sacc = s.access.index_select(dim, idx)
+            if out is None:
+                shape = list(sacc.shape)
+                if is_tensor(src):
+                    out = torch.empty(shape, dtype=dtype or src.dtype, device=src.device)
+                else:
+                    out = np.empty(shape, dtype=dtype or src.dtype)
+            d = view(out, writable=True)
+            stmt = _core.Stmt(d.access, sacc)
+            native = (_native_gather, out, src, dim, idx) if _flat_payload(out, src, fn) else None
+            checked = self._index_overlap(s, d, stmt)
+            with self._lock:
+                try:
+                    self._e.copy_stmt(s.endpoint, d.endpoint, stmt, fn or _IDENTITY, ctx=ctx,
+                                      stream=current_stream(d, s), native=native, overlap_checked=checked)
+                except _core.Unsupported:
+                    if values or not _host_param(idx):
+                        raise
+                    continue  # a step plan's host index parameter this copy cannot read when it runs: values
+                self._after(s.obj, d.obj, idx)
+            return out
 
     def scatter_(self, dst, index, src, dim: int = 0, *, fn: Optional[Elementwise] = None, ctx: str = ""):
         """``dst.index_copy_(dim, index, fn(src))``. Duplicate indices raise UnsafeCopy."""
@@ -855,22 +889,28 @@ class Engine:
                 and self._indexed(_torch_ops.scatter_, dst, src, dim, index, (dst, src, dim))):
             return dst
         d, s = view(dst, writable=True), view(src)
-        idx = device_table(index, host_ok=d.is_cuda or s.is_cuda)
-        if idx is not None and idx.is_cuda and not d.is_cuda:
-            idx = None  # GPU indices need the destination on the GPU
-        if idx is not None:  # duplicates are not detected on the device (undefined, as in torch)
-            dacc = select_device(d.access, dim, idx)
-        else:
-            idx = index_array(index)
-            dacc = d.access.index_select(dim, idx)
-        stmt = _core.Stmt(dacc, broadcast_to(s.access, list(dacc.shape)))
-        native = (_native_scatter, dst, src, dim, idx) if _flat_payload(dst, src, fn) else None
-        checked = self._index_overlap(s, d, stmt)
-        with self._lock:
-            self._e.copy_stmt(s.endpoint, d.endpoint, stmt, fn or _IDENTITY, ctx=ctx, stream=current_stream(d, s),
-                              native=native, overlap_checked=checked)
-            self._after(s.obj, d.obj, idx)
-        return dst
+        for values in (False, True):
+            idx = None if values else device_table(index, host_ok=d.is_cuda or s.is_cuda)
+            if idx is not None and idx.is_cuda and not d.is_cuda:
+                idx = None  # GPU indices need the destination on the GPU
+            if idx is not None:  # duplicates are not detected on the device (undefined, as in torch)
+                dacc = select_device(d.access, dim, idx)
+            else:
+                idx = index_array(index)
+                dacc = d.access.index_select(dim, idx)
+            stmt = _core.Stmt(dacc, broadcast_to(s.access, list(dacc.shape)))
+            native = (_native_scatter, dst, src, dim, idx) if _flat_payload(dst, src, fn) else None
+            checked = self._index_overlap(s, d, stmt)
+            with self._lock:
+                try:
+                    self._e.copy_stmt(s.endpoint, d.endpoint, stmt, fn or _IDENTITY, ctx=ctx,
+                                      stream=current_stream(d, s), native=native, overlap_checked=checked)
+                except _core.Unsupported:
+                    if values or not _host_param(idx):
+                        raise
+                    continue  # a step plan's host index parameter this copy cannot read when it runs: values
+                self._after(s.obj, d.obj, idx)
+            return dst
 
     @staticmethod
     def _index_overlap(s, d, stmt) -> bool:

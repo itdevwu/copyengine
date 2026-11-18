@@ -304,13 +304,14 @@ class TorchGather final : public ce::NativeOp {  // index_select(src, dim, index
   TorchGather(Tensor out, Tensor src, int64_t dim, Tensor index)
       : out_(std::move(out)), src_(std::move(src)), index_(std::move(index)), dim_(dim) {}
   void run(uintptr_t) override {
-    if (out_.is_cuda()) {
+    if (out_.is_cuda() && (!src_.is_cuda() || out_.get_device_index() == src_.get_device_index())) {
       std::array<StableIValue, 4> st{torch::stable::detail::from(src_), torch::stable::detail::from(dim_),
                                      torch::stable::detail::from(index_), torch::stable::detail::from(out_)};
       dispatch("aten::index_select", "out", st.data());
       return;
     }
-    // Into host memory: gather on the GPU, then copy (torch's index_select needs one device).
+    // Into host memory or another GPU: gather on the source's GPU, then copy (torch's
+    // index_select needs one device).
     std::array<StableIValue, 3> st{torch::stable::detail::from(src_), torch::stable::detail::from(dim_),
                                    torch::stable::detail::from(index_)};
     Tensor tmp = dispatch("aten::index_select", "", st.data());
@@ -328,7 +329,8 @@ class TorchScatter final : public ce::NativeOp {  // dst.index_copy_(dim, index,
       : dst_(std::move(dst)), src_(std::move(src)), index_(std::move(index)), dim_(dim) {}
   void run(uintptr_t) override {
     Tensor src = src_;
-    if (!src.is_cuda()) src = on_gpu_like(src_, dst_);  // index_copy_ needs one device
+    if (!src.is_cuda() || src.get_device_index() != dst_.get_device_index())
+      src = on_gpu_like(src_, dst_);  // index_copy_ needs one device: the destination's
     std::array<StableIValue, 4> st{torch::stable::detail::from(dst_), torch::stable::detail::from(dim_),
                                    torch::stable::detail::from(index_), torch::stable::detail::from(src)};
     dispatch("aten::index_copy_", "", st.data());
@@ -371,7 +373,7 @@ void indexed(Tensor dst, Tensor src, int side, int64_t dim, Tensor index, int64_
                                      static_cast<int>(ds.size()), dst.storage_offset(), side, static_cast<int>(dim),
                                      reinterpret_cast<uintptr_t>(index.data_ptr()), index.numel(),
                                      static_cast<int>(index.get_device_index()), {}, std::move(native), 0,
-                                     current_stream(de.device.index), &err);
+                                     current_stream(dst.is_cuda() ? de.device.index : se.device.index), &err);
   STD_TORCH_CHECK(rc == 0, "[copyengine:", rc - 1, "] ", err);
 }
 

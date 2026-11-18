@@ -7,6 +7,7 @@ orders the two streams."""
 import os
 import sys
 
+import numpy as np
 import pytest
 
 import copyengine as ce
@@ -81,3 +82,99 @@ def test_natives_inside_a_scope_are_not_intercepted_again(intercept, lazy):
         src.fill_(-1.0)             # later work on the source
     torch.cuda.synchronize()
     assert torch.equal(dst, want)
+
+
+@pytest.mark.parametrize("force", [None, "fused"])
+def test_a_copy_reading_gpu_indices_runs_before_a_later_copy_overwrites_them(force):
+    # The kernel reads its index table when it runs: that read orders like any other
+    # (before: a later copy into the index tensor could run first, in an earlier wave).
+    e = ce.Engine(_force=force) if force else ce.Engine()
+    src = torch.arange(64.0, device=DEV).view(64, 1).expand(64, 8).contiguous()
+    for _ in range(5):
+        ids = torch.tensor([3, 5, 7, 9], device=DEV)
+        out = torch.zeros(4, 8, device=DEV)
+        scratch, other = torch.zeros(1024, device=DEV), torch.ones(1024, device=DEV)
+        with e.scope():
+            e.copy_(scratch, other)                                   # unrelated: an earlier group
+            e.gather(src, ids, 0, out=out)                            # reads ids on the GPU
+            e.copy_(ids, torch.tensor([60, 61, 62, 63], device=DEV))  # then overwrites them
+        torch.cuda.synchronize()
+        assert torch.equal(out[:, 0], torch.tensor([3.0, 5, 7, 9], device=DEV)), e.stats()["last"]
+
+
+def test_a_plan_reused_where_a_table_is_now_written_orders_it():
+    # Two flushes with the same fingerprints (index tables' addresses are not in them):
+    # in the second the later copy writes the very table the gather reads.
+    e = ce.Engine()
+    src = torch.arange(64.0, device=DEV).view(64, 1).expand(64, 8).contiguous()
+    a, b = torch.tensor([1, 2, 3, 4], device=DEV), torch.tensor([10, 11, 12, 13], device=DEV)
+    new = torch.tensor([50, 51, 52, 53], device=DEV)
+    out = torch.zeros(4, 8, device=DEV)
+    scratch, other = torch.zeros(1024, dtype=torch.int64, device=DEV), torch.ones(1024, dtype=torch.int64, device=DEV)
+    for ids, want in ((a, [1.0, 2, 3, 4]), (b, [10.0, 11, 12, 13])):
+        with e.scope():
+            e.copy_(scratch, other)  # an earlier group the later copy joins
+            e.gather(src, ids, 0, out=out)
+            e.copy_(b, new)  # the first time another tensor, the second time the table read
+        torch.cuda.synchronize()
+        assert torch.equal(out[:, 0], torch.tensor(want, device=DEV)), (want, e.stats()["last"])
+        b.copy_(torch.tensor([10, 11, 12, 13], device=DEV))
+
+
+def test_a_copy_writing_its_own_index_table_is_refused():
+    e = ce.Engine()
+    buf = torch.zeros(16, dtype=torch.int64, device=DEV)
+    ids = buf[:4]
+    ids.copy_(torch.tensor([4, 5, 6, 7], device=DEV))
+    with pytest.raises(ce.UnsafeCopy):
+        e.scatter_(buf, ids, torch.ones(4, dtype=torch.int64, device=DEV))
+
+
+def test_a_quantization_writing_its_own_index_table_is_refused():
+    # The scales written over the GPU index table the kernel reads (codex review, dev10).
+    e = ce.Engine()
+    ids = torch.tensor([3, 5], dtype=torch.int64, device=DEV)  # 16 bytes = 2 rows x 2 float32 scales
+    x = torch.randn(8, 256, device=DEV, dtype=torch.bfloat16)
+    q = torch.empty(2, 256, dtype=torch.float8_e4m3fn, device=DEV)
+    with pytest.raises(ce.UnsafeCopy):
+        e.quantize(x, q, ids.view(torch.float32).view(2, 2), fmt="fp8_e4m3", group=128, x_index=ids)
+
+
+def test_a_plan_keeps_which_quantization_reads_a_gpu_table():
+    # Flush 1: A reads GPU ids, B host ids; flush 2 the other way round, a copy into ids
+    # between them both times, the same ids tensor: the plans must not be shared, B must
+    # read the ids the copy wrote (codex review, dev10; fingerprints say which op reads a table).
+    e = ce.Engine()
+    x = torch.randn(64, 256, device=DEV, dtype=torch.bfloat16)
+    qa, qb = (torch.zeros(4, 256, dtype=torch.float8_e4m3fn, device=DEV) for _ in range(2))
+    sa, sb = (torch.zeros(4, 2, device=DEV) for _ in range(2))
+    host = np.array([0, 1, 2, 3])
+    first, then = [9, 10, 11, 12], [40, 41, 42, 43]
+    ref = ce.Engine()
+    want_q = torch.empty_like(qa)
+    want_s = torch.empty_like(sa)
+    ref.quantize(x, want_q, want_s, fmt="fp8_e4m3", group=128, x_index=np.array(then))
+    torch.cuda.synchronize()
+    ids = torch.zeros(4, dtype=torch.int64, device=DEV)
+    for k in range(4):
+        ids.copy_(torch.tensor(first))
+        a_idx, b_idx = (ids, host) if k % 2 == 0 else (host, ids)
+        with e.scope():
+            e.quantize(x, qa, sa, fmt="fp8_e4m3", group=128, x_index=a_idx)
+            e.copy_(ids, torch.tensor(then, device=DEV))
+            e.quantize(x, qb, sb, fmt="fp8_e4m3", group=128, x_index=b_idx)
+        torch.cuda.synchronize()
+        if k % 2:
+            assert torch.equal(qb.view(torch.uint8), want_q.view(torch.uint8)), (k, e.stats()["last"])
+            assert torch.equal(sb, want_s), k
+
+
+def test_disabled_engines_run_indexed_copies_without_a_torch_equivalent():
+    # disable=True runs every copy as its baseline: one with indices read on the GPU and a
+    # function has no torch copy, and passthrough (runs) cannot run it: its own strategy does.
+    src = torch.arange(64 * 8, dtype=torch.float32, device=DEV).view(64, 8)
+    ids = torch.tensor([3, 5, 7], device=DEV)
+    out = torch.zeros(3, 8, device=DEV)
+    ce.Engine(disable=True).copy_(ce.lazy(out), ce.lazy(src)[ids], fn=ce.Elementwise(scale=2.0))
+    torch.cuda.synchronize()
+    assert torch.equal(out, src[ids] * 2)

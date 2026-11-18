@@ -314,6 +314,14 @@ NB_MODULE(_core, m) {
   nb::class_<ce::Frozen>(m, "Frozen")
       .def("run", nb::overload_cast<uintptr_t>(&ce::Frozen::run), "stream"_a = 0,
            nb::call_guard<nb::gil_scoped_release>())
+      .def("rebind_aliases",
+           [](ce::Frozen& f, const std::vector<std::array<uintptr_t, 3>>& rebinds) {
+             std::vector<ce::Rebind> r;
+             r.reserve(rebinds.size());
+             for (const auto& x : rebinds) r.push_back({x[0], x[1], x[2]});
+             return f.rebind_aliases(r);
+           },
+           "rebinds"_a)
       .def("run_rebound",
            [](ce::Frozen& f, uintptr_t stream, const std::vector<std::array<uintptr_t, 3>>& rebinds) {
              std::vector<ce::Rebind> r;

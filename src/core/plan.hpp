@@ -128,6 +128,10 @@ struct Op {
   double enqueue_us = 0;           // host time spent submitting it
   bool host_async = false;         // Hints::host_async
   int64_t weight = 1;              // runs this op stands for in online sampling (see Impl::native_now)
+  // Between two GPUs: the source GPU's current stream when the copy was made
+  // (the frontend's StreamProvider), where it runs; unset in frozen plans.
+  uintptr_t peer_stream = 0;
+  bool peer_set = false;
   uintptr_t stab = 0, dtab = 0;    // device index tables of form->stab_dim / dtab_dim, this call's
   // A statement with device tables has no runs (its indices are not known on
   // the host): `form` is its only executable description, and its footprint
@@ -162,6 +166,9 @@ struct Op {
     int64_t lo = 0, hi = 0;  // absolute bytes
     bool write = false;
     std::shared_ptr<const Intervals> bytes;
+    // A GPU index table the kernel reads when it runs (its address is this
+    // call's, not part of the op's fingerprint: see Impl::flush).
+    bool table = false;
   };
   std::vector<Extra> extras;
   Hash128 fp;  // content fingerprint

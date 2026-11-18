@@ -1,6 +1,7 @@
 """Step plans: traced once per argument layout, replayed with new CUDA index
 tensors, checked against torch."""
 
+import numpy as np
 import pytest
 
 import copyengine as ce
@@ -355,3 +356,109 @@ def test_step_plan_host_indices_one_or_two_passes_per_call():
         assert torch.equal(pool, want), k
     tr = next(iter(p._layouts.values()))["traces"][0]
     assert tr.plain is None and tr.checks
+
+
+def test_a_copy_that_cannot_read_host_index_parameters_runs_once_with_values():
+    # A copy the engine cannot run with a host index parameter (host to host: no GPU reads
+    # the table) takes the values instead; the step is not run again (a swap run twice is
+    # undone: fuzzer seed 17 with two GPUs).
+    e = ce.Engine()
+    gpu = torch.arange(8.0, device=DEV)
+    a, b = torch.arange(16.0), torch.zeros(16)
+
+    def step(gpu, a, b, ids):
+        tmp = torch.empty(4, device=DEV)
+        e.copy_(tmp, gpu[:4])
+        e.copy_(gpu[:4], gpu[4:])
+        e.copy_(gpu[4:], tmp)
+        e.copy_(ce.lazy(b)[ids], ce.lazy(a)[ids])
+
+    p = e.plan(step)
+    for it in range(8):
+        ids = np.random.default_rng(it).permutation(16)[:5]
+        want_gpu = torch.cat([gpu[4:], gpu[:4]])
+        want_b = b.clone()
+        want_b[torch.from_numpy(ids)] = a[torch.from_numpy(ids)]
+        p(gpu, a, b, ids)
+        torch.cuda.synchronize()
+        assert torch.equal(gpu, want_gpu) and torch.equal(b, want_b), it
+
+
+@pytest.mark.parametrize("op", ["gather", "scatter_"])
+def test_host_index_parameters_no_kernel_can_read_take_values_once(op):
+    # Pageable host memory and a conversion: no strategy reads a host table here (the
+    # statement kernel cannot reach pageable memory; DMA does not convert). Refused when
+    # the copy is made, so the traced copy takes the values and the step runs once
+    # (codex review, dev10: refused at the flush, the trace failed).
+    e = ce.Engine()
+    fn = ce.Elementwise(scale=2.0)
+    host, gpu = torch.arange(64 * 8, dtype=torch.float32).view(64, 8), torch.zeros(64, 8, device=DEV)
+    calls = []
+
+    def step(ids):
+        calls.append(1)
+        if op == "gather":
+            e.gather(host, ids, 0, out=gpu[:8], fn=fn)
+        else:
+            e.scatter_(host, ids, gpu[:8], 0, fn=fn)
+
+    p = e.plan(step)
+    for it in range(6):
+        ids = np.random.default_rng(it).permutation(64)[:8]
+        gpu.normal_()
+        before = host.clone()
+        n = len(calls)
+        p(ids)
+        torch.cuda.synchronize()
+        assert len(calls) <= n + 1, it
+        t = torch.from_numpy(ids)
+        if op == "gather":
+            assert torch.equal(gpu[:8].cpu(), host[t] * 2), it
+        else:
+            before[t] = gpu[:8].cpu() * 2
+            assert torch.equal(host, before), it
+
+
+def test_a_replay_whose_index_argument_lies_where_the_step_writes_runs_plainly():
+    # Traced with an index tensor apart from what the step writes; replayed with the
+    # index being the tensor a later copy overwrites. The frozen waves never ordered
+    # that (codex review, dev10): the step runs plainly, the gather reads the old ids.
+    e = ce.Engine()
+    src = torch.arange(64.0, device=DEV).view(64, 1).expand(64, 8).contiguous()
+    out = torch.zeros(4, 8, device=DEV)
+    scratch, other = torch.zeros(1024, device=DEV), torch.ones(1024, device=DEV)
+    b, new = torch.tensor([10, 11, 12, 13], device=DEV), torch.tensor([50, 51, 52, 53], device=DEV)
+
+    calls = []
+
+    def step(ids):
+        calls.append(1)
+        e.copy_(scratch, other)
+        e.gather(src, ids, 0, out=out)
+        e.copy_(b, new)
+
+    p = e.plan(step)
+    lay = None
+    for _ in range(300):  # until the engine settled and the step froze
+        b.copy_(torch.tensor([10, 11, 12, 13], device=DEV))
+        p(torch.tensor([1, 2, 3, 4], device=DEV))
+        lay = next(iter(p._layouts.values()))
+        if lay["traces"]:
+            break
+    tr = lay["traces"][0]
+    assert tr.frozen is not None and tr.plain is None, (tr.plain, e.stats()["locks"])
+    tr.site.decided = True  # replays from now on (the A/B's outcome is not this test's subject)
+    for _ in range(3):
+        b.copy_(torch.tensor([10, 11, 12, 13], device=DEV))
+        out.zero_()
+        n = len(calls)
+        p(b)
+        torch.cuda.synchronize()
+        assert len(calls) == n + 1  # ran plainly, once
+        assert torch.equal(out[:, 0], torch.tensor([10.0, 11, 12, 13], device=DEV)), e.stats()["last"]
+        assert torch.equal(b, new)
+    n = len(calls)
+    p(torch.tensor([5, 6, 7, 8], device=DEV))  # an index apart from the writes still replays
+    torch.cuda.synchronize()
+    assert len(calls) == n  # replayed: the step's Python did not run
+    assert torch.equal(out[:, 0], torch.tensor([5.0, 6, 7, 8], device=DEV))

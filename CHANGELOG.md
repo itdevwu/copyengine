@@ -6,6 +6,44 @@ change incompatibly only in a new minor (0.x) or major release.
 
 ## Unreleased
 
+- Many small rows between pinned host memory (mapped at its address) and a
+  GPU can run as one kernel reading or writing them over the link itself
+  (zero-copy), measured beside DMA per row, batched DMA and staging (token
+  rows of a page-first host KV pool, say).
+- A GPU index table is a read of the copy that uses it: a copy queued in the
+  same scope that writes the table runs first (before: the kernel could read
+  the table before it was written), and a copy whose destination overlaps
+  its own index table is refused (UnsafeCopy). `disable=True` engines run
+  copies with run-time indices and no torch equivalent themselves (before:
+  skipped).
+- GPU-index gathers and scatters between two GPUs are no longer refused as
+  "host index tables between two GPUs"; their torch baselines gather on the
+  source GPU and scatter on the destination's; a gather into host memory runs
+  on the source GPU's current stream.
+- A lazy copy with host index values on one side and a GPU index table on
+  the other runs (before: refused); the host values are snapshotted at the
+  call; duplicate destination rows are refused (UnsafeCopy).
+- A step plan's first run executes the step once (before: a copy that could
+  not take a host index parameter made it run the step a second time, after
+  the copies queued before it had already run: wrong results for steps that
+  are not idempotent, fuzzer seed 17). Overlapping block copies within one
+  pool run up to 36 copies per launch of the three kernels.
+- From an independent review of this release: overlapping block copies under
+  a soft SM limit ran only the first copies of a batch (the grid's second
+  dimension was capped; the kernels now stride over the batch); a CUDA graph
+  that captured them could replay into buffers a later, larger eager batch
+  had freed, and two graphs captured on one stream shared them (a captured
+  graph's buffers are now its own); a step plan replay
+  whose index tensor lies in memory the step writes runs the step plainly
+  (its frozen order did not cover that); quantization writing its own GPU
+  index table and copies into broadcast (stride-0) destinations are refused
+  (UnsafeCopy); a scoped copy between two GPUs runs on the source GPU's
+  stream current when it was made; a CPU index tensor rewritten after a lazy
+  view was built no longer changes the view; `gather` / `scatter_` in a step
+  plan take index values where a host index parameter cannot be read.
+- `bench/bench_serving.py` draws new block ids every step, as serving does,
+  and adds a step-plan column (`ce_plan`) and per-case profiling.
+
 - `bench/bench_workloads.py`: copyengine on its target workloads, one suite
   per kind (rooflines, segment sweeps, paged KV, reblock, resharding, SM
   caps, interference, quantization with paged gathers and across PCIe, block

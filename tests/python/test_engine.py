@@ -829,12 +829,8 @@ def test_site_decisions_travel_with_the_profile():
             dst.copy_(src[:, ::2])
 
     a = ce.Engine()
-    for _ in range(200):
-        step(a)
-        if a._sites[SITE].decided is not None:
-            break
-    decided = a._sites[SITE].decided
-    assert decided is not None
+    step(a)  # the site exists; its A/B's convergence is other tests' subject (it depends on timing)
+    a._sites[SITE].decided = decided = True
     prof = a.dump_profile()
     import json
     assert list(json.loads(prof)["sites"]["scope"].values()) == [decided]
@@ -861,3 +857,16 @@ def test_stats_count_buckets_by_locked_strategy():
     locks = e.stats()["locks"]
     assert set(locks) == {"locked", "exploring", "flips", "reopens"}
     assert sum(locks["locked"].values()) + locks["exploring"] == e.stats()["buckets"]
+
+
+def test_copies_before_an_exception_in_a_scope_run_as_torchs_would():
+    # torch runs each copy_ when called: an exception later in the block leaves the earlier
+    # copies done. A scope keeps that result (it does not drop what was queued).
+    torch = pytest.importorskip("torch")
+    e = ce.Engine()
+    src, dst = np.arange(64, dtype=np.float32), np.zeros(64, dtype=np.float32)
+    with pytest.raises(KeyError):
+        with e.scope():
+            e.copy_(dst[:32], src[:32])
+            raise KeyError("later work fails")
+    np.testing.assert_array_equal(dst[:32], src[:32])

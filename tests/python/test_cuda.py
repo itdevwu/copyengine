@@ -13,7 +13,7 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a C
 DEV = "cuda"
 
 
-def explore(fn, rounds=8, check=None):
+def explore(fn, rounds=12, check=None):
     """Run fn(engine) with exploration so every candidate strategy executes; check each round."""
     e = ce.Engine(tune_trials=1, tune_topk=4)
     seen = set()
@@ -231,6 +231,41 @@ def test_pageable_fragments_use_bounce(direction):
 
     _, seen = explore(body, check=check, rounds=8)
     assert {"staged", "bounce"} <= seen
+
+
+@pytest.mark.parametrize("direction", ["h2d", "d2h"])
+def test_pinned_fragments_offer_zero_copy(direction):
+    """Many small rows of pinned host memory (mapped at its address): one kernel
+    reads or writes them over the link itself, besides DMA per row and staging."""
+    n, row, stride = 1024, 512, 2048  # 2 KB rows 8 KB apart on the host side
+    host = torch.randn(n * stride // 4).pin_memory()
+    hv = host.view(n, stride // 4)[:, : row // 4]
+    dev = torch.randn(n, row // 4, device=DEV)
+    perm = np.random.default_rng(1).permutation(n)
+    hoff = hv.storage_offset() + perm * hv.stride(0)
+    doff = np.arange(n) * (row // 4)
+
+    def body(e):
+        if direction == "h2d":
+            e.segments(host, dev, hoff, doff, [row // 4] * n)
+        else:
+            e.segments(dev, host, doff, hoff, [row // 4] * n)
+
+    for force in ("kernel", None):
+        host.copy_(torch.randn_like(host))
+        dev.normal_()
+        e = ce.Engine(_force=force) if force else ce.Engine()
+        for _ in range(6 if force is None else 1):
+            want_dev, want_host = hv[perm].clone(), host.clone()
+            want_host.view(n, stride // 4)[perm, : row // 4] = dev.cpu()
+            body(e)
+            torch.cuda.synchronize()
+            if direction == "h2d":
+                assert torch.equal(dev.cpu(), want_dev), e.stats()
+            else:
+                assert torch.equal(host, want_host), e.stats()
+        if force:
+            assert e.stats()["last"]["strategies"] == ["kernel"], e.stats()["last"]
 
 
 def test_stats_report_admission():

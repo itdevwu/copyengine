@@ -94,6 +94,17 @@ struct RowsOv {
   uint64_t err;         // set (and the element skipped) for an index outside [0, rows)
 };
 static_assert(sizeof(RowsOv) == 104 && offsetof(RowsOv, marks) == 72 && offsetof(RowsOv, err) == 96);
+// Up to kOvBatch such copies in one launch of each kernel (blockIdx.y picks the copy),
+// carried in the kernel's parameters (under the 4 KB limit). They share the epoch words
+// and have marks and staging of their own.
+constexpr int kOvBatch = 36;
+struct RowsOvBatch {
+  int32_t count;
+  int32_t pad;
+  RowsOv op[kOvBatch];
+};
+static_assert(offsetof(RowsOvBatch, op) == 8 && sizeof(RowsOvBatch) == 8 + 104 * kOvBatch &&
+              sizeof(RowsOvBatch) <= 4096);
 
 // Every size and offset above, and the tile descriptor's, in one number.
 #if defined(__CUDACC__)
@@ -107,7 +118,7 @@ constexpr uint64_t layout_fingerprint() {
                         offsetof(cv::TileK, rows), offsetof(cv::TileK, g),  offsetof(cv::TileK, xi),
                         offsetof(cv::TileK, err), kPutWords,                kBulkBufs,
                         kTmaBox,                sizeof(RowsOv),             offsetof(RowsOv, marks),
-                        offsetof(RowsOv, err)};
+                        offsetof(RowsOv, err),  kOvBatch,                   sizeof(RowsOvBatch)};
   uint64_t h = 1469598103934665603ull;
   for (uint64_t x : v) h = (h ^ x) * 1099511628211ull;
   return h;

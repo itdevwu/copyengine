@@ -223,6 +223,12 @@ class CudaExecutor final : public Executor {
         if (g.used) d_->cuEventSynchronize(g.done);
         dev_free(s, g.mem);
       }
+      for (Dev::OvBuf& b : s.ovs) {
+        if (b.used) d_->cuEventSynchronize(b.done);
+        dev_free(s, b.marks), dev_free(s, b.epoch), dev_free(s, b.staging);
+        if (b.done) d_->cuEventDestroy(b.done);
+      }
+      for (DevMem& m : s.ov_kept) dev_free(s, m);
       dev_free(s, s.err);
       dev_free(s, s.capture_arena);
       dev_free(s, s.pace);
@@ -269,7 +275,9 @@ class CudaExecutor final : public Executor {
     const bool two_gpus = sc && dc && !one_gpu;
     const bool reach = kernel_reach(g.src) && kernel_reach(g.dst);
     switch (s) {
-      case Strategy::kernel: return one_gpu || (two_gpus && peer(g.src.device.index, g.dst.device.index).kernel);
+      case Strategy::kernel:  // one GPU, a pair's admitted kernel, or zero-copy over host memory mapped at its address
+        return one_gpu || (two_gpus && peer(g.src.device.index, g.dst.device.index).kernel) ||
+               (sc != dc && g.pure() && reach && zero_copy_ok(state(device_of(g))));
       case Strategy::bulk:
       case Strategy::tma2d: return one_gpu;
       case Strategy::batch: return reach && (!two_gpus || peer(g.src.device.index, g.dst.device.index).batch);
@@ -353,6 +361,9 @@ class CudaExecutor final : public Executor {
         for (i64 h : g.rects.height) rows += h;
         const bool fragmented = rows > 2 && g.bytes() / rows < kSmallRect;  // small rows DMA poorly
         if (fragmented && s.kernels) c.push_back(Strategy::staged);  // dense link copy + device-side kernel
+        // Zero-copy: one kernel reads (writes) the host rows over the link itself.
+        if (fragmented && s.kernels && kernel_reach(g.src) && kernel_reach(g.dst) && zero_copy_ok(s))
+          c.push_back(Strategy::kernel);
         // cuMemcpyBatchAsync takes device-accessible addresses: host memory must be mapped at its own.
         if (s.batch && kernel_reach(g.src) && kernel_reach(g.dst)) c.push_back(Strategy::batch);
         if (!host_ok) c.push_back(Strategy::bounce);
@@ -699,9 +710,11 @@ class CudaExecutor final : public Executor {
       size_t mark_rows = 0, staging_bytes = 0;
       CUevent done{};
       bool used = false;
+      bool captured = false;  // a CUDA graph holds these addresses: the next eager use takes new ones
       uint64_t last = 0;
     };
     std::vector<OvBuf> ovs;
+    std::vector<DevMem> ov_kept;  // buffers captured graphs still use: kept until teardown
     std::array<Bounce, 2> bounce;
     // SM limit (EngineOptions::max_sms)
     CUgreenCtx green{};
@@ -1893,7 +1906,7 @@ class CudaExecutor final : public Executor {
         t.qe, 1, t.qp);
     add(&cv::TileK::s, &cv::TileK::sr, ci, op.extras[0].device.kind == DeviceKind::host, !writes_scale, t.upr, t.se,
         sw);
-    if (op.extras.size() > 1)
+    if (op.extras.size() > 1 && !op.extras[1].table)  // scale, zero points, then GPU index tables (reads)
       add(&cv::TileK::z, &cv::TileK::zr, ci, op.extras[1].device.kind == DeviceKind::host, !writes_scale, t.upr, t.ze,
           1);
     return v;
@@ -2452,73 +2465,122 @@ class CudaExecutor final : public Executor {
                                       [](const Dev::OvBuf& x, const Dev::OvBuf& y) { return x.last < y.last; });
     if (b.used) check(d_->cuStreamWaitEvent(st, b.done, 0), "cuStreamWaitEvent");  // the other stream's last use first
     b.caller = st;
+    ov_detach(s, b);
     return b;
   }
 
-  // Whether `st`'s buffers already fit every op of `g` (a capture can only
+  // A captured graph replays with `b`'s addresses (marks, epoch, staging) and
+  // the epoch it holds: they become the graph's (kept until teardown) and `b`
+  // starts over with new buffers, allocated by its next use.
+  static void ov_detach(Dev& s, Dev::OvBuf& b) {
+    if (!b.captured) return;
+    for (DevMem* m : {&b.marks, &b.epoch, &b.staging})
+      if (m->ptr) s.ov_kept.push_back(*m), *m = DevMem{};
+    b.mark_rows = b.staging_bytes = 0;
+    b.captured = false;
+  }
+
+  // The marks and staging a batch of these copies needs: each copy its own region
+  // (staging regions 16-byte aligned: rows move as 16-byte words where they can).
+  struct OvNeed {
+    size_t marks = 0, staging = 0;  // uint64 marks; bytes
+  };
+  static OvNeed ov_need(const std::vector<const Form*>& forms) {
+    OvNeed n;
+    for (const Form* f : forms) {
+      const auto L = rows_layout(*f);
+      if (!L) continue;
+      n.marks += static_cast<size_t>(L->rows);
+      n.staging += (static_cast<size_t>(L->n * L->row_bytes) + 15) & ~size_t{15};
+    }
+    return n;
+  }
+  static std::vector<const Form*> group_forms(const Group& g, size_t from, size_t to) {
+    std::vector<const Form*> fs;
+    for (size_t i = from; i < to && i < g.forms.size(); ++i) fs.push_back(g.forms[i].get());
+    return fs;
+  }
+  // The most any batch of `g` needs (batches run one after another on a stream: they reuse it).
+  static OvNeed ov_need_max(const Group& g) {
+    OvNeed m;
+    for (size_t at = 0; at < g.forms.size(); at += cuabi::kOvBatch) {
+      const OvNeed n = ov_need(group_forms(g, at, at + cuabi::kOvBatch));
+      m.marks = std::max(m.marks, n.marks), m.staging = std::max(m.staging, n.staging);
+    }
+    return m;
+  }
+
+  // Whether `st`'s buffers already fit every batch of `g` (a capture can only
   // record kernels: no allocation, no wait for another stream's use).
   bool rows_ov_resident(Dev& s, const Group& g, CUstream st) {
     if (!s.err.ptr) return false;
-    for (const Dev::OvBuf& b : s.ovs) {
-      if (!b.assigned || b.caller != st || !b.epoch.ptr) continue;
-      for (const auto& f : g.forms) {
-        const auto L = rows_layout(*f);
-        if (!L || static_cast<size_t>(L->rows) > b.mark_rows ||
-            static_cast<size_t>(L->n * L->row_bytes) > b.staging_bytes)
-          return false;
-      }
-      return true;
-    }
+    const OvNeed need = ov_need_max(g);
+    for (const Dev::OvBuf& b : s.ovs)
+      if (b.assigned && b.caller == st && b.epoch.ptr)  // not a graph's already (ov_detach)
+        return !b.captured && need.marks <= b.mark_rows && need.staging <= b.staging_bytes;
     return false;
   }
 
   int64_t rows_overlap(Dev& s, const Group& g, const std::vector<Op>& ops, CUstream st) {
     const bool cap = capturing(reinterpret_cast<uintptr_t>(st));
+    Dev::OvBuf& b = ov_of(s, st);
+    ov_detach(s, b);  // what a graph replays is its own: no eager run, nor another graph, uses it
+    b.last = ++s.staging_clock;
+    const OvNeed need = ov_need_max(g);
+    if (cap && (!b.epoch.ptr || b.mark_rows < need.marks || b.staging_bytes < need.staging))
+      fail(Errc::unsupported, "an overlapping indexed copy is recorded in a CUDA graph only after it ran once on "
+                              "the capturing stream");
+    if (!b.epoch.ptr) {
+      b.epoch = dev_alloc(s, 16, "overlap epoch", st);
+      check(d_->cuMemsetD8Async(b.epoch.ptr, 0, 16, st), "cuMemsetD8Async");
+    }
+    if (b.mark_rows < need.marks) {  // new marks are zero: older than any epoch to come
+      dev_free(s, b.marks);
+      b.marks = dev_alloc(s, need.marks * 8, "overlap marks", st);
+      check(d_->cuMemsetD8Async(b.marks.ptr, 0, need.marks * 8, st), "cuMemsetD8Async");
+      b.mark_rows = need.marks;
+    }
+    if (b.staging_bytes < need.staging) {
+      dev_free(s, b.staging);
+      b.staging = dev_alloc(s, std::max<size_t>(need.staging, 16), "overlap staging", st);
+      b.staging_bytes = std::max<size_t>(need.staging, 16);
+    }
+    const CUdeviceptr err = error_word(s);
+    if (cap) s.err_graphs = true;
+    else s.err_armed = true;
     int64_t calls = 0;
-    for (int k : g.ops) {
-      const Op& op = ops[k];
-      const auto L = op.form ? rows_layout(*op.form) : std::nullopt;
-      if (!L) fail(Errc::backend, "rows_overlap: the op is not rows of one layout");
-      Dev::OvBuf& b = ov_of(s, st);
-      b.last = ++s.staging_clock;
-      const size_t need_rows = static_cast<size_t>(L->rows), need_stg = static_cast<size_t>(L->n * L->row_bytes);
-      if (cap && (!b.epoch.ptr || b.mark_rows < need_rows || b.staging_bytes < need_stg))
-        fail(Errc::unsupported, "an overlapping indexed copy is recorded in a CUDA graph only after it ran once on "
-                                "the capturing stream");
-      if (!b.epoch.ptr) {
-        b.epoch = dev_alloc(s, 16, "overlap epoch", st);
-        check(d_->cuMemsetD8Async(b.epoch.ptr, 0, 16, st), "cuMemsetD8Async");
+    for (size_t at = 0; at < g.ops.size(); at += cuabi::kOvBatch) {
+      cuabi::RowsOvBatch B{};
+      size_t marks_at = 0, staging_at = 0;
+      int64_t max_n = 0;
+      for (size_t i = at; i < g.ops.size() && i < at + cuabi::kOvBatch; ++i) {
+        const Op& op = ops[g.ops[i]];
+        const auto L = op.form ? rows_layout(*op.form) : std::nullopt;
+        if (!L) fail(Errc::backend, "rows_overlap: the op is not rows of one layout");
+        cuabi::RowsOv& P = B.op[B.count++];
+        P.pool = static_cast<uint64_t>(L->pool), P.row_stride = L->row_stride, P.row_bytes = L->row_bytes;
+        P.stab = op.stab, P.dtab = op.dtab, P.sstep = op.form->stab_step, P.dstep = op.form->dtab_step;
+        P.n = L->n, P.rows = L->rows;
+        P.marks = b.marks.ptr + marks_at * 8, P.epoch = b.epoch.ptr, P.staging = b.staging.ptr + staging_at;
+        P.err = err;
+        marks_at += static_cast<size_t>(L->rows);
+        staging_at += (static_cast<size_t>(L->n * L->row_bytes) + 15) & ~size_t{15};
+        max_n = std::max(max_n, L->n);
       }
-      if (b.mark_rows < need_rows) {  // new marks are zero: older than any epoch to come
-        dev_free(s, b.marks);
-        b.marks = dev_alloc(s, need_rows * 8, "overlap marks", st);
-        check(d_->cuMemsetD8Async(b.marks.ptr, 0, need_rows * 8, st), "cuMemsetD8Async");
-        b.mark_rows = need_rows;
-      }
-      if (b.staging_bytes < need_stg) {
-        dev_free(s, b.staging);
-        b.staging = dev_alloc(s, std::max<size_t>(need_stg, 16), "overlap staging", st);
-        b.staging_bytes = std::max<size_t>(need_stg, 16);
-      }
-      cuabi::RowsOv P{};
-      P.pool = static_cast<uint64_t>(L->pool), P.row_stride = L->row_stride, P.row_bytes = L->row_bytes;
-      P.stab = op.stab, P.dtab = op.dtab, P.sstep = op.form->stab_step, P.dstep = op.form->dtab_step;
-      P.n = L->n, P.rows = L->rows;
-      P.marks = b.marks.ptr, P.epoch = b.epoch.ptr, P.staging = b.staging.ptr;
-      P.err = error_word(s);
-      if (cap) s.err_graphs = true;
-      else s.err_armed = true;
-      void* args[] = {&P};
-      const unsigned rows_grid = static_cast<unsigned>(std::min<int64_t>(L->n, 1 << 20));
-      const unsigned mark_grid = static_cast<unsigned>(std::min<int64_t>((L->n + 255) / 256, 1 << 16));
-      run_kernel(s, function(s, "ce_ov_mark"), {mark_grid, 1, 1}, {256, 1, 1}, args, st, "ce_ov_mark");
-      run_kernel(s, function(s, "ce_ov_stage"), {rows_grid, 1, 1}, {128, 1, 1}, args, st, "ce_ov_stage");
-      run_kernel(s, function(s, "ce_ov_scatter"), {rows_grid, 1, 1}, {128, 1, 1}, args, st, "ce_ov_scatter");
-      if (!cap) {
-        check(d_->cuEventRecord(b.done, st), "cuEventRecord");
-        b.used = true;
-      }
+      void* args[] = {&B};
+      const auto y = static_cast<unsigned>(B.count);
+      const unsigned rows_grid = static_cast<unsigned>(std::min<int64_t>(max_n, 1 << 20));
+      const unsigned mark_grid = static_cast<unsigned>(std::min<int64_t>((max_n + 255) / 256, 1 << 16));
+      run_kernel(s, function(s, "ce_ov_mark"), {mark_grid, y, 1}, {256, 1, 1}, args, st, "ce_ov_mark");
+      run_kernel(s, function(s, "ce_ov_stage"), {rows_grid, y, 1}, {128, 1, 1}, args, st, "ce_ov_stage");
+      run_kernel(s, function(s, "ce_ov_scatter"), {rows_grid, y, 1}, {128, 1, 1}, args, st, "ce_ov_scatter");
       calls += 3;
+    }
+    if (!cap) {
+      check(d_->cuEventRecord(b.done, st), "cuEventRecord");
+      b.used = true;
+    } else {
+      b.captured = true;
     }
     return calls;
   }
@@ -2593,6 +2655,8 @@ class CudaExecutor final : public Executor {
   }
 
   int64_t kernel(Dev& s, const Group& g, CUstream st, bool resident_table = true) {
+    if (g.src.device.kind != DeviceKind::cuda || g.dst.device.kind != DeviceKind::cuda)
+      return kernel_named(s, g, g.pure() ? "ce_bytes_cs" : kernel_name(g), st);  // zero-copy over mapped host memory
     if (!resident_table) {
       launch(s, kernel_name(g), chunks_of(g), to_cv(g.fn), st);
       return 1;
@@ -2823,6 +2887,7 @@ class CudaExecutor final : public Executor {
       s.zero_copy_error = "no kernels: " + s.kernel_error;
       return false;
     }
+    const Push push(*d_, s.ctx);  // planning may run on a thread with another context current, or none
     const size_t n = 1 << 16;
     void* host = nullptr;
     CUdeviceptr dev = 0;

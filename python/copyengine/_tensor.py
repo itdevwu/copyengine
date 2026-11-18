@@ -81,6 +81,8 @@ class Lazy:
         if t is not None:  # stays on the GPU: the copy kernel reads it
             return self._with(select_device(self._access, dim, t), ("index_select", dim, t))
         idx = index_array(index)
+        if idx is index or not idx.flags.owndata:  # the caller's array or tensor memory (a CPU tensor's numpy())
+            idx = idx.copy()  # the values as of now: the caller may rewrite its index before the copy runs
         return self._with(self._access.index_select(dim, idx), ("index_select", dim, idx))
 
     def slice(self, dim: int, start=None, stop=None, step: int = 1):
@@ -108,6 +110,54 @@ class Lazy:
 
     def __getitem__(self, key):
         return apply_index(self, key)
+
+    def params(self) -> bool:
+        """Whether an index of this view is a step plan's host index parameter (its pinned buffer)."""
+        return any(op[0] == "index_select" and len(op) == 3 and is_tensor(op[2]) and not op[2].is_cuda
+                   for op in self._ops)
+
+    def device_tables(self) -> bool:
+        """Whether an index of this view is read on the GPU when the copy runs."""
+        return any(op[0] == "index_select" and is_tensor(op[2]) and op[2].is_cuda for op in self._ops)
+
+    def value_indices(self) -> bool:
+        return any(op[0] == "index_select" and isinstance(op[2], np.ndarray) for op in self._ops)
+
+    def with_host_tables(self, unique: bool = False) -> "Lazy":
+        """This view with its host index values passed as host tables (read when the copy runs):
+        snapshots of the values recorded when the view was built, owned by the view and known
+        to freeze() (note_table). `unique`: the view is written, so its indices must be distinct
+        (the copy's units would race otherwise; the value path refuses them alike)."""
+        x = Lazy(self._base, self._base.access)
+        for op in self._ops:
+            if op[0] == "index_select" and isinstance(op[2], np.ndarray):
+                n = x.shape[op[1]]
+                v = np.where(op[2] < 0, op[2] + n, op[2]).astype(np.int64)  # as Access.index_select normalizes
+                if unique and np.unique(v).size != v.size:
+                    raise _core.UnsafeCopy("duplicate destination indices: the copies would race")
+                t = torch.from_numpy(np.ascontiguousarray(v).copy())
+                note_table(t)
+                x = x._with(select_device(x._access, op[1], t), ("index_select", op[1], t, "snapshot"))
+            else:
+                x = x._replay(op)
+        return x
+
+    def with_values(self) -> "Lazy":
+        """This view with a step plan's host index parameters taken as values now: for a copy
+        that cannot read them when it runs (the plan then guards them by value)."""
+        x = Lazy(self._base, self._base.access)
+        for op in self._ops:
+            if op[0] == "index_select" and len(op) == 3 and is_tensor(op[2]) and not op[2].is_cuda:
+                idx = index_array(op[2])
+                x = x._with(x._access.index_select(op[1], idx), ("index_select", op[1], idx))
+            else:
+                x = x._replay(op)
+        return x
+
+    def _replay(self, op) -> "Lazy":
+        if op[0] == "index_select" and len(op) == 4:  # a host-table snapshot: kept as it is
+            return self._with(select_device(self._access, op[1], op[2]), op)
+        return getattr(self, op[0])(*op[1:])
 
     def as_view(self) -> View:
         b = self._base

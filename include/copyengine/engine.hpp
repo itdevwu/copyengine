@@ -211,6 +211,10 @@ class Frozen {
   // parameter buffers), some copy's source and destination share bytes
   // (exact, by the rows those values select; an index out of range: true).
   virtual bool host_overlap() const = 0;
+  // Whether a rebound table (its new bytes) lies in memory the frozen copies
+  // write: their order was planned with the traced tables, so such a replay
+  // could read a table before (or while) it is written. run() refuses it.
+  virtual bool rebind_aliases(std::span<const Rebind> rebinds) = 0;
 };
 
 }  // namespace ce

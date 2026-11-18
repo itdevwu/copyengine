@@ -278,6 +278,9 @@ class StepPlan:
             if torch is not None and torch.cuda.is_available():
                 stream = torch.cuda.current_stream(tr.device).cuda_stream
             rebinds = [(p, p + n, leaves[i].data_ptr()) for i, p, n in tr.tables]
+            if rebinds and tr.frozen.rebind_aliases(rebinds):
+                kind, timed = None, False  # this call's index tensors lie where the copies write: plainly
+        if kind == "replay":
             with e._lock:
                 if e._depth:
                     raise RuntimeError("a step plan replays outside scopes (it would reorder the queued copies)")
@@ -303,16 +306,11 @@ class StepPlan:
         _tracing.engine = e
         e._e.set_recording(True)
         try:
-            for attempt in (0, 1):
-                _tracing.params, _tracing.used, _tracing.values, _tracing.overlaps = params, set(), 0, 0
-                try:
-                    with e.scope():
-                        self._step(*args, **kw)
-                    break
-                except _core.Unsupported:
-                    if attempt or not params:
-                        raise
-                    params = {}  # host index tables this copy cannot take: index values instead
+            # The step runs once: a copy that cannot read a host index parameter when it
+            # runs takes the values instead (Engine.copy_), so nothing is done twice.
+            _tracing.params, _tracing.used, _tracing.values, _tracing.overlaps = params, set(), 0, 0
+            with e.scope():
+                self._step(*args, **kw)
             used, values, overlaps = _tracing.used, _tracing.values, _tracing.overlaps
         finally:
             _tracing.params = None

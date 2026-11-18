@@ -44,7 +44,7 @@ ce.quantize(kv, q_cache, scales, fmt="fp8_e4m3", group=128, x_index=pages, index
 
 | Your code | Use |
 |---|---|
-| A loop of `copy_` calls you do not want to touch | `with ce.scope():` around it |
+| A loop of `copy_` calls you do not want to touch | `with ce.scope():` around it: the copies plan and run together, but the loop's own Python and torch dispatch remain (about what each `copy_` costs torch); for speed, one of the rows below |
 | The same step every iteration, block ids changing (paged caches, offload) | `step = ce.plan(fn)`, with `ce.lazy(pool)[ids]` inside; pass pools and ids as arguments |
 | One copy per layer, the same tensors every step | `ce.copy_many(dsts, srcs)` |
 | Gather + permute + cast before a copy (`x[ids].permute(...).to(...)`) | `ce.copy_(out, ce.lazy(x)[ids].permute(...))`: one pass, no temporaries |
@@ -178,7 +178,8 @@ fastest.
   copies, `allow_async`) are kept alive until the GPU is done with them.
 - CUDA Graphs: copies inside `torch.cuda.graph` (scopes, `ce.copy_`,
   `FrozenPlan.run()`) are recorded and replay correctly. Copies torch has no
-  equivalent for must run once before capturing.
+  equivalent for must run once before capturing. A graph may use the
+  engine's buffers: keep the engine alive while the graph replays.
 - `scope(stream=...)`: the scope's work (its copies, and any other op written
   in it) runs on that stream, after what the current stream had queued. The
   host waits for none of it, even for copies that would otherwise block; the

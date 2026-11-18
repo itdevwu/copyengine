@@ -98,7 +98,7 @@ def test_graph_replays_advance_the_epoch():
     pool = torch.randn(128, 64, device=DEV)
     d = torch.zeros(32, dtype=torch.int64, device=DEV)
     s = torch.zeros(32, dtype=torch.int64, device=DEV)
-    e = ce.Engine()
+    e = ce.Engine(_force="fused")  # the three kernels captured (else the frozen plan may replay torch's copy)
     side = torch.cuda.Stream()
 
     def fill():
@@ -125,6 +125,129 @@ def test_graph_replays_advance_the_epoch():
         g.replay()
         torch.cuda.synchronize()
         assert torch.equal(pool, want), it
+
+
+def test_a_graph_keeps_its_buffers_when_eager_copies_grow_them():
+    # Eager copies on the capturing stream that need more marks and staging than the
+    # captured graph take new buffers: the graph's stay its own (codex review, dev10).
+    rng = np.random.default_rng(4)
+    pool = torch.randn(128, 64, device=DEV)
+    d = torch.zeros(32, dtype=torch.int64, device=DEV)
+    s = torch.zeros(32, dtype=torch.int64, device=DEV)
+    e = ce.Engine(_force="fused")  # the three kernels (the tuner might lock torch's copy: nothing captured)
+    side = torch.cuda.Stream()
+
+    def fill():
+        dd = rng.permutation(128)[:32]
+        d.copy_(torch.as_tensor(dd))
+        s.copy_(torch.as_tensor(np.roll(dd, 1)))
+
+    fill()
+    for _ in range(10):
+        e.copy_(ce.lazy(pool)[d], ce.lazy(pool)[s])
+    fr = e.freeze()
+    torch.cuda.synchronize()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        fr.run()
+    side.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g, stream=side):
+        fr.run()
+    # Larger eager batches on the same stream: more rows, two pools per flush.
+    big = [torch.randn(4096, 64, device=DEV) for _ in range(2)]
+    side.wait_stream(torch.cuda.current_stream())  # `big` is written on the current stream
+    with torch.cuda.stream(side):
+        for _ in range(4):
+            wants = []
+            with e.scope():
+                for p in big:
+                    bd = torch.as_tensor(rng.permutation(4096)[:1024], device=DEV)
+                    bs = torch.roll(bd, 1)
+                    wants.append(_want(p, bd, bs))
+                    e.copy_(ce.lazy(p)[bd], ce.lazy(p)[bs])
+            side.synchronize()
+            for p, w in zip(big, wants):
+                assert torch.equal(p, w), e.stats()["last"]
+    # Memory freed now would be handed out again: the graph must not write into it.
+    with torch.cuda.stream(side):  # torch's allocator hands freed blocks out again on their stream: fill them
+        junk = [torch.zeros(512, dtype=torch.uint8, device=DEV) for _ in range(8192)]
+    side.synchronize()
+    for it in range(4):
+        fill()
+        torch.cuda.synchronize()
+        want = _want(pool, d, s)
+        g.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(pool, want), it
+        assert not torch.cat(junk).any(), it
+
+
+def test_an_sm_limit_runs_every_copy_of_a_batch():
+    # The soft SM limit caps the grid's y dimension below the batch's copies (codex
+    # review, dev10): each kernel strides over them. 40 pools: two batches (36 + 4).
+    rng = np.random.default_rng(5)
+    e = ce.Engine(max_sms=1)
+    pools = [torch.randn(64, 16, device=DEV) for _ in range(40)]
+    for it in range(4):
+        wants = []
+        with e.scope():
+            for p in pools:
+                d = torch.as_tensor(rng.permutation(64)[:16], device=DEV)
+                s = torch.roll(d, 1)
+                wants.append(_want(p, d, s))
+                e.copy_(ce.lazy(p)[d], ce.lazy(p)[s])
+        torch.cuda.synchronize()
+        assert _rows(e) and e.stats()["last"]["calls"] == 6, e.stats()["last"]  # two batches of three kernels
+        for k, (p, w) in enumerate(zip(pools, wants)):
+            assert torch.equal(p, w), (it, k, e.stats()["cuda"][0].get("sm_limit"), e.stats()["last"])
+
+
+def test_two_graphs_captured_on_one_stream_do_not_share_buffers():
+    # The second capture finds the stream's buffers taken by the first graph: it records
+    # torch's copy (or two passes) instead, and both graphs replay right, also at once
+    # on two streams (codex review, dev10).
+    rng = np.random.default_rng(6)
+    rows, n = 1 << 16, 1 << 14  # long enough kernels that the two replays run at the same time
+    pools = [torch.randn(rows, 64, device=DEV) for _ in range(2)]
+    idx = [(torch.zeros(n, dtype=torch.int64, device=DEV), torch.zeros(n, dtype=torch.int64, device=DEV))
+           for _ in range(2)]
+    e = ce.Engine(_force="fused")
+    side = torch.cuda.Stream()
+
+    def fill():
+        for d, s in idx:
+            dd = rng.permutation(rows)[:n]
+            d.copy_(torch.as_tensor(dd))
+            s.copy_(torch.as_tensor(np.roll(dd, 1)))
+
+    fill()
+    graphs = []
+    for p, (d, s) in zip(pools, idx):
+        for _ in range(3):
+            e.copy_(ce.lazy(p)[d], ce.lazy(p)[s])
+        fr = e.freeze()
+        torch.cuda.synchronize()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            fr.run()
+        side.synchronize()
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, stream=side):
+            fr.run()
+        graphs.append(g)
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    for it in range(4):
+        fill()
+        torch.cuda.synchronize()
+        wants = [_want(p, d, s) for p, (d, s) in zip(pools, idx)]
+        for g, st in zip(graphs, streams):
+            st.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(st):
+                g.replay()
+        torch.cuda.synchronize()
+        for p, w in zip(pools, wants):
+            assert torch.equal(p, w), it
 
 
 def test_an_eager_capture_takes_two_passes():

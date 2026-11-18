@@ -172,5 +172,6 @@ def test_sessions_of_exited_threads_are_let_go():
     t = threading.Thread(target=lambda: e.copy_(torch.zeros(8, device=DEV), torch.ones(8, device=DEV)))
     t.start()
     t.join()
+    torch.cuda.synchronize()  # its last copy done: a session is let go once nothing of it is in flight
     e.copy_(torch.zeros(8, device=DEV), torch.ones(8, device=DEV))  # this thread again: the others are gone
-    assert e.stats()["sessions"] == 1, e.stats()["sessions"]
+    assert e.stats()["sessions"] == 1, (e.stats()["sessions"], e.stats()["last"])

@@ -201,7 +201,9 @@ fastest.
   (`ce.copy_(ce.lazy(pool)[d], ce.lazy(pool)[s])`) gathers first and then
   writes, as torch's `pool[d] = pool[s]` does, in two passes where the sides
   may overlap and one where they cannot (disjoint column slices of one pool
-  stay one pass; with host indices the check uses this call's values).
+  stay one pass; with host indices the check uses this call's values). Block
+  copies within one pool by GPU indices (rows of one layout) copy only the
+  source rows that are also destination rows twice.
   `ce.gather` / `ce.scatter_` and plain views refuse it with `UnsafeCopy`, as
   torch's `index_select(out=)`, `index_copy_` and `copy_` do.
 

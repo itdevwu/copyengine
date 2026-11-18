@@ -47,7 +47,8 @@ class Executor {
   virtual bool capturing(uintptr_t /*stream*/) { return false; }
   // Whether running `s` for `g` now only enqueues stream work (its tables
   // already resident, no staging, pinned or device memory only).
-  virtual bool capture_safe(Strategy /*s*/, const Group& /*g*/) { return true; }
+  // `stream`: the stream being captured.
+  virtual bool capture_safe(Strategy /*s*/, const Group& /*g*/, uintptr_t /*stream*/) { return true; }
   // Admission results etc. for stats().
   virtual Json info() { return Json(true); }
 };

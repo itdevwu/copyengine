@@ -524,6 +524,14 @@ Access Access::reshape(std::span<const i64> nshape) const {
         out.push_back(old[i0]);
         continue;
       }
+      // Strides that nest (each the next one's stride times its size): one strided dimension.
+      bool nests = true;
+      for (size_t d = i0; d < i && nests; ++d)
+        nests = !old[d].table && (d + 1 == i || old[d].stride == old[d + 1].stride * old[d + 1].size);
+      if (nests) {
+        out.emplace_back(pn, old[i - 1].stride);
+        continue;
+      }
       std::vector<std::vector<i64>> vals;
       for (size_t d = i0; d < i; ++d) vals.push_back(term_values(old[d]));
       auto table = std::make_shared<const std::vector<i64>>(outer_offsets(vals, vals.size(), 0));

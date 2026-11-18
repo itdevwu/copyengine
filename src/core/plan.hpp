@@ -1,5 +1,6 @@
 #pragma once
 
+#include <optional>
 #include <array>
 #include <cstdint>
 #include <memory>
@@ -76,6 +77,18 @@ struct Form {
            dtab_host == o.dtab_host;
   }
 };
+// A form that copies rows within one pool by device index tables on both
+// sides: one layout (base, strides, bound) on both, the table dimension the
+// same, every other dimension together one contiguous row. Absolute bytes.
+struct RowsLayout {
+  int64_t pool = 0;        // address of row 0
+  int64_t row_stride = 0;  // bytes between rows
+  int64_t row_bytes = 0;
+  int64_t n = 0;           // indices per side
+  int64_t rows = 0;        // the indices' bound
+};
+std::optional<RowsLayout> rows_layout(const Form& f);
+
 // The runs a form with host tables reads now: `stab` / `dtab` are its tables'
 // host pointers (int64, the form's steps). Absolute element indices; the
 // innermost dimension stays one run where it is contiguous on both sides.
@@ -120,6 +133,10 @@ struct Op {
   // the host): `form` is its only executable description, and its footprint
   // is its whole source / destination allocation.
   bool opaque = false;
+  // An opaque copy within one pool whose indices may overlap, gather first
+  // (torch's pool[d] = pool[s]): rows of one layout on both sides, run as three
+  // kernels (mark, stage the source rows that are destination rows, scatter).
+  bool rows_ov = false;
   double bandwidth = 0;            // bytes/s limit of its scope (0: none), mixed into fp
   std::shared_ptr<const Form> form;  // null when the statement has tables or came in as runs
   // A tile op (quantization while copying): its kernel description, and the
@@ -173,6 +190,7 @@ struct Group {
   int64_t opaque_elems = 0;  // elements of ops without runs (device tables): only their forms can run them
   bool opaque() const { return opaque_elems > 0; }
   bool tiles = false;  // tile ops (quantization while copying): only the tile strategies run them
+  bool rows_ov = false;  // Op::rows_ov ops: only the statement kernels' overlap path runs them
   bool tile_host_sides = false;  // some tensor of its tile ops is in host memory
   bool tile_staged_ok = false;   // ... and every op can go through device staging (Op::tile_staged_ok)
   bool tile_mapped = true;       // ... and every host tensor is mapped (zero-copy kernels reach it)

@@ -122,6 +122,8 @@ class Intercept(TorchDispatchMode):
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         kwargs = kwargs or {}
+        if _core._framework_copy_running():  # copyengine runs torch's own copy (a native): let it through
+            return func(*args, **kwargs)
         if func is _COPY:
             return intercepted_copy(self.engine, *args, **kwargs)
         writes = _writes(func)

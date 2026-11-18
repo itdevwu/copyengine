@@ -66,18 +66,32 @@ StreamProvider stream_provider();
 using PeerEnabler = void (*)(int a, int b);
 void set_peer_enabler(PeerEnabler f);
 PeerEnabler peer_enabler();
-// Runs the enabler. Its copy may be intercepted (a scope open on this
-// thread): while it runs, engines run intercepted copies as the framework's
-// own at once (enabling_peer()), so the framework's copy is what happens.
 void run_peer_enabler(int a, int b);
-bool enabling_peer();
+
+// While copyengine runs the framework's own copy on a thread (a native: the
+// baseline, a copy torch does better, the peer enabler's), nothing is
+// intercepted on that thread: interception (the shim, the Python mode) lets
+// every op through to the framework, and an engine runs a copy handed to it
+// as its native at once. Otherwise the framework's copy, intercepted inside a
+// scope, would come back into the engine and be queued instead of done.
+class FrameworkCopy {
+ public:
+  FrameworkCopy();
+  ~FrameworkCopy();
+  FrameworkCopy(const FrameworkCopy&) = delete;
+  FrameworkCopy& operator=(const FrameworkCopy&) = delete;
+
+ private:
+  bool was_;
+};
+bool framework_copy_running();
 
 // Entry points for framework extensions (copyengine._torch). They receive this
 // table from copyengine._core, so the process holds one copy of the engine and
 // extensions need not link the core. Both sides come from the same build;
 // errors cross as codes because exception types do not cross shared objects.
 struct FrontendApi {
-  static constexpr uint32_t kVersion = 8;
+  static constexpr uint32_t kVersion = 9;
   enum Flags : uint32_t {
     kHostAsync = 1,  // see Hints::host_async
   };
@@ -117,6 +131,7 @@ struct FrontendApi {
   int (*end_scope)(Engine& engine, std::string* error) = nullptr;
   void (*set_stream_provider)(StreamProvider f) = nullptr;
   void (*set_peer_enabler)(PeerEnabler f) = nullptr;
+  bool (*framework_copy_running)() = nullptr;
 };
 
 const FrontendApi* frontend_api();

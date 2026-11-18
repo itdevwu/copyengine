@@ -15,6 +15,8 @@ Modes:
   freeze    one explicit flush, frozen, replayed
   threads   one engine shared by threads, each with its own bases and stream: explicit and
             scope runs interleaved (plans and tuning shared, sessions per thread)
+  pool      block copies within one pool by GPU indices that overlap (pool[d] = pool[s],
+            torch's gather-first result): explicit, frozen and step-plan runs, new indices each
 
 Also `forced`: every strategy (Engine(_force=...)) wherever the executor offers it, the most
 conservative one elsewhere, so a failure belongs to the forced strategy. FUZZ_SKIP=a,b leaves
@@ -315,6 +317,8 @@ def fuzz_one(seed, modes, runs=24):
         errs += fuzz_plan(seed, init, ops, fresh)
     if "threads" in modes:
         errs += fuzz_threads(seed, init, ops, want, fresh, runs)
+    if "pool" in modes:
+        errs += fuzz_pool(seed)
     if "graph" in modes:  # the program captured in a CUDA graph after warmup, replayed
         eng = ce.Engine()
         bs = fresh()
@@ -340,6 +344,70 @@ def fuzz_one(seed, modes, runs=24):
             if not any(w in str(ex) for w in ("captur", "graph")) and \
                     not isinstance(ex, (ce.Unsupported, ce.NeedsMaterialize, ce.UnsafeCopy)):
                 errs.append(f"seed {seed} mode graph: {type(ex).__name__}: {str(ex).splitlines()[0][:160]}")
+    return errs
+
+
+def fuzz_pool(seed, calls=40):
+    rng = np.random.default_rng(seed + 2 * 10**6)
+    rows = int(rng.integers(4, 300))
+    inner = tuple(int(rng.integers(1, 9)) for _ in range(int(rng.integers(0, 3))))
+    dtype = [torch.float32, torch.bfloat16, torch.uint8, torch.float16][int(rng.integers(0, 4))]
+    n = int(rng.integers(1, max(2, rows // 2)))
+    cols = int(rng.integers(0, 2)) if inner else 0  # a column slice of the rows: not one dense row (two passes)
+    errs = []
+
+    def indices():
+        d = rng.permutation(rows)[:n]
+        how = rng.integers(0, 3)
+        s = np.roll(d, 1) if how == 0 else rng.integers(0, rows, n) if how == 1 else d[rng.integers(0, n, n)]
+        return torch.as_tensor(d, device=DEV), torch.as_tensor(s, device=DEV)
+
+    def view(pool):
+        return ce.lazy(pool)[:, : inner[0] - 1] if cols and inner[0] > 1 else ce.lazy(pool)
+
+    def check(tag, pool, before, d, s, it):
+        want = before.clone()
+        if cols and inner[0] > 1:
+            want[d, : inner[0] - 1] = want[s, : inner[0] - 1]
+        else:
+            want[d] = want[s]
+        if not same(pool, want):
+            errs.append(f"seed {seed} mode pool/{tag} run {it}: rows={rows} inner={inner} {dtype} n={n} cols={cols}")
+            return False
+        return True
+
+    def fresh_pool():
+        return (torch.randn((rows,) + inner, device=DEV) * 50).to(dtype)
+
+    try:
+        eng = ce.Engine()
+        pool = fresh_pool()
+        for it in range(calls):  # explicit: exploration runs every candidate
+            d, s = indices()
+            before = pool.clone()
+            eng.copy_(view(pool)[d], view(pool)[s])
+            torch.cuda.synchronize()
+            if not check("explicit", pool, before, d, s, it):
+                return errs
+        fr = eng.freeze()
+        for it in range(4):  # frozen: the same indices (the tensors it read)
+            before = pool.clone()
+            fr.run()
+            torch.cuda.synchronize()
+            if not check("freeze", pool, before, d, s, it):
+                return errs
+        step = eng.plan(lambda pool, d, s: eng.copy_(view(pool)[d], view(pool)[s]))
+        for it in range(calls):  # step plan: new index tensors every call
+            d, s = indices()
+            before = pool.clone()
+            step(pool, d, s)
+            torch.cuda.synchronize()
+            if not check("plan", pool, before, d, s, it):
+                return errs
+    except (ce.Unsupported, ce.NeedsMaterialize, ce.UnsafeCopy):
+        pass
+    except Exception as ex:
+        errs.append(f"seed {seed} mode pool: {type(ex).__name__}: {str(ex).splitlines()[0][:160]}")
     return errs
 
 

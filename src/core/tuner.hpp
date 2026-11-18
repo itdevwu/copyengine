@@ -95,6 +95,9 @@ class Tuner {
   Json dump() const;
   void load(const Json& profile);
   size_t size() const { return table_.size(); }
+  // Buckets per locked strategy, those still exploring, and the online
+  // re-checks' flips and reopens so far (stats()["locks"]).
+  Json lock_counts() const;
   const TunerConfig& config() const { return cfg_; }
 
   // The A/B rule, exposed for tests: paired samples (same index = same pair).

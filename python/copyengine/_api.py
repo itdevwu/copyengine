@@ -189,6 +189,10 @@ def _bandwidth(b) -> float:
     return b
 
 
+def _capturing() -> bool:
+    return torch is not None and torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+
+
 class _PerThread:
     """An Engine attribute each thread has its own of (its session, as in the C++
     engine): scope depth, held buffers, the interception of its open scope.
@@ -415,13 +419,15 @@ class Engine:
         d, s = view(dst, writable=True), view(src)
         sacc = broadcast_to(s.access, list(d.access.shape))
         stmt = _core.Stmt(d.access, sacc)
-        checked = False
+        checked = gather_first = False
         if isinstance(dst, Lazy) or isinstance(src, Lazy):
             # torch's equivalent (dst[ids] = src[ids2]) gathers first: where the two sides
             # may share bytes, so does copyengine (two passes through a temporary).
             ov = _core.Engine.stmt_overlap(s.endpoint, d.endpoint, stmt)
             if ov == 1 and _plan.overlap_checked_per_call():
                 checked = True  # a step plan's host indices: checked exactly before each replay
+            elif ov == 2 and fn in (None, _IDENTITY) and not _capturing():
+                gather_first = True  # GPU indices, rows of one layout within one pool: three kernels (else two passes)
             elif ov:
                 return self._copy_two_pass(dst, src, d, s, fn, ctx)
         with self._lock:
@@ -429,9 +435,17 @@ class Engine:
                 native = _lazy_payload(dst, src, fn)
             else:
                 native = (self._native, dst, src) if _same_bits(dst, src, fn) else None
-            self._e.copy_stmt(s.endpoint, d.endpoint, stmt, fn or _IDENTITY, ctx=ctx, stream=current_stream(d, s),
-                              native=native, overlap_checked=checked)
-            self._after(s.obj, d.obj, src, dst)  # a lazy side holds its device index tables
+            try:
+                self._e.copy_stmt(s.endpoint, d.endpoint, stmt, fn or _IDENTITY, ctx=ctx, stream=current_stream(d, s),
+                                  native=native, overlap_checked=checked, overlap_gather=gather_first)
+            except _core.Unsupported:
+                if not gather_first:
+                    raise
+                gather_first = None  # not rows of one layout: two passes
+            else:
+                self._after(s.obj, d.obj, src, dst)  # a lazy side holds its device index tables
+        if gather_first is None:
+            return self._copy_two_pass(dst, src, d, s, fn, ctx)
         return dst
 
     def _copy_two_pass(self, dst, src, d, s, fn, ctx):

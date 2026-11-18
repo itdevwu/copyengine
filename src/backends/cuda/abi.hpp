@@ -74,6 +74,27 @@ struct alignas(128) TmaBlock {
 };
 static_assert(sizeof(TmaBlock) == 384 && offsetof(TmaBlock, dst) == 128 && offsetof(TmaBlock, width) == 256);
 
+// Rows copied within one pool whose indices may overlap (pool[d] = pool[s],
+// torch's gather-first result), in three kernels on one stream: ce_ov_mark
+// marks the destination rows, ce_ov_stage copies the source rows that are
+// also destination rows to staging, ce_ov_scatter writes every destination
+// row from staging or the pool. Marks are epochs: the current one lives in
+// device memory (epoch[0]; epoch[1] is the next, written by ce_ov_stage and
+// made current by ce_ov_scatter), so a CUDA graph replay advances it too.
+// Rows are row_bytes contiguous bytes, row_stride bytes apart from `pool`.
+struct RowsOv {
+  uint64_t pool;
+  int64_t row_stride, row_bytes;
+  uint64_t stab, dtab;  // int64 indices, sstep / dstep apart
+  int64_t sstep, dstep;
+  int64_t n, rows;      // indices per side; every index lies in [0, rows)
+  uint64_t marks;       // uint64 per row
+  uint64_t epoch;       // two uint64 words
+  uint64_t staging;     // n * row_bytes
+  uint64_t err;         // set (and the element skipped) for an index outside [0, rows)
+};
+static_assert(sizeof(RowsOv) == 104 && offsetof(RowsOv, marks) == 72 && offsetof(RowsOv, err) == 96);
+
 // Every size and offset above, and the tile descriptor's, in one number.
 #if defined(__CUDACC__)
 __host__ __device__
@@ -85,7 +106,8 @@ constexpr uint64_t layout_fingerprint() {
                         offsetof(TmaBlock, width), alignof(TmaBlock),       sizeof(cv::TileK),
                         offsetof(cv::TileK, rows), offsetof(cv::TileK, g),  offsetof(cv::TileK, xi),
                         offsetof(cv::TileK, err), kPutWords,                kBulkBufs,
-                        kTmaBox};
+                        kTmaBox,                sizeof(RowsOv),             offsetof(RowsOv, marks),
+                        offsetof(RowsOv, err)};
   uint64_t h = 1469598103934665603ull;
   for (uint64_t x : v) h = (h ^ x) * 1099511628211ull;
   return h;

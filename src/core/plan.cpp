@@ -64,7 +64,7 @@ Hash128 fingerprint(const Op& op) {
   h.add(std::bit_cast<uint32_t>(op.fn.lo));
   h.add(std::bit_cast<uint32_t>(op.fn.hi));
   h.add(op.ctx);
-  h.add(uint64_t{op.form != nullptr});
+  h.add(uint64_t{op.form != nullptr} | (uint64_t{op.rows_ov} << 1));
   // Both sides' allocations: their boundaries cut runs (build_plan), so the
   // same addresses split into other allocations are another plan.
   h.add(static_cast<uint64_t>(op.src_lo));
@@ -317,6 +317,29 @@ std::vector<int> waves(const std::vector<Op>& ops) {
 
 // ---- planning --------------------------------------------------------------------
 
+std::optional<RowsLayout> rows_layout(const Form& f) {
+  const int t = f.stab_dim;
+  if (t < 0 || f.dtab_dim != t || f.stab_host || f.dtab_host || f.sdt != f.ddt) return std::nullopt;
+  if (f.s_base != f.d_base || f.sbound != f.dbound || f.ss != f.ds || f.sbound <= 0) return std::nullopt;
+  const i64 item = static_cast<i64>(itemsize(f.sdt));
+  // The other dimensions, innermost first: one dense run.
+  std::vector<std::pair<i64, i64>> rest;  // (stride, extent)
+  for (int k = 0; k < f.rank; ++k)
+    if (k != t && f.shape[k] > 1) rest.emplace_back(f.ss[k], f.shape[k]);
+  std::sort(rest.begin(), rest.end());
+  i64 width = 1;
+  for (const auto& [stride, extent] : rest) {
+    if (stride != width) return std::nullopt;
+    width *= extent;
+  }
+  const i64 stride = f.ss[t];
+  if (stride < width || f.shape[t] <= 0) return std::nullopt;  // rows apart (and none read backwards)
+  RowsLayout r;
+  r.pool = f.s_base * item, r.row_stride = stride * item, r.row_bytes = width * item;
+  r.n = f.shape[t], r.rows = f.sbound;
+  return r;
+}
+
 Plan build_plan(const std::vector<Op>& ops) {
   Plan plan;
   if (ops.empty()) return plan;
@@ -341,13 +364,14 @@ Plan build_plan(const std::vector<Op>& ops) {
       auto it = std::find_if(groups.begin(), groups.end(), [&](const Group& g) {
         const bool g_opaque = !g.ops.empty() && ops[g.ops[0]].opaque && !ops[g.ops[0]].tile;
         return g.src == op.src && g.dst == op.dst && g.fn == op.fn && g.ctx == op.ctx && g.bandwidth == op.bandwidth &&
-               same_tile(g) && g_opaque == opaque_copy;
+               same_tile(g) && g_opaque == opaque_copy && g.rows_ov == op.rows_ov;
       });
       if (it == groups.end()) {
         groups.push_back({});
         it = groups.end() - 1;
         it->src = op.src, it->dst = op.dst, it->fn = op.fn, it->ctx = op.ctx, it->wave = lv;
         it->bandwidth = op.bandwidth;
+        it->rows_ov = op.rows_ov;
       }
       it->ops.push_back(k);
       it->runs.append(op.runs());
@@ -402,7 +426,7 @@ std::string bucket_key(const Group& g, int nops) {
   std::string fn = g.fn.identity() ? "id" : (std::string("aff") + (g.fn.round ? "r" : "") + (g.fn.clamp ? "c" : ""));
   return side(g.src) + ">" + side(g.dst) + "|" + fn + "|b" + std::to_string(lg(g.bytes())) + "|n" +
          std::to_string(lg(static_cast<int64_t>(g.rects.size()))) + "|o" + std::to_string(lg(nops)) +
-         (g.rects.has_2d() ? "|2d" : "") + (g.tiles ? "|tile" : g.opaque() ? "|indexed" : "") +
+         (g.rects.has_2d() ? "|2d" : "") + (g.tiles ? "|tile" : g.rows_ov ? "|rows" : g.opaque() ? "|indexed" : "") +
          (g.ctx.empty() ? "" : "|" + g.ctx) + (g.bandwidth > 0 ? "|paced" : "");
 }
 

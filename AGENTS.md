@@ -10,9 +10,10 @@
   (namespace `ce`): IR and lowering (`ir`), planning and dependencies (`plan`),
   tuner, engine, probe. It must not include torch or CUDA headers.
 - `src/backends/host`: host executor and the conversion table.
-- `src/backends/cuda`: driver loader (dlopen + `cuGetProcAddress` at the
-  header's `CUDA_VERSION`), probe, executor, and `kernels.cu` (AOT fatbin,
-  embedded by `cmake/embed.cmake`).
+- `src/backends/cuda`: driver loader (dlopen; each entry point typed by
+  `cudaTypedefs.h`'s versioned `PFN_cuX_vNNNNN` and fetched with
+  `cuGetProcAddress` at exactly that version), probe, executor, and
+  `kernels.cu` (AOT fatbin, embedded by `cmake/embed.cmake`).
 - Everything the CUDA executor writes for the kernels to read is defined once,
   in `src/backends/cuda/abi.hpp` (and `src/core/tile.hpp`), included by both:
   fixed-width types, device addresses as `uint64_t`, driver objects (a
@@ -93,6 +94,10 @@
   Tests check the ordering, not just the data.
 - Intercepted `copy_` keeps the caller's `non_blocking` semantics; explicit
   `ce.copy_` returns with host-side copies complete.
+- While copyengine runs the framework's own copy on a thread (a native, the
+  peer enabler's copy), nothing is intercepted on that thread
+  (`FrameworkCopy`): the shim and the Python mode let it through, and an
+  engine handed a copy then runs it as its native at once.
 
 ## Review checklist
 
@@ -103,7 +108,8 @@ it merges, against these:
 1. **The property itself.** A decision checks what it depends on, not a
    proxy: the same storage, not the same Python object; mapped for kernels at
    that address, not pinned; every row start aligned (base and outer strides),
-   not the base; the values, not the address that held them.
+   not the base; the values, not the address that held them; the prototype
+   the driver returns at the version asked for, not cuda.h's of that name.
 2. **Where and when memory is touched.** For every access: on which stream,
    or on the CPU, at call time or at execution time; and what orders it after
    the work that writes those bytes. torch's own copy is stream-ordered only
@@ -120,6 +126,10 @@ it merges, against these:
    baseline is offered only where its bits equal copyengine's.
 7. **Bounds.** Narrowing conversions, overflow, zero and empty sizes, grid and
    parameter limits.
+8. **Callbacks.** Whatever the engine calls out to (natives, the framework's
+   allocator, stream provider and peer enabler, Python callables) may call
+   back into an engine, on this thread or another: say what happens then
+   (interception, the engine lock, the GIL, a flush in progress).
 
 ## Scope
 
@@ -132,16 +142,36 @@ it merges, against these:
 ## Verification
 
 - `just test` builds the C++ library, runs ctest, installs the Python package
-  and runs pytest (CUDA tests skip without a GPU).
-- GPU work runs inside `just docker-shell`.
-- `python bench/bench_torch.py` compares against torch on a GPU.
-- `just tidy` (clang-tidy, also in CI), `just fuzz` (random copy programs
-  against torch, every strategy forced) and `just sanitize`
-  (compute-sanitizer) run before a pre-release; a feature merges after a
-  review against the checklist above.
-- Other GPU generations and multi-GPU machines are reached through
-  `tests/fuzz/kit.py` (one JSON report, run by whoever has the machine); a
-  pre-release is announced with the kit results it has.
+  and runs pytest (CUDA tests skip without a GPU). GPU work runs inside
+  `just docker-shell`; commands run in a container never change the
+  repository's git state (no stash, checkout or reset inside them).
+- Every change: `just test` on a GPU. A dev pre-release, before it is tagged:
+  `just test`, `just test-gpu-matrix` (`CE_SHIM=0`, `CE_TORCH_ALLOCATOR=0`,
+  expandable segments), ctest with `CE_WERROR=ON`, `just tidy` (also in CI),
+  and the kit's fuzz over every mode; `just sanitize` (compute-sanitizer)
+  before a release candidate, on native Linux. `python bench/bench_torch.py`
+  (and `bench_p2p.py` with two GPUs) compares against torch.
+- Paths one machine cannot reach (another GPU generation, several GPUs,
+  another CUDA major) still get what one GPU can check: the build checks
+  every driver entry point's prototype (versioned typedefs), and each entry
+  point and frontend hook one GPU can call is called by a test that runs
+  there (`tests/cpp/test_driver.cpp`); the rest is reached through
+  `tests/fuzz/kit.py` (one JSON report, run by whoever has the machine; it
+  runs `tests/python/test_peer.py` with two GPUs).
+  A pre-release is announced with the kit results it has and names the paths
+  only the kit ran.
+- A test that fails once is a finding, not noise. Reproduce it (in a loop,
+  within the full suite), make its assertion say what happened (the engine's
+  `stats()` in the message), and check that its premises hold (a plan already
+  built, a GPU still busy). New concurrency tests and fixes of fuzzer seeds
+  pass repeatedly (tens of runs) before they count.
+- A fuzzer failure: reproduce it with `python tests/fuzz/fuzz.py <seed> 1
+  <mode>`, then bisect with switches (strategies forced, a synchronization
+  after every step) to tell ordering from timing. To observe the engine
+  without changing it, build with `CE_NOSTRIP=ON` and attach uprobes to its
+  functions (perf, eBPF tools). Instrumentation added for a hunt is removed
+  before the commit; what it found becomes a deterministic test.
+- A feature merges after a review against the checklist above.
 
 ## Branches, commits and releases
 

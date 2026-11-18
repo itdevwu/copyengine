@@ -49,6 +49,6 @@ sanitize:
 
 # Random copy programs against torch in submission order, every strategy forced
 # and every mode (tests/fuzz/fuzz.py); one process per seed, failures printed.
-fuzz first="0" count="100" modes="forced,explicit,scope,freeze,plan,graph,threads":
+fuzz first="0" count="100" modes="forced,explicit,scope,freeze,plan,graph,threads,pool":
     SKBUILD_CMAKE_DEFINE="CE_CUDA_ARCHS={{cuda_archs}}" pip install --no-build-isolation . -q
     for s in $(seq {{first}} $(({{first}} + {{count}} - 1))); do timeout 600 python tests/fuzz/fuzz.py $s 1 {{modes}} 2>&1 | grep -E "^FAIL|Error" | head -3; done; echo "fuzzed seeds {{first}}..$(({{first}} + {{count}} - 1))"

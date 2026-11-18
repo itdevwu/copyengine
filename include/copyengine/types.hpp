@@ -152,6 +152,11 @@ struct Hints {
   // destination do not share bytes (a step plan with host indices,
   // Frozen::host_overlap): footprints that may overlap are not refused.
   bool overlap_checked = false;
+  // The copy has torch's gather-first result where its sides may share bytes
+  // (pool[d] = pool[s]): rows of one layout within one pool run as the
+  // overlap path (Op::rows_ov); anything else that may overlap is refused as
+  // unsupported (the frontend takes two passes instead).
+  bool overlap_gather = false;
 };
 
 }  // namespace ce

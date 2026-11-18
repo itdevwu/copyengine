@@ -2,7 +2,9 @@
 
 #include <dlfcn.h>
 
+#include <cstdlib>
 #include <map>
+#include <string>
 #include <mutex>
 
 namespace ce::cuda {
@@ -46,24 +48,24 @@ State load() {
     return st;
   }
 
-  auto fetch = [&](const char* name, void** out) -> std::string {
+  auto fetch = [&](const char* name, int version, void** out) -> std::string {
     CUdriverProcAddressQueryResult status{};
-    CUresult r = gpa(name, out, CUDA_VERSION, CU_GET_PROC_ADDRESS_DEFAULT, &status);
+    CUresult r = gpa(name, out, version, CU_GET_PROC_ADDRESS_DEFAULT, &status);
     if (r == CUDA_SUCCESS && status == CU_GET_PROC_ADDRESS_SUCCESS && *out) return {};
     *out = nullptr;
     return status_text(r, status);
   };
 
-#define CE_CUDA_FETCH_REQUIRED(name)                                              \
-  if (auto why = fetch(#name, reinterpret_cast<void**>(&st.drv.name)); !why.empty()) { \
+#define CE_CUDA_FETCH_REQUIRED(name, version)                                            \
+  if (auto why = fetch(#name, version, reinterpret_cast<void**>(&st.drv.name)); !why.empty()) { \
     st.error = std::string(#name) + ": " + why;                                        \
     return st;                                                                         \
   }
   CE_CUDA_REQUIRED(CE_CUDA_FETCH_REQUIRED)
 #undef CE_CUDA_FETCH_REQUIRED
 
-#define CE_CUDA_FETCH_OPTIONAL(name)                                              \
-  if (auto why = fetch(#name, reinterpret_cast<void**>(&st.drv.name)); !why.empty()) { \
+#define CE_CUDA_FETCH_OPTIONAL(name, version)                                            \
+  if (auto why = fetch(#name, version, reinterpret_cast<void**>(&st.drv.name)); !why.empty()) { \
     st.missing[#name] = why;                                                           \
   }
   CE_CUDA_OPTIONAL(CE_CUDA_FETCH_OPTIONAL)

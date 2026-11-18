@@ -58,16 +58,18 @@ void set_peer_enabler(PeerEnabler f) { g_peers.store(f); }
 PeerEnabler peer_enabler() { return g_peers.load(); }
 
 namespace {
-thread_local bool t_enabling_peer = false;
+thread_local bool t_framework_copy = false;
 }
+FrameworkCopy::FrameworkCopy() : was_(t_framework_copy) { t_framework_copy = true; }
+FrameworkCopy::~FrameworkCopy() { t_framework_copy = was_; }
+bool framework_copy_running() { return t_framework_copy; }
+
 void run_peer_enabler(int a, int b) {
   const PeerEnabler f = peer_enabler();
   if (!f) return;
-  t_enabling_peer = true;
+  const FrameworkCopy fc;
   f(a, b);  // noexcept
-  t_enabling_peer = false;
 }
-bool enabling_peer() { return t_enabling_peer; }
 
 void set_stream_provider(StreamProvider f) { g_streams.store(f); }
 StreamProvider stream_provider() { return g_streams.load(); }
@@ -201,6 +203,7 @@ const FrontendApi* frontend_api() {
     a.set_device_allocator = &set_device_allocator;
     a.set_stream_provider = &set_stream_provider;
     a.set_peer_enabler = &set_peer_enabler;
+    a.framework_copy_running = &framework_copy_running;
     a.copy_indexed = &copy_indexed;
     a.shared_engine = &shared_engine;
     a.tile = &tile;

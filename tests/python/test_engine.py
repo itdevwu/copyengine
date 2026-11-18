@@ -850,3 +850,14 @@ def test_site_decisions_travel_with_the_profile():
 
 
 SITE = (test_site_decisions_travel_with_the_profile.__code__, 1)
+
+
+def test_stats_count_buckets_by_locked_strategy():
+    torch = pytest.importorskip("torch")
+    e = ce.Engine()
+    src, dst = np.arange(4096, dtype=np.float32), np.zeros(2048, dtype=np.float32)
+    for _ in range(80):
+        e.copy_(dst, src[::2])
+    locks = e.stats()["locks"]
+    assert set(locks) == {"locked", "exploring", "flips", "reopens"}
+    assert sum(locks["locked"].values()) + locks["exploring"] == e.stats()["buckets"]

@@ -432,8 +432,10 @@ void tile_op(bool quantize, Tensor x, Tensor q, Tensor scale, const std::optiona
              const std::optional<Tensor>& index, int64_t engine) {
   STD_TORCH_CHECK(g_api && g_api->tile, "[copyengine:3] copyengine._torch is not bound to copyengine._core");
   const int64_t lead_dims = x.dim() - (bh > 1 ? 2 : 1);  // box units: rows of boxes are a leading dimension too
-  STD_TORCH_CHECK(lead_dims >= (bh > 1 ? 0 : 1) && lead_dims + (bh > 1 ? 1 : 0) <= 3,
-                  "[copyengine:0] x needs one to three leading dimensions");
+  // As the eager API: none (one row) up to three; an index selects along the first.
+  STD_TORCH_CHECK(lead_dims >= 0 && lead_dims + (bh > 1 ? 1 : 0) <= 3,
+                  "[copyengine:0] at most three leading dimensions", bh > 1 ? " (block= needs two dimensions)" : "");
+  STD_TORCH_CHECK(lead_dims >= 1 || (!x_index && !index), "[copyengine:0] an index needs a leading dimension");
   const int64_t D = x.size(x.dim() - 1), g = unit_of(fmt, group);
   STD_TORCH_CHECK(g > 0 && D % g == 0, "[copyengine:0] the last dimension is not a multiple of the unit size");
   ce::TileSpec t;

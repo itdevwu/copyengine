@@ -537,6 +537,27 @@ def test_intercepted_non_blocking_keeps_pinned_sources_alive(intercept):
     _reuse_pinned_after_free(start, later, info=lambda: {k: e.stats()[k] for k in ("last", "kept", "sessions")})
 
 
+@pytest.mark.parametrize("scoped", [False, True])
+def test_copies_at_new_addresses_each_call_never_wait_for_the_gpu(scoped):
+    # A lone small copy whose tensors are new every call misses the plan cache
+    # each time: its setup (tables made resident, allocated on the default
+    # stream, whose handle 0 is a stream and not "the host") must not wait.
+    e = ce.Engine(prior_only=True)
+    pairs = [(torch.zeros(4, device=DEV), torch.full((4,), float(i), device=DEV)) for i in range(40)]
+    e.copy_(*pairs[0])  # the device and the kernels set up once
+    torch.cuda.synchronize()
+    torch.cuda._sleep(2_000_000_000)
+    for d, s in pairs[1:]:
+        if scoped:
+            with e.scope():
+                d.copy_(s)
+        else:
+            e.copy_(d, s)
+    assert not torch.cuda.current_stream().query(), f"a call waited for the GPU: {e.stats()['last']}"
+    torch.cuda.synchronize()
+    assert all(torch.equal(d, s) for d, s in pairs)
+
+
 def test_sparse_tensors_take_the_general_path():
     dense = torch.eye(8)
     sparse = dense.to_sparse()

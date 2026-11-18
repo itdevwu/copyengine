@@ -169,7 +169,14 @@ const char* refusal(int rc) {
   }
 }
 
+// Inside copyengine's run of torch's own copy (a native): not intercepted.
+bool passing() { return g_api->framework_copy_running && g_api->framework_copy_running(); }
+
 at::Tensor& intercepted_copy(c10::DispatchKeySet ks, at::Tensor& self, const at::Tensor& src, bool non_blocking) {
+  if (passing()) {
+    c10::impl::ExcludeDispatchKeyGuard guard(kKey);
+    return copy_op().redispatch(ks & kAfter, self, src, non_blocking);
+  }
   ce::Engine* e = engine();
   if (!e || self.numel() == 0) return native_copy(ks, self, src, non_blocking);
   if (const char* why = decline_reason(self, src)) {
@@ -214,7 +221,7 @@ void add_tensors(const c10::IValue& v, std::vector<at::Tensor>& out) {
 // Every other op inside a scope: if copies are queued, order it after the
 // ones whose memory it reads or writes, then hand it to torch.
 void fallback(const c10::OperatorHandle& op, c10::DispatchKeySet ks, torch::jit::Stack* stack) {
-  ce::Engine* e = engine();
+  ce::Engine* e = passing() ? nullptr : engine();  // copyengine's run of torch's own copy: no fence
   if (e && g_api->queued(*e) > 0) {
     const auto& args = op.schema().arguments();
     const size_t n = args.size(), base = stack->size() - n;

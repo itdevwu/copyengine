@@ -6,6 +6,34 @@ change incompatibly only in a new minor (0.x) or major release.
 
 ## Unreleased
 
+- Block copies within one pool by GPU indices that may overlap
+  (`ce.copy_(ce.lazy(pool)[d], ce.lazy(pool)[s])`, rows of one layout) run as
+  three kernels: mark the destination rows, stage only the source rows that
+  are also destination rows, scatter; before, two full passes through a
+  temporary. Fuzzed by a `pool` mode (explicit, frozen and step-plan runs).
+- No host wait on the hot path: tables made resident for a new plan are
+  written on the caller's stream or uploaded on copyengine's side stream with
+  an event their users wait for (before, each new plan waited; with a copy
+  at new addresses every call, every call did); copyengine's buffers
+  allocated on the default stream (handle 0) no longer wait for the device.
+  A queue flushed because work arrives on another stream now orders that
+  stream after the flushed copies too (it waited only for earlier work).
+- Inside torch.compile regions, `dst = fn(src)` copies are measured against
+  Inductor's code for the same steps (taken only where its bits equal the
+  catalog's on edge values), and copies with a host side are measured with
+  pinned and pageable memory (the trace cannot tell them apart): copyengine is
+  taken only if it wins with both.
+- `stats()["locks"]`: buckets per locked strategy, those still exploring, and
+  the online re-checks' flips and reopens. A lazy reshape that merges
+  dimensions whose strides nest keeps them strided where another dimension
+  has an index table (before: a table of every offset). Quantizing a
+  one-dimensional `x` works inside torch.compile regions as it does eagerly.
+- torch's own copy run by copyengine inside an intercepting scope is no
+  longer intercepted again (it was queued instead of done: a later copy could
+  run first; fuzzer seed 1963). The CUDA driver's entry points are fetched at
+  the version of the prototype they are called with (cuStreamGetCtx's newer
+  version takes three arguments: copies between two GPUs crashed).
+
 - Copies between two GPUs are ordered as torch's: on the source GPU's
   current stream, after both GPUs' queued work and before their later work
   (before: only the destination's stream, and a default stream could name

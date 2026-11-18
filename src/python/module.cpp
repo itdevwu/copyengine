@@ -365,14 +365,17 @@ NB_MODULE(_core, m) {
       .def_static("stmt_overlap", &ce::Engine::stmt_overlap, "src"_a, "dst"_a, "stmt"_a)
       .def("copy_stmt", [make_hints](ce::Engine& e, const ce::Endpoint& src, const ce::Endpoint& dst, const ce::Stmt& stmt,
                                      const ce::Elementwise& fn, nb::handle valid_start, nb::handle valid_len,
-                                     const std::string& ctx, uintptr_t stream, nb::handle native, bool overlap_checked) {
+                                     const std::string& ctx, uintptr_t stream, nb::handle native, bool overlap_checked,
+                                     bool overlap_gather) {
         ce::Hints h = make_hints(valid_start, valid_len, ctx);
         h.native = py_payload(native);
         h.overlap_checked = overlap_checked;
+        h.overlap_gather = overlap_gather;
         nb::gil_scoped_release release;
         e.copy(src, dst, stmt, fn, h, stream);
       }, "src"_a, "dst"_a, "stmt"_a, "fn"_a, "valid_start"_a = nb::none(), "valid_len"_a = nb::none(),
-         "ctx"_a = "", "stream"_a = 0, "native"_a = nb::none(), "overlap_checked"_a = false)
+         "ctx"_a = "", "stream"_a = 0, "native"_a = nb::none(), "overlap_checked"_a = false,
+         "overlap_gather"_a = false)
       .def("tile", [](ce::Engine& e, const ce::TileSpec& spec, const std::string& ctx, uintptr_t stream,
                       nb::handle native) {
         ce::Hints h;
@@ -483,6 +486,8 @@ NB_MODULE(_core, m) {
       }
     });
   }, "enabler"_a);
+  // Whether copyengine runs the framework's own copy on this thread (interception lets it through).
+  m.def("_framework_copy_running", &ce::framework_copy_running);
   // Address of the FrontendApi table handed to copyengine._torch.
   m.def("_frontend_api", [] { return reinterpret_cast<uintptr_t>(ce::frontend_api()); });
 

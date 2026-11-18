@@ -356,6 +356,20 @@ bool Tuner::locked(const std::string& bucket) const {
   return it != table_.end() && it->second.locked >= 0;
 }
 
+Json Tuner::lock_counts() const {
+  std::array<int64_t, kNumStrategies> n{};
+  int64_t exploring = 0, flips = 0, reopens = 0;
+  for (const auto& [bucket, e] : table_) {
+    if (e.locked >= 0) ++n[static_cast<size_t>(e.locked)];
+    else ++exploring;
+    flips += e.flips, reopens += e.reopens;
+  }
+  Json locked = Json::object();
+  for (int i = 0; i < kNumStrategies; ++i)
+    if (n[static_cast<size_t>(i)]) locked.set(std::string(strategy_name(static_cast<Strategy>(i))), n[static_cast<size_t>(i)]);
+  return Json::object().set("locked", std::move(locked)).set("exploring", exploring).set("flips", flips).set("reopens", reopens);
+}
+
 Json Tuner::dump() const {
   std::vector<std::string> keys;
   for (auto& [k, _] : table_) keys.push_back(k);

@@ -5,6 +5,7 @@
 #include <array>
 #include <cstring>
 #include <map>
+#include <optional>
 #include <set>
 #include <memory>
 #include <mutex>
@@ -303,6 +304,10 @@ class CudaExecutor final : public Executor {
                                     ") or compact host tensors for staging");
       return c;
     }
+    if (g.rows_ov) {  // overlapping rows within one pool: the three kernels (RowsOv)
+      if (!s.kernels) fail(Errc::unsupported, "overlapping indexed copies need the copy kernels: " + s.kernel_error);
+      return {Strategy::fused};
+    }
     if (g.opaque()) {  // indices read at run time: the statement kernel, or (host tables) DMA expanded per run
       std::vector<Strategy> c;
       if (g.src.device.kind == DeviceKind::cuda && g.dst.device.kind == DeviceKind::cuda &&
@@ -376,7 +381,7 @@ class CudaExecutor final : public Executor {
     return st != CU_STREAM_CAPTURE_STATUS_NONE;
   }
 
-  bool capture_safe(Strategy strat, const Group& g) override {
+  bool capture_safe(Strategy strat, const Group& g, uintptr_t stream) override {
     const int di = device_of(g);
     if (di < 0 || di >= static_cast<int>(devs_.size()) || !devs_[di].init) return false;  // first use sets up the device
     const bool src_ok = g.src.device.kind == DeviceKind::cuda || g.src.pinned;
@@ -395,6 +400,7 @@ class CudaExecutor final : public Executor {
       }
       case Strategy::fused: {
         if (!on_device || !devs_[di].kernels) return false;
+        if (g.rows_ov) return rows_ov_resident(devs_[di], g, reinterpret_cast<CUstream>(stream));
         if (g.opaque()) fused_plan(g);  // host-only planning: fine under capture
         const auto& slot = g.exec_cache[static_cast<int>(Strategy::fused)];
         if (!slot) return false;
@@ -641,9 +647,10 @@ class CudaExecutor final : public Executor {
   };
 
   struct Lane {
-    CUstream caller{};  // the stream it serves (null: not yet assigned)
+    CUstream caller{};  // the stream it serves, once `assigned` (0, the legacy stream, is a stream like any)
     CUstream sm{};
     CUevent in{}, out{};
+    bool assigned = false;
   };
 
   struct Staging {
@@ -683,6 +690,18 @@ class CudaExecutor final : public Executor {
     // copies on one stream never wait for another stream's use of it.
     std::vector<Staging> stagings;
     uint64_t staging_clock = 0;
+    // Overlapping row copies (RowsOv): marks, epoch words and staging per caller
+    // stream (kLanes, then the least recently used, taken over in order).
+    struct OvBuf {
+      CUstream caller{};
+      bool assigned = false;  // caller set (stream 0 is a stream)
+      DevMem marks, epoch, staging;
+      size_t mark_rows = 0, staging_bytes = 0;
+      CUevent done{};
+      bool used = false;
+      uint64_t last = 0;
+    };
+    std::vector<OvBuf> ovs;
     std::array<Bounce, 2> bounce;
     // SM limit (EngineOptions::max_sms)
     CUgreenCtx green{};
@@ -731,16 +750,19 @@ class CudaExecutor final : public Executor {
   // whose kernels on m.stream still read or write it. So `use`, the stream
   // that touches it first, waits for m.stream first (null: the host waits;
   // setup only). The mirror of dev_free's ordering.
-  DevMem dev_alloc(Dev& s, size_t bytes, const char* what, CUstream use = nullptr) {
+  // `use`: the stream that first uses the memory (it waits for the allocation
+  // stream). None: the host uses it first (it waits). Stream 0 is a stream,
+  // the device's legacy one, not "none".
+  DevMem dev_alloc(Dev& s, size_t bytes, const char* what, std::optional<CUstream> use = std::nullopt) {
     if (const DeviceAllocator* a = device_allocator()) {
       DevMem m;
       m.ptr = static_cast<CUdeviceptr>(a->alloc(s.index, bytes, &m.handle, &m.stream));
       if (!m.ptr) fail(Errc::backend, std::string(what) + ": out of memory (" + a->name + " allocator, " +
                                           std::to_string(bytes) + " bytes)");
-      if (reinterpret_cast<uintptr_t>(use) != m.stream || !use) {
+      if (!use || reinterpret_cast<uintptr_t>(*use) != m.stream) {
         if (!s.ev_alloc) check(d_->cuEventCreate(&s.ev_alloc, CU_EVENT_DISABLE_TIMING), "cuEventCreate");
         check(d_->cuEventRecord(s.ev_alloc, reinterpret_cast<CUstream>(m.stream)), "cuEventRecord");
-        if (use) check(d_->cuStreamWaitEvent(use, s.ev_alloc, 0), "cuStreamWaitEvent");
+        if (use) check(d_->cuStreamWaitEvent(*use, s.ev_alloc, 0), "cuStreamWaitEvent");
         else check(d_->cuEventSynchronize(s.ev_alloc), "cuEventSynchronize");
       }
       return m;
@@ -1347,12 +1369,12 @@ class CudaExecutor final : public Executor {
   // spare, then one shared by hash (ordered, still correct).
   Lane& lane_for(Dev& s, CUstream st) {
     for (Lane& l : s.lanes)
-      if (l.caller == st) return l;
+      if (l.assigned && l.caller == st) return l;
     for (Lane& l : s.lanes)
-      if (!l.caller) return l.caller = st, l;
+      if (!l.assigned) return l.caller = st, l.assigned = true, l;
     if (s.lanes.size() < kLanes) {
       Lane l;
-      l.caller = st;
+      l.caller = st, l.assigned = true;
       check(d_->cuGreenCtxStreamCreate(&l.sm, s.green, CU_STREAM_NON_BLOCKING, 0), "cuGreenCtxStreamCreate");
       check(d_->cuEventCreate(&l.in, CU_EVENT_DISABLE_TIMING), "cuEventCreate");
       check(d_->cuEventCreate(&l.out, CU_EVENT_DISABLE_TIMING), "cuEventCreate");
@@ -1428,7 +1450,7 @@ class CudaExecutor final : public Executor {
       check(d_->cuEventCreate(&s.sm_in, CU_EVENT_DISABLE_TIMING), "cuEventCreate");
       check(d_->cuEventCreate(&s.sm_out, CU_EVENT_DISABLE_TIMING), "cuEventCreate");
       s.grid_cap = 0;
-      s.lanes.push_back({nullptr, s.sm_stream, s.sm_in, s.sm_out});
+      s.lanes.push_back({nullptr, s.sm_stream, s.sm_in, s.sm_out, false});
       s.sm_limit = "hard: green context of " + std::to_string(granted) + " SMs (verified)";
     } catch (const std::exception& e) {
       if (s.sm_stream) d_->cuStreamDestroy(s.sm_stream);
@@ -1447,12 +1469,16 @@ class CudaExecutor final : public Executor {
     CUdeviceptr ptr = 0;
     size_t count = 0;
     std::weak_ptr<int> alive;  // the executor
+    // Recorded after the upload (on the device's side stream) until it is seen
+    // complete: a stream using the table first waits for it (use()).
+    mutable CUevent ready{};
     ~DevTable() {
-      if (!mem.ptr || alive.expired()) return;
+      if (alive.expired()) return;
       try {  // a destructor must not throw (std::terminate): after a sticky CUDA error the push fails
         Dev& s = owner->devs_[device];
         Push push(*owner->d_, s.ctx);
-        owner->dev_free(s, mem);
+        if (ready) owner->d_->cuEventDestroy(ready);
+        if (mem.ptr) owner->dev_free(s, mem);
       } catch (...) {  // NOLINT(bugprone-empty-catch): the memory is lost with the context
       }
     }
@@ -1570,11 +1596,11 @@ class CudaExecutor final : public Executor {
   static constexpr int kBulkBlocksPerSm = 8;
   int64_t bulk(Dev& s, const Group& g, CUstream st) {
     auto& slot = g.exec_cache[static_cast<int>(Strategy::bulk)];
-    if (!slot) slot = resident(s, chunks_of(g));
+    if (!slot) slot = resident(s, chunks_of(g), st);
     const auto& t = *static_cast<DevTable*>(slot.get());
     if (t.count == 0) return 0;
     CUfunction f = function(s, "ce_bytes_bulk");
-    CUdeviceptr table = t.ptr;
+    CUdeviceptr table = use(s, t, st);
     int n = static_cast<int>(t.count);
     long long zero = 0;
     int seg = s.bulk_seg;
@@ -1642,11 +1668,11 @@ class CudaExecutor final : public Executor {
     if (!slot) {
       const std::vector<TmaBlock> v = tma_blocks(g.rects);
       if (v.empty()) fail(Errc::backend, "cuTensorMapEncodeTiled refused a block");
-      slot = resident(s, v);
+      slot = resident(s, v, st);
     }
     const auto& t = *static_cast<DevTable*>(slot.get());
     CUfunction f = function(s, "ce_bytes_tma2d");
-    CUdeviceptr table = t.ptr;
+    CUdeviceptr table = use(s, t, st);
     int n = static_cast<int>(t.count);
     void* args[] = {&table, &n};
     run_kernel(s, f, {static_cast<unsigned>(std::min<size_t>(t.count, 1 << 16)), 1, 1}, {32, 1, 1}, args, st,
@@ -1719,9 +1745,9 @@ class CudaExecutor final : public Executor {
       if (!x.table) {
         std::vector<cv::TileK> v;
         for (int k : g.ops) v.push_back(*ops[k].tile);
-        x.table = resident(s, v);
+        x.table = resident(s, v, st);
       }
-      table = static_cast<DevTable*>(x.table.get())->ptr;
+      table = use(s, *static_cast<DevTable*>(x.table.get()), st);
     } else {
       std::vector<unsigned long long> vals;  // host index values first, then the TileKs
       std::vector<std::pair<size_t, size_t>> at;
@@ -2135,16 +2161,52 @@ class CudaExecutor final : public Executor {
 
   // Built once, when a group first runs a strategy (planning, not the hot path).
   template <class T>
-  std::shared_ptr<DevTable> resident(Dev& s, const std::vector<T>& v) {
+  std::shared_ptr<DevTable> resident(Dev& s, const std::vector<T>& v, CUstream st) {
     auto t = std::make_shared<DevTable>();
     t->owner = this, t->device = s.index, t->alive = alive_, t->count = v.size();
     if (v.empty()) return t;
-    const size_t bytes = v.size() * sizeof(T);
+    const size_t bytes = v.size() * sizeof(T), words = (bytes + 7) / 8;
+    if (words <= 2 * static_cast<size_t>(kPutWords) && s.kernels) {
+      // Small (a lone copy planned anew each call): written on `st` itself
+      // through kernel parameters, in order with the work that reads it.
+      t->mem = dev_alloc(s, words * 8, "copy table", st);
+      t->ptr = t->mem.ptr;
+      std::vector<unsigned long long> w(words, 0);
+      std::memcpy(w.data(), v.data(), bytes);
+      put_words(s, t->ptr, w.data(), words, st);
+      // Kept for later calls, maybe on other streams: they wait for these writes.
+      check(d_->cuEventCreate(&t->ready, CU_EVENT_DISABLE_TIMING), "cuEventCreate");
+      check(d_->cuEventRecord(t->ready, st), "cuEventRecord");
+      return t;
+    }
     t->mem = dev_alloc(s, bytes, "copy table", s.side);
     t->ptr = t->mem.ptr;
+    // From pageable memory: the driver has copied `v` out when this returns,
+    // so nothing waits here; streams that use the table wait for `ready`.
     check(d_->cuMemcpyHtoDAsync(t->ptr, v.data(), bytes, s.side), "cuMemcpyHtoDAsync");
-    check(d_->cuStreamSynchronize(s.side), "cuStreamSynchronize");
+    check(d_->cuEventCreate(&t->ready, CU_EVENT_DISABLE_TIMING), "cuEventCreate");
+    check(d_->cuEventRecord(t->ready, s.side), "cuEventRecord");
     return t;
+  }
+
+  // The table's device address, for work on `st`: ordered after its upload.
+  CUdeviceptr use(Dev& s, const DevTable& t, CUstream st) {
+    if (!t.ready) return t.ptr;
+    const CUresult q = d_->cuEventQuery(t.ready);
+    if (q == CUDA_SUCCESS) {
+      d_->cuEventDestroy(t.ready);
+      t.ready = nullptr;
+    } else if (q == CUDA_ERROR_NOT_READY) {
+      if (capturing(reinterpret_cast<uintptr_t>(st))) {
+        check(d_->cuEventSynchronize(t.ready), "cuEventSynchronize");  // a capture cannot wait for outside work
+      } else {
+        check(d_->cuStreamWaitEvent(st, t.ready, 0), "cuStreamWaitEvent");
+      }
+    } else {
+      check(q, "cuEventQuery");
+    }
+    (void)s;
+    return t.ptr;
   }
 
   // Chunk kernels on a device table; `sadd` / `dadd` offset every chunk.
@@ -2375,7 +2437,94 @@ class CudaExecutor final : public Executor {
     return avg < (g.pure() ? 256 : 64) && fused_plan(g).ok;
   }
 
+  // ---- rows within one pool whose indices may overlap (abi.hpp: RowsOv) ----------------
+
+  Dev::OvBuf& ov_of(Dev& s, CUstream st) {
+    for (Dev::OvBuf& b : s.ovs)
+      if (b.assigned && b.caller == st) return b;
+    if (s.ovs.size() < kLanes) {
+      Dev::OvBuf& b = s.ovs.emplace_back();
+      b.caller = st, b.assigned = true;
+      check(d_->cuEventCreate(&b.done, CU_EVENT_DISABLE_TIMING), "cuEventCreate");
+      return b;
+    }
+    Dev::OvBuf& b = *std::min_element(s.ovs.begin(), s.ovs.end(),
+                                      [](const Dev::OvBuf& x, const Dev::OvBuf& y) { return x.last < y.last; });
+    if (b.used) check(d_->cuStreamWaitEvent(st, b.done, 0), "cuStreamWaitEvent");  // the other stream's last use first
+    b.caller = st;
+    return b;
+  }
+
+  // Whether `st`'s buffers already fit every op of `g` (a capture can only
+  // record kernels: no allocation, no wait for another stream's use).
+  bool rows_ov_resident(Dev& s, const Group& g, CUstream st) {
+    if (!s.err.ptr) return false;
+    for (const Dev::OvBuf& b : s.ovs) {
+      if (!b.assigned || b.caller != st || !b.epoch.ptr) continue;
+      for (const auto& f : g.forms) {
+        const auto L = rows_layout(*f);
+        if (!L || static_cast<size_t>(L->rows) > b.mark_rows ||
+            static_cast<size_t>(L->n * L->row_bytes) > b.staging_bytes)
+          return false;
+      }
+      return true;
+    }
+    return false;
+  }
+
+  int64_t rows_overlap(Dev& s, const Group& g, const std::vector<Op>& ops, CUstream st) {
+    const bool cap = capturing(reinterpret_cast<uintptr_t>(st));
+    int64_t calls = 0;
+    for (int k : g.ops) {
+      const Op& op = ops[k];
+      const auto L = op.form ? rows_layout(*op.form) : std::nullopt;
+      if (!L) fail(Errc::backend, "rows_overlap: the op is not rows of one layout");
+      Dev::OvBuf& b = ov_of(s, st);
+      b.last = ++s.staging_clock;
+      const size_t need_rows = static_cast<size_t>(L->rows), need_stg = static_cast<size_t>(L->n * L->row_bytes);
+      if (cap && (!b.epoch.ptr || b.mark_rows < need_rows || b.staging_bytes < need_stg))
+        fail(Errc::unsupported, "an overlapping indexed copy is recorded in a CUDA graph only after it ran once on "
+                                "the capturing stream");
+      if (!b.epoch.ptr) {
+        b.epoch = dev_alloc(s, 16, "overlap epoch", st);
+        check(d_->cuMemsetD8Async(b.epoch.ptr, 0, 16, st), "cuMemsetD8Async");
+      }
+      if (b.mark_rows < need_rows) {  // new marks are zero: older than any epoch to come
+        dev_free(s, b.marks);
+        b.marks = dev_alloc(s, need_rows * 8, "overlap marks", st);
+        check(d_->cuMemsetD8Async(b.marks.ptr, 0, need_rows * 8, st), "cuMemsetD8Async");
+        b.mark_rows = need_rows;
+      }
+      if (b.staging_bytes < need_stg) {
+        dev_free(s, b.staging);
+        b.staging = dev_alloc(s, std::max<size_t>(need_stg, 16), "overlap staging", st);
+        b.staging_bytes = std::max<size_t>(need_stg, 16);
+      }
+      cuabi::RowsOv P{};
+      P.pool = static_cast<uint64_t>(L->pool), P.row_stride = L->row_stride, P.row_bytes = L->row_bytes;
+      P.stab = op.stab, P.dtab = op.dtab, P.sstep = op.form->stab_step, P.dstep = op.form->dtab_step;
+      P.n = L->n, P.rows = L->rows;
+      P.marks = b.marks.ptr, P.epoch = b.epoch.ptr, P.staging = b.staging.ptr;
+      P.err = error_word(s);
+      if (cap) s.err_graphs = true;
+      else s.err_armed = true;
+      void* args[] = {&P};
+      const unsigned rows_grid = static_cast<unsigned>(std::min<int64_t>(L->n, 1 << 20));
+      const unsigned mark_grid = static_cast<unsigned>(std::min<int64_t>((L->n + 255) / 256, 1 << 16));
+      run_kernel(s, function(s, "ce_ov_mark"), {mark_grid, 1, 1}, {256, 1, 1}, args, st, "ce_ov_mark");
+      run_kernel(s, function(s, "ce_ov_stage"), {rows_grid, 1, 1}, {128, 1, 1}, args, st, "ce_ov_stage");
+      run_kernel(s, function(s, "ce_ov_scatter"), {rows_grid, 1, 1}, {128, 1, 1}, args, st, "ce_ov_scatter");
+      if (!cap) {
+        check(d_->cuEventRecord(b.done, st), "cuEventRecord");
+        b.used = true;
+      }
+      calls += 3;
+    }
+    return calls;
+  }
+
   int64_t fused(Dev& s, const Group& g, const std::vector<Op>& ops, CUstream st) {
+    if (g.rows_ov) return rows_overlap(s, g, ops, st);
     const FusedPlan& P = fused_plan(g);
     if (!P.ok) fail(Errc::unsupported, "fused strategy is not applicable to this group");
     const cv::Fn fn = to_cv(g.fn);
@@ -2410,9 +2559,9 @@ class CudaExecutor final : public Executor {
         continue;
       }
       auto& table = const_cast<FusedBatch&>(b).table;
-      if (!table) table = resident(s, b.bases);
+      if (!table) table = resident(s, b.bases, st);
       const auto& t = *static_cast<DevTable*>(table.get());
-      launch_stmt(t.ptr, t.count, b, fn, P.h2d ? add : 0, P.h2d ? 0 : add, s, st);
+      launch_stmt(use(s, t, st), t.count, b, fn, P.h2d ? add : 0, P.h2d ? 0 : add, s, st);
     }
     if (P.cross) {
       if (!P.h2d) copy_raws(s, dev_side, host_side, raws, st);
@@ -2437,9 +2586,9 @@ class CudaExecutor final : public Executor {
   // The kernel strategy with a given chunk kernel (zero-copy: streaming accesses).
   int64_t kernel_named(Dev& s, const Group& g, const std::string& name, CUstream st) {
     auto& slot = g.exec_cache[static_cast<int>(Strategy::kernel)];
-    if (!slot) slot = resident(s, chunks_of(g));
+    if (!slot) slot = resident(s, chunks_of(g), st);
     const auto& t = *static_cast<DevTable*>(slot.get());
-    launch_table(s, name, t.ptr, t.count, to_cv(g.fn), 0, 0, st);
+    launch_table(s, name, use(s, t, st), t.count, to_cv(g.fn), 0, 0, st);
     return 1;
   }
 
@@ -2449,9 +2598,9 @@ class CudaExecutor final : public Executor {
       return 1;
     }
     auto& slot = g.exec_cache[static_cast<int>(Strategy::kernel)];
-    if (!slot) slot = resident(s, chunks_of(g));
+    if (!slot) slot = resident(s, chunks_of(g), st);
     const auto& t = *static_cast<DevTable*>(slot.get());
-    launch_table(s, kernel_name(g), t.ptr, t.count, to_cv(g.fn), 0, 0, st);
+    launch_table(s, kernel_name(g), use(s, t, st), t.count, to_cv(g.fn), 0, 0, st);
     return 1;
   }
 
@@ -2624,8 +2773,8 @@ class CudaExecutor final : public Executor {
           return;
         }
         auto& table = const_cast<StagedStep&>(step).table;
-        if (!table) table = resident(s, step.chunks);
-        launch_table(s, name, table->ptr, table->count, fn, h2d ? base : 0, h2d ? 0 : base, st);
+        if (!table) table = resident(s, step.chunks, st);
+        launch_table(s, name, use(s, *table, st), table->count, fn, h2d ? base : 0, h2d ? 0 : base, st);
       };
       if (h2d) {
         copy_raws(s, g.src, dev_side, raws, st);

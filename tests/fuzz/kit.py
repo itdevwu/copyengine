@@ -23,7 +23,7 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
-MODES = "forced,explicit,scope,freeze,plan,graph,threads"
+MODES = "forced,explicit,scope,freeze,plan,graph,threads,pool"
 
 
 def environment():

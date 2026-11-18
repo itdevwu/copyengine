@@ -211,6 +211,70 @@ def test_the_measurement_runs_and_is_kept(monkeypatch):
 
 
 @ops
+def test_converting_copies_with_a_function_are_measured(monkeypatch):
+    # dst = fn(src) in a compiled region: measured against Inductor's code for the
+    # same steps (taken only where its bits equal the catalog's on edge values).
+    monkeypatch.delenv("CE_COMPILE_BASELINE")
+    ce._compiled._DECISIONS.clear()
+    fn = ce.Elementwise(scale=2.0, bias=1.0)
+    src = torch.randn(256, 512, device=DEV)
+    dst = torch.empty(256, 512, device=DEV, dtype=torch.bfloat16)
+
+    def f(x):
+        ce.copy_(dst, x, fn=fn)
+        return dst
+
+    torch._dynamo.reset()
+    torch.compile(f)(src)
+    torch.cuda.synchronize()
+    want = torch.empty_like(dst)
+    ce.Engine(prior_only=True).copy_(want, src, fn=fn)
+    assert torch.equal(dst.view(torch.int16), want.view(torch.int16))
+    why = [w for k, w in ce._compiled._REASONS.items() if k[0] == "copy_fn"]
+    assert why and ("us" in why[0] or "bits" in why[0]), why
+    ce._compiled._DECISIONS.clear()
+
+
+def test_host_memory_is_measured_pinned_and_pageable(monkeypatch):
+    # The trace cannot tell pinned from pageable host memory: copyengine is taken
+    # only if it wins with both.
+    seen = []
+
+    def one(kind, metas, extra, reps, pinned):
+        seen.append(pinned)
+        return ("ce" if pinned else "torch"), "forced"
+
+    monkeypatch.setattr(ce._compiled, "_measure_one", one)
+    host = ((64, 32), (32, 1), "float32", "cpu", 0)
+    gpu = ((64, 32), (32, 1), "float32", "cuda", 0)
+    assert ce._compiled._measure("copy", (gpu, host), ())[0] == "torch"
+    assert seen == [True, False]
+    seen.clear()
+    assert ce._compiled._measure("copy", (gpu, gpu), ())[0] == "ce"
+    assert seen == [True]
+
+
+@ops
+def test_one_dimensional_quantization_compiles_as_eager():
+    # x of one dimension (one row of units) quantizes in a compiled region as it does eagerly.
+    x = torch.randn(4096, device=DEV)
+    q, s = torch.empty(4096, dtype=torch.int8, device=DEV), torch.empty(32, device=DEV)
+    q2, s2 = torch.empty_like(q), torch.empty_like(s)
+    ce.quantize(x, q2, s2, fmt="int8", group=128)
+
+    def f(x):
+        ce.quantize(x, q, s, fmt="int8", group=128)
+        return q
+
+    code, breaks_ = _graph_ops(f, x)
+    assert breaks_ == 0, code
+    torch._dynamo.reset()
+    torch.compile(f)(x)
+    torch.cuda.synchronize()
+    assert torch.equal(q, q2) and torch.equal(s, s2)
+
+
+@ops
 def test_warm_when_the_model_is_warm():
     # Module-level calls in a compiled model explore on its warmup runs and lock;
     # compiled_stats() shows the process-wide engine they use.

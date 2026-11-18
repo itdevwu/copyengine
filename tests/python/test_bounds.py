@@ -131,3 +131,18 @@ def test_frozen_two_pass_copy_owns_its_temporary():
     torch.cuda.synchronize()
     assert torch.equal(pool, want)
     del junk
+
+
+def test_reshape_merging_nested_strides_needs_no_table():
+    # A merge of dimensions whose strides nest is one strided dimension, also
+    # when another dimension has an index table (no table of offsets is built).
+    a = ce._core.Access.contiguous([6, 4, 5]).index_select(0, np.array([4, 1, 3], dtype=np.int64))
+    r = a.reshape([3, 20])
+    assert not r.select(0, 0).has_table
+    want = np.arange(6 * 4 * 5).reshape(6, 4, 5)[[4, 1, 3]].reshape(3, 20)
+    np.testing.assert_array_equal(r.offsets().reshape(3, 20), want)
+    t = ce._core.Access.contiguous([6, 4, 5]).permute([0, 2, 1]).index_select(0, np.array([2, 0], dtype=np.int64))
+    m = t.reshape([2, 20])  # strides 1 and 5: they do not nest, a table it is
+    assert m.select(0, 0).has_table
+    want = np.arange(120).reshape(6, 4, 5).transpose(0, 2, 1)[[2, 0]].reshape(2, 20)
+    np.testing.assert_array_equal(m.offsets().reshape(2, 20), want)

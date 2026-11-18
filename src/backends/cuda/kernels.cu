@@ -502,6 +502,71 @@ extern "C" __global__ void ce_put(Put p) {
   for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < p.n; i += gridDim.x * blockDim.x) dst[i] = p.w[i];
 }
 
+// ---- rows within one pool whose indices may overlap (abi.hpp: RowsOv) --------------------
+
+using RowsOv = ce::cuabi::RowsOv;
+
+__device__ __forceinline__ bool ov_index(const RowsOv& P, uint64_t table, int64_t step, long long i, long long* out) {
+  const long long v = reinterpret_cast<const long long*>(table)[i * step];
+  if (v < 0 || v >= P.rows) {
+    if (P.err) atomicOr(reinterpret_cast<unsigned long long*>(P.err), 1ull);
+    return false;
+  }
+  *out = v;
+  return true;
+}
+
+// One row by the threads of a block: 16-byte words where everything is aligned.
+__device__ __forceinline__ void ov_row(const char* src, char* dst, long long bytes) {
+  if (((reinterpret_cast<uintptr_t>(src) | reinterpret_cast<uintptr_t>(dst) | static_cast<uintptr_t>(bytes)) & 15) == 0) {
+    const uint4* s = reinterpret_cast<const uint4*>(src);
+    uint4* d = reinterpret_cast<uint4*>(dst);
+    for (long long k = threadIdx.x; k < bytes / 16; k += blockDim.x) d[k] = s[k];
+  } else {
+    for (long long k = threadIdx.x; k < bytes; k += blockDim.x) dst[k] = src[k];
+  }
+}
+
+extern "C" __global__ void ce_ov_mark(RowsOv P) {
+  const unsigned long long e = reinterpret_cast<const unsigned long long*>(P.epoch)[0] + 1;
+  auto* marks = reinterpret_cast<unsigned long long*>(P.marks);
+  for (long long i = blockIdx.x * static_cast<long long>(blockDim.x) + threadIdx.x; i < P.n;
+       i += static_cast<long long>(gridDim.x) * blockDim.x) {
+    long long d;
+    if (ov_index(P, P.dtab, P.dstep, i, &d)) marks[d] = e;
+  }
+}
+
+// Source rows that are also destination rows, before anything is written.
+extern "C" __global__ void ce_ov_stage(RowsOv P) {
+  auto* ep = reinterpret_cast<unsigned long long*>(P.epoch);
+  const unsigned long long e = ep[0] + 1;
+  if (blockIdx.x == 0 && threadIdx.x == 0) ep[1] = e;  // read by ce_ov_scatter only
+  const auto* marks = reinterpret_cast<const unsigned long long*>(P.marks);
+  for (long long i = blockIdx.x; i < P.n; i += gridDim.x) {
+    long long r;
+    if (!ov_index(P, P.stab, P.sstep, i, &r) || marks[r] != e) continue;
+    ov_row(reinterpret_cast<const char*>(P.pool) + r * P.row_stride,
+           reinterpret_cast<char*>(P.staging) + i * P.row_bytes, P.row_bytes);
+  }
+}
+
+// Every destination row: from staging where its source row is a destination
+// row too, else from the pool (no row read here is written here).
+extern "C" __global__ void ce_ov_scatter(RowsOv P) {
+  auto* ep = reinterpret_cast<unsigned long long*>(P.epoch);
+  const unsigned long long e = ep[1];
+  if (blockIdx.x == 0 && threadIdx.x == 0) ep[0] = e;  // the current epoch for the next call (read as ep[1] here)
+  const auto* marks = reinterpret_cast<const unsigned long long*>(P.marks);
+  for (long long i = blockIdx.x; i < P.n; i += gridDim.x) {
+    long long r, d;
+    if (!ov_index(P, P.stab, P.sstep, i, &r) || !ov_index(P, P.dtab, P.dstep, i, &d)) continue;
+    const char* from = marks[r] == e ? reinterpret_cast<const char*>(P.staging) + i * P.row_bytes
+                                     : reinterpret_cast<const char*>(P.pool) + r * P.row_stride;
+    ov_row(from, reinterpret_cast<char*>(P.pool) + d * P.row_stride, P.row_bytes);
+  }
+}
+
 extern "C" __global__ void ce_stmt(const Base* __restrict__ bases, long long count, StmtDesc D, Fn fn, long long sadd,
                                    long long dadd) {
   stmt_body(bases, count, D, sadd, dadd, dt_size(D.sdt), dt_size(D.ddt), DynConv{D, fn});

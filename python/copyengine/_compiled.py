@@ -56,15 +56,16 @@ def _meta(t):
     return (shape, stride, str(t.dtype).replace("torch.", ""), t.device.type, t.device.index or 0)
 
 
-def _real(m, bound=None):
-    """A real tensor with layout `m`: random values (an index: within `bound`, unique if asked)."""
+def _real(m, bound=None, pinned=True):
+    """A real tensor with layout `m`: random values (an index: within `bound`, unique if asked);
+    host memory pinned or pageable."""
     shape, stride, dtype, kind, index = m
     offset = 0  # (the traced tensor's offset is no constant for Dynamo; alignment aside, the same layout)
     dtype = getattr(torch, dtype)
     dev = torch.device(kind, index) if kind == "cuda" else torch.device("cpu")
     span = 1 + sum((n - 1) * s for n, s in zip(shape, stride) if n > 0)
     base = torch.empty(span + offset, dtype=dtype, device=dev)
-    if dev.type == "cpu" and torch.cuda.is_available():
+    if dev.type == "cpu" and pinned and torch.cuda.is_available():
         base = base.pin_memory()
     r = base.as_strided(shape, stride, offset)
     n = r.numel()
@@ -127,6 +128,18 @@ def _kind(kind, extra):
     ops = torch.ops.copyengine
     if kind == "copy":
         return (lambda d, s: d.copy_(s)), (lambda h, d, s: ops.copy_(d, s, h)), [0], {}
+    if kind == "copy_fn":  # dst = fn(src): the catalog's steps as torch ops (bits checked on edge values)
+        scale, bias, rnd, clamp, lo, hi = extra
+
+        def native(d, s):
+            v = s.float() * scale
+            v = v + bias
+            if rnd:
+                v = torch.round(v)
+            if clamp:
+                v = v.clamp(lo, hi)
+            d.copy_(v)
+        return native, (lambda h, d, s: ops.copy_fn_(d, s, h, scale, bias, rnd, clamp, lo, hi)), [0], {}
     if kind == "copy_many":
         n = extra[0]
 
@@ -167,11 +180,24 @@ def _kind(kind, extra):
 
 
 def _measure(kind, metas, extra, reps=25):
-    """'torch' (the compiled baseline) or 'ce', measured as described above."""
+    """'torch' (the compiled baseline) or 'ce', measured as described above. Host
+    tensors may be pinned or pageable at run time (the trace cannot tell): both
+    are measured, and copyengine is taken only if it wins with both."""
+    host = any(m is not None and m[3] == "cpu" for m in metas)
+    whys = []
+    for pinned in ((True, False) if host else (True,)):
+        d, why = _measure_one(kind, metas, extra, reps, pinned)
+        whys.append(("pinned: " if pinned and host else "pageable: " if host else "") + why)
+        if d == "torch":
+            return "torch", "; ".join(whys)
+    return "ce", "; ".join(whys)
+
+
+def _measure_one(kind, metas, extra, reps, pinned):
     from ._api import Engine
     native, with_ce, mutated, bounds = _kind(kind, extra)
     sync = torch.cuda.synchronize
-    ins = [None if m is None else _real(m, bounds.get(i)) for i, m in enumerate(metas)]
+    ins = [None if m is None else _real(m, bounds.get(i), pinned) for i, m in enumerate(metas)]
     nat = [a.clone() if i in mutated else a for i, a in enumerate(ins)]
     cea = [a.clone() if i in mutated else a for i, a in enumerate(ins)]
     # Inductor directly (traced by make_fx): torch.compile would wait for Dynamo's
@@ -217,6 +243,8 @@ def _pairs_same_bits(kind, metas, extra) -> bool:
         return same_bits_dtypes(getattr(torch, d[2]), getattr(torch, s[2]))
     if kind == "copy":
         return ok(metas[0], metas[1])
+    if kind == "copy_fn":
+        return True  # computation: checked on edge-value samples (the catalog's recipe is the reference)
     if kind == "copy_many":
         n = extra[0]
         return all(ok(d, s) for d, s in zip(metas[:n], metas[n:2 * n]))
@@ -543,7 +571,11 @@ def copy_(engine: int, dst, src, fn=None) -> bool:
             ops.copy_(dt, st, engine)
     else:
         lo, hi = fn.clamp or (0.0, 0.0)
-        ops.copy_fn_(dt, st, engine, fn.scale, fn.bias, fn.round, fn.clamp is not None, lo, hi)
+        extra = (float(fn.scale), float(fn.bias), bool(fn.round), fn.clamp is not None, float(lo), float(hi))
+        if decide("copy_fn", [dt, st], extra) == "torch":
+            _kind("copy_fn", extra)[0](dt, st)
+        else:
+            ops.copy_fn_(dt, st, engine, fn.scale, fn.bias, fn.round, fn.clamp is not None, lo, hi)
     return True
 
 

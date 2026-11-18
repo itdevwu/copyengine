@@ -435,19 +435,19 @@ struct Engine::Impl {
 
   // What runs a group during capture: the locked or given strategy if it only
   // enqueues stream work, else torch's own copy (capturable), else plain DMA.
-  Strategy capture_choice(const Group& g, const std::vector<Op>& ops, std::optional<Strategy> want) {
+  Strategy capture_choice(const Group& g, const std::vector<Op>& ops, std::optional<Strategy> want, uintptr_t strm) {
     Executor& ex = exec_for(g.src, g.dst);
     if (g.bandwidth > 0) {  // the limit holds in graphs too: paced or nothing
-      if (ex.capture_safe(Strategy::paced, g)) return Strategy::paced;
+      if (ex.capture_safe(Strategy::paced, g, strm)) return Strategy::paced;
       fail(Errc::unsupported,
            "copyengine cannot record this bandwidth-limited copy in a CUDA graph: run it once before capturing "
            "(pacing state and tables are set up on first use); pageable host memory cannot be captured");
     }
     if (!want) want = tuner.locked_strategy(g.bucket);
-    if (want && *want != Strategy::native && ex.capture_safe(*want, g)) return *want;
+    if (want && *want != Strategy::native && ex.capture_safe(*want, g, strm)) return *want;
     if (std::all_of(g.ops.begin(), g.ops.end(), [&](int k) { return ops[k].native != nullptr; })) return Strategy::native;
     for (Strategy s : {Strategy::runs, Strategy::passthrough, Strategy::fused})
-      if (ex.capture_safe(s, g)) return s;
+      if (ex.capture_safe(s, g, strm)) return s;
     fail(Errc::unsupported,
          "copyengine cannot record this copy in a CUDA graph: torch has no equivalent and its strategy needs "
          "resources that are set up on first use; run it once before capturing");
@@ -471,10 +471,11 @@ struct Engine::Impl {
     return op.src.device.kind == DeviceKind::cuda ? op.src.device.index : -1;
   }
 
-  // The queue (on `stream`) is flushed because work arrives on `strm`. Natives
-  // run on the framework's current stream, which is `strm` now, not `stream`:
-  // `strm` waits for what `stream` had, and `stream` for what the flush put on
-  // `strm`, so either stream's later work sees the flushed copies.
+  // The queue (on `stream`) is flushed because work arrives on `strm`. The
+  // flush puts copyengine's copies on `stream` and natives on the framework's
+  // current stream, which is `strm` now: `strm` first waits for what `stream`
+  // had (natives read it), and afterwards each stream waits for the other, so
+  // either stream's later work sees every flushed copy.
   // `strm_dev`: the GPU of the work arriving on `strm` (-1: none). Streams of
   // two GPUs are not ordered here (an event belongs to one device's context;
   // torch orders cross-device work itself).
@@ -491,7 +492,10 @@ struct Engine::Impl {
     const uintptr_t was = stream;
     if (dev >= 0) cuda->order(strm, dev, was, dev);
     flush();
-    if (dev >= 0) cuda->order(was, dev, strm, dev);
+    if (dev >= 0) {
+      cuda->order(strm, dev, was, dev);  // the copies the flush put on `stream`
+      cuda->order(was, dev, strm, dev);  // the natives it ran on `strm`
+    }
   }
 
   // torch's own copy keeps its buffers safe itself (it records events on pinned memory).
@@ -503,7 +507,10 @@ struct Engine::Impl {
     const bool host_only = op.src.device.kind == DeviceKind::host && op.dst.device.kind == DeviceKind::host;
     if (host_only && host_pending && !capturing) synchronize();  // host work may touch what CUDA work still uses
     before_cpu_native(op);
-    op.native->run(strm, op.host_async);
+    {
+      const FrameworkCopy fc;  // the framework's own copy: not intercepted again (frontend.hpp)
+      op.native->run(strm, op.host_async);
+    }
     note_pending(op.src, op.dst, strm, !op.host_async, gpu_of(op));  // the stream given is the destination GPU's
     bury(std::move(op.native));
     ++native_ops;
@@ -639,9 +646,14 @@ struct Engine::Impl {
     const bool same_storage = src.device == dst.device && src.base < dst.base + static_cast<uintptr_t>(dst.nbytes) &&
                               dst.base < src.base + static_cast<uintptr_t>(src.nbytes);
     if (!hints.overlap_checked && same_storage && device_tables_reach(stmt) &&
-        intersects(form->src_bytes(), form->dst_bytes()))
-      fail(Errc::unsafe_copy, "source and destination may overlap (indices read at run time): one pass would read "
-                              "what it writes");
+        intersects(form->src_bytes(), form->dst_bytes())) {
+      if (!hints.overlap_gather)
+        fail(Errc::unsafe_copy, "source and destination may overlap (indices read at run time): one pass would read "
+                                "what it writes");
+      if (!fn.identity() || !rows_layout(*form) || !cuda)
+        fail(Errc::unsupported, "an overlapping indexed copy other than rows of one layout within one pool");
+      op.rows_ov = true;
+    }
     const auto [slo, shi] = form->src_extent();
     const auto [dlo, dhi] = form->dst_extent();
     const i64 ss = static_cast<i64>(itemsize(src.dtype)), ds = static_cast<i64>(itemsize(dst.dtype));
@@ -1055,6 +1067,7 @@ struct Engine::Impl {
     const auto t0 = Clock::now();
     int64_t calls = 0;
     if (s == Strategy::native) {
+      const FrameworkCopy fc;  // the framework's own copies: not intercepted again (frontend.hpp)
       for (int k : g.ops) ops[k].native->run(strm, ops[k].host_async);
       calls = static_cast<int64_t>(g.ops.size());
     } else {
@@ -1184,7 +1197,7 @@ struct Engine::Impl {
       for (int k : g.ops) runs = std::max(runs, ops[k].weight);
       // A bandwidth-limited group is not raced against full-speed copies: the
       // executor paces it (its objective is the limit, not the fastest time).
-      if (capturing) p = {capture_choice(g, ops, opt.disable ? std::optional<Strategy>(c.baseline) : std::nullopt), false};
+      if (capturing) p = {capture_choice(g, ops, opt.disable ? std::optional<Strategy>(c.baseline) : std::nullopt, stream), false};
       else if (g.bandwidth > 0) p = {Strategy::paced, false};
       else if (!opt.disable) p = tuner.pick(g.bucket, c, runs);
       if (!capturing && !opt.force.empty() && g.bandwidth == 0) p = forced(g, ops, p);
@@ -1442,7 +1455,7 @@ Engine::~Engine() {
 void Engine::copy(const Endpoint& src, const Endpoint& dst, const Runs& runs, const Elementwise& fn,
                   const Hints& hints, uintptr_t stream) {
   const auto t0 = Clock::now();
-  if (enabling_peer() && hints.native) {  // the framework's own copy that enables peer access (frontend.hpp)
+  if (framework_copy_running() && hints.native) {  // inside the framework's own copy (frontend.hpp)
     hints.native->run(stream, false);
     return;
   }
@@ -1454,7 +1467,7 @@ void Engine::copy(const Endpoint& src, const Endpoint& dst, const Runs& runs, co
 void Engine::copy(const Endpoint& src, const Endpoint& dst, const Stmt& stmt, const Elementwise& fn,
                   const Hints& hints, uintptr_t stream) {
   const auto t0 = Clock::now();
-  if (enabling_peer() && hints.native) {  // the framework's own copy that enables peer access (frontend.hpp)
+  if (framework_copy_running() && hints.native) {  // inside the framework's own copy (frontend.hpp)
     hints.native->run(stream, false);
     return;
   }
@@ -1651,6 +1664,7 @@ std::string Engine::stats_json() const {
       .set("sessions", static_cast<uint64_t>(1 + m.parked.size() + m.exited.size()))  // threads with state here
       .set("plans", static_cast<uint64_t>(m.plans.size()))
       .set("buckets", static_cast<uint64_t>(m.tuner.size()))
+      .set("locks", m.tuner.lock_counts())
       .set("cuda", m.cuda ? m.cuda->info() : Json(m.cuda_error))
       .dump();
 }
@@ -1727,7 +1741,7 @@ class FrozenImpl final : public Frozen {
     const Engine::Impl::Capture cap(*eng_, stream);
     const auto& groups = ran_.plan->groups;
     for (size_t i = 0; i < groups.size(); ++i) {
-      const Strategy s = eng_->capturing ? eng_->capture_choice(groups[i], *ops, ran_.strategies[i]) : ran_.strategies[i];
+      const Strategy s = eng_->capturing ? eng_->capture_choice(groups[i], *ops, ran_.strategies[i], stream) : ran_.strategies[i];
       eng_->run_group(groups[i], s, *ops, stream, false, nullptr);
     }
     eng_->finish(stream);

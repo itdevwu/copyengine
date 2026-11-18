@@ -5,7 +5,16 @@
 #   docker run --rm -e HOST_UID=$(id -u) -v "$PWD":/work -w /work \
 #     quay.io/pypa/manylinux_2_28_x86_64 docker/build-wheels.sh
 #
-# CE_WHEEL_SDIST=0 skips the sdist (one architecture provides it).
+# Stages (CE_WHEEL_STAGE; CI runs them as parallel jobs, `all` runs them in turn):
+#   kernels  the CUDA kernel fatbin for every GPU architecture, once: it does
+#            not depend on the Python version or the host architecture
+#            ($OUT/ce_kernels.fatbin and its .sources, which wheel builds check);
+#   wheel    one raw wheel per Python in CE_WHEEL_PYTHONS, embedding the fatbin
+#            in CE_WHEEL_FATBIN (compiled here if unset);
+#   pack     the raw wheels in CE_WHEEL_RAW: a prebuilt interception shim per
+#            supported torch release added, repaired, the sdist (unless
+#            CE_WHEEL_SDIST=0), each wheel smoke-tested in a fresh environment.
+#
 # CE_WHEEL_VERSION_SUFFIX=.dev1 builds a pre-release (0.3.0.dev1) of the
 # project() version: wheel metadata and copyengine.__version__ both carry it.
 # Python 3.12+ gets one abi3 wheel; older versions one wheel each. Every wheel
@@ -49,69 +58,107 @@ if [ -n "$SUFFIX" ]; then
   export SKBUILD_CMAKE_DEFINE="CE_VERSION_SUFFIX=$SUFFIX${SKBUILD_CMAKE_DEFINE:+;$SKBUILD_CMAKE_DEFINE}"
 fi
 
-step "CUDA $CUDA toolkit (nvcc, headers)"
-dnf -y -q install dnf-plugins-core
-dnf config-manager --add-repo "https://developer.download.nvidia.com/compute/cuda/repos/rhel8/$CUDA_REPO/cuda-rhel8.repo"
-dnf -y -q install "cuda-nvcc-$CUDA" "cuda-cudart-devel-$CUDA" "cuda-driver-devel-$CUDA" "cuda-nvtx-$CUDA"
-export PATH=/usr/local/cuda/bin:$PATH
+STAGE=${CE_WHEEL_STAGE:-all}
+case "$STAGE" in all|kernels|wheel|pack) ;; *) echo "unknown CE_WHEEL_STAGE $STAGE"; exit 1 ;; esac
+mkdir -p "$OUT"
+
+cuda_toolkit() {
+  step "CUDA $CUDA toolkit (nvcc, headers)"
+  dnf -y -q install dnf-plugins-core
+  dnf config-manager --add-repo "https://developer.download.nvidia.com/compute/cuda/repos/rhel8/$CUDA_REPO/cuda-rhel8.repo"
+  dnf -y -q install "cuda-nvcc-$CUDA" "cuda-cudart-devel-$CUDA" "cuda-driver-devel-$CUDA" "cuda-nvtx-$CUDA"
+  export PATH=/usr/local/cuda/bin:$PATH
+}
 
 venv() {  # venv <python tag> <dir>
   "/opt/python/$1-$1/bin/python" -m venv "$2"
   "$2/bin/pip" install -q -U pip
 }
 
-for py in $PYTHONS; do
-  step "wheel $py (torch $TORCH_BUILD)"
-  venv "$py" "$WORK/v-$py"
-  "$WORK/v-$py/bin/pip" install -q scikit-build-core nanobind numpy cmake ninja wheel
-  "$WORK/v-$py/bin/pip" install -q "torch==$TORCH_BUILD" --index-url "$INDEX"
-  "$WORK/v-$py/bin/pip" wheel -q --no-build-isolation --no-deps "$SRC" -w "$WORK/raw" \
-    -C build-dir="$WORK/build/{wheel_tag}"
-done
+kernels() {
+  step "kernel fatbin (every GPU architecture, once)"
+  "/opt/python/cp312-cp312/bin/python" -m venv "$WORK/v-kernels"
+  "$WORK/v-kernels/bin/pip" install -q cmake
+  "$WORK/v-kernels/bin/cmake" -S "$SRC" -B "$WORK/build-kernels" -DCE_BUILD_TESTS=OFF -DCE_BUILD_PYTHON=OFF \
+    -DCE_CUDA=ON >/dev/null
+  "$WORK/v-kernels/bin/cmake" --build "$WORK/build-kernels" --target ce_kernels
+  cp "$WORK/build-kernels/ce_kernels.fatbin" "$WORK/build-kernels/ce_kernels.fatbin.sources" "$OUT/"
+}
 
-# A shim works with any Python: compile one per further torch release (by
-# importing a built wheel with that torch) and add it to every wheel.
-first=$(ls "$WORK"/raw/*cp312*.whl | head -1)
-for t in $TORCH_SHIMS; do
-  step "shim for torch $t"
-  venv cp312 "$WORK/s-$t"
-  "$WORK/s-$t/bin/pip" install -q numpy "torch==$t" --index-url "$INDEX" --extra-index-url https://pypi.org/simple
-  "$WORK/s-$t/bin/pip" install -q --no-deps "$first"
-  (cd "$WORK" && CE_CACHE_DIR="$WORK/shims-cache" "$WORK/s-$t/bin/python" -I -c '
+wheels() {
+  local fatbin=${CE_WHEEL_FATBIN:-}
+  [ -z "$fatbin" ] || fatbin=$(realpath "$fatbin")
+  for py in $PYTHONS; do
+    step "wheel $py (torch $TORCH_BUILD${fatbin:+, prebuilt kernels})"
+    venv "$py" "$WORK/v-$py"
+    "$WORK/v-$py/bin/pip" install -q scikit-build-core nanobind numpy cmake ninja wheel
+    "$WORK/v-$py/bin/pip" install -q "torch==$TORCH_BUILD" --index-url "$INDEX"
+    SKBUILD_CMAKE_DEFINE="${SKBUILD_CMAKE_DEFINE:-}${fatbin:+${SKBUILD_CMAKE_DEFINE:+;}CE_KERNELS_FATBIN=$fatbin}" \
+      "$WORK/v-$py/bin/pip" wheel -q --no-build-isolation --no-deps "$SRC" -w "$RAW" \
+      -C build-dir="$WORK/build/{wheel_tag}"
+  done
+}
+
+pack() {
+  # A shim works with any Python: compile one per further torch release (by
+  # importing a built wheel with that torch) and add it to every wheel.
+  first=$(ls "$RAW"/*cp312*.whl | head -1)
+  for t in $TORCH_SHIMS; do
+    step "shim for torch $t"
+    venv cp312 "$WORK/s-$t"
+    "$WORK/s-$t/bin/pip" install -q numpy "torch==$t" --index-url "$INDEX" --extra-index-url https://pypi.org/simple
+    "$WORK/s-$t/bin/pip" install -q --no-deps "$first"
+    (cd "$WORK" && CE_CACHE_DIR="$WORK/shims-cache" "$WORK/s-$t/bin/python" -I -c '
 import copyengine._shim as s
 assert s.lib is not None, s.error
 print(s.shim_key())')
-done
+  done
 
-step "add shims, repair (libtorch and libc10 stay the user's), sdist"
-W="$WORK/v-cp312/bin"
-"$W/pip" install -q auditwheel build
-mkdir -p "$OUT" "$WORK/packed"
-for whl in "$WORK"/raw/*.whl; do
-  rm -rf "$WORK/unpacked"
-  "$W/python" -m wheel unpack -d "$WORK/unpacked" "$whl"
-  pkg=$(echo "$WORK"/unpacked/*/copyengine)
-  cp -r "$WORK"/shims-cache/copyengine/shim/* "$pkg/shims/"
-  "$W/python" -m wheel pack -d "$WORK/packed" "$WORK"/unpacked/*
-done
-"$W/auditwheel" repair -w "$OUT" --plat "manylinux_2_28_$ARCH" \
-  --exclude 'libtorch*.so*' --exclude 'libc10*.so*' "$WORK"/packed/*.whl
-if [ "${CE_WHEEL_SDIST:-1}" != 0 ]; then
-  "$W/python" -m build --sdist --no-isolation -o "$OUT" "$SRC"
-fi
+  step "add shims, repair (libtorch and libc10 stay the user's), sdist"
+  venv cp312 "$WORK/v-pack"
+  W="$WORK/v-pack/bin"
+  "$W/pip" install -q auditwheel build wheel scikit-build-core nanobind
+  mkdir -p "$OUT" "$WORK/packed"
+  for whl in "$RAW"/*.whl; do
+    rm -rf "$WORK/unpacked"
+    "$W/python" -m wheel unpack -d "$WORK/unpacked" "$whl"
+    pkg=$(echo "$WORK"/unpacked/*/copyengine)
+    cp -r "$WORK"/shims-cache/copyengine/shim/* "$pkg/shims/"
+    "$W/python" -m wheel pack -d "$WORK/packed" "$WORK"/unpacked/*
+  done
+  "$W/auditwheel" repair -w "$OUT" --plat "manylinux_2_28_$ARCH" \
+    --exclude 'libtorch*.so*' --exclude 'libc10*.so*' "$WORK"/packed/*.whl
+  if [ "${CE_WHEEL_SDIST:-1}" != 0 ]; then
+    "$W/python" -m build --sdist --no-isolation -o "$OUT" "$SRC"
+  fi
 
-step "smoke test: each wheel in a fresh environment"
-for py in $PYTHONS; do
-  venv "$py" "$WORK/t-$py"
-  "$WORK/t-$py/bin/pip" install -q numpy pytest "torch==$TORCH_BUILD" --index-url "$INDEX" --extra-index-url https://pypi.org/simple
-  "$WORK/t-$py/bin/pip" install -q --no-deps --no-index --only-binary :all: --find-links "$OUT" copyengine
-  (cd "$WORK" && CE_CACHE_DIR="$WORK/empty-cache" "$WORK/t-$py/bin/python" -I -c '
+  step "smoke test: each wheel in a fresh environment"
+  for py in $PYTHONS; do
+    venv "$py" "$WORK/t-$py"
+    "$WORK/t-$py/bin/pip" install -q numpy pytest "torch==$TORCH_BUILD" --index-url "$INDEX" --extra-index-url https://pypi.org/simple
+    "$WORK/t-$py/bin/pip" install -q --no-deps --no-index --only-binary :all: --find-links "$OUT" copyengine
+    (cd "$WORK" && CE_CACHE_DIR="$WORK/empty-cache" "$WORK/t-$py/bin/python" -I -c '
 import copyengine as ce, copyengine._shim as s, os
 assert ce._torch_ops.copy_ is not None, ce._torch_ops.error
 assert s.lib is not None and "/shims/" in s.lib._name, (s.error, getattr(s.lib, "_name", None))
 assert not os.path.exists(os.environ["CE_CACHE_DIR"]), "the prebuilt shim was not used"
 print("ok", ce.__version__)')
-done
+  done
+}
+
+RAW=${CE_WHEEL_RAW:-$WORK/raw}
+case "$STAGE" in
+  kernels) cuda_toolkit; kernels ;;
+  wheel) cuda_toolkit; RAW=$OUT; wheels ;;
+  pack) RAW=$(realpath "$RAW"); pack ;;
+  all)
+    cuda_toolkit
+    kernels
+    CE_WHEEL_FATBIN="$OUT/ce_kernels.fatbin" wheels
+    pack
+    rm -f "$OUT/ce_kernels.fatbin" "$OUT/ce_kernels.fatbin.sources"
+    ;;
+esac
 
 ls -l "$OUT"
 [ -n "${HOST_UID:-}" ] && chown -R "$HOST_UID" "$OUT"

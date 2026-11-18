@@ -85,8 +85,32 @@ if(CE_WITH_CUDA)
   # array; loaded at runtime with cuModuleLoadData (no cudart dependency).
   set(CE_CUDA_ARCHS "75;80;86;89;90;100;120" CACHE STRING
       "SM architectures for the kernel fatbin (PTX of the last one is added), or 'native'")
+  # A fatbin built once for every wheel of a release (the kernels do not depend
+  # on the Python version or the host architecture): embedded as is, if it was
+  # built from these kernel sources for these architectures (its .sources file).
+  set(CE_KERNELS_FATBIN "" CACHE FILEPATH "prebuilt kernel fatbin to embed instead of compiling (release builds)")
+  set(_ce_kernel_sources src/backends/cuda/kernels.cu src/backends/cuda/abi.hpp src/core/convert.hpp
+      src/core/quant.hpp src/core/tile.hpp)
+  set(_ce_nvcc_flags -std=c++17 -O3 --fmad=false --compress-mode=size)
+  set(_ce_kernel_id "archs=${CE_CUDA_ARCHS}\nflags=${_ce_nvcc_flags}")
+  foreach(f IN LISTS _ce_kernel_sources)
+    file(SHA256 ${CMAKE_CURRENT_SOURCE_DIR}/${f} _h)
+    string(APPEND _ce_kernel_id "\n${f}=${_h}")
+  endforeach()
+  set(_embed ${CMAKE_CURRENT_BINARY_DIR}/ce_kernels_fatbin.c)
   find_program(CE_NVCC nvcc HINTS ${CUDAToolkit_BIN_DIR})
-  if(CE_NVCC)
+  if(CE_KERNELS_FATBIN)
+    if(NOT EXISTS ${CE_KERNELS_FATBIN} OR NOT EXISTS ${CE_KERNELS_FATBIN}.sources)
+      message(FATAL_ERROR "CE_KERNELS_FATBIN: ${CE_KERNELS_FATBIN} or its .sources file is missing")
+    endif()
+    file(READ ${CE_KERNELS_FATBIN}.sources _ce_prebuilt_id)
+    if(NOT _ce_prebuilt_id STREQUAL _ce_kernel_id)
+      message(FATAL_ERROR "CE_KERNELS_FATBIN was built from other kernel sources or architectures:\n"
+                          "${_ce_prebuilt_id}\nthese:\n${_ce_kernel_id}")
+    endif()
+    set(CE_CUDA_KERNELS ON)
+    set(_fatbin ${CE_KERNELS_FATBIN})
+  elseif(CE_NVCC)
     set(CE_CUDA_KERNELS ON)
     if(CE_CUDA_ARCHS STREQUAL "native")
       set(_gencode -arch=native)
@@ -99,16 +123,22 @@ if(CE_WITH_CUDA)
       list(APPEND _gencode -gencode arch=compute_${_last},code=compute_${_last})
     endif()
     set(_fatbin ${CMAKE_CURRENT_BINARY_DIR}/ce_kernels.fatbin)
-    set(_embed ${CMAKE_CURRENT_BINARY_DIR}/ce_kernels_fatbin.c)
+    file(WRITE ${_fatbin}.sources "${_ce_kernel_id}")  # what the fatbin is built from (CE_KERNELS_FATBIN checks it)
     add_custom_command(
       OUTPUT ${_fatbin}
       # compress-mode=size: ~27x smaller; needs a CUDA 12.4+ era driver to load,
-      # older drivers fail kernel admission with a clear reason.
-      COMMAND ${CE_NVCC} --fatbin -std=c++17 -O3 --fmad=false --compress-mode=size ${_gencode}
+      # older drivers fail kernel admission with a clear reason. --threads 0:
+      # the architectures compile in parallel.
+      COMMAND ${CE_NVCC} --fatbin ${_ce_nvcc_flags} --threads 0 ${_gencode}
               -I${CMAKE_CURRENT_SOURCE_DIR}/src -o ${_fatbin} ${CMAKE_CURRENT_SOURCE_DIR}/src/backends/cuda/kernels.cu
-      DEPENDS src/backends/cuda/kernels.cu src/core/convert.hpp src/core/quant.hpp src/core/tile.hpp
+      DEPENDS ${_ce_kernel_sources}
       COMMENT "Compiling copy kernels (${CE_CUDA_ARCHS})"
       VERBATIM)
+    add_custom_target(ce_kernels DEPENDS ${_fatbin})  # the fatbin alone (docker/build-wheels.sh kernels)
+  else()
+    message(WARNING "nvcc not found: CUDA conversions and kernel strategies will be unavailable")
+  endif()
+  if(CE_CUDA_KERNELS)
     add_custom_command(
       OUTPUT ${_embed}
       COMMAND ${CMAKE_COMMAND} -DINPUT=${_fatbin} -DOUTPUT=${_embed} -DNAME=ce_kernels_fatbin
@@ -116,8 +146,6 @@ if(CE_WITH_CUDA)
       DEPENDS ${_fatbin} cmake/embed.cmake
       VERBATIM)
     target_sources(copyengine PRIVATE ${_embed})
-  else()
-    message(WARNING "nvcc not found: CUDA conversions and kernel strategies will be unavailable")
   endif()
 endif()
 target_compile_definitions(copyengine PRIVATE CE_CUDA_KERNELS=$<BOOL:${CE_CUDA_KERNELS}>)

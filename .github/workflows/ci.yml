@@ -146,14 +146,81 @@ jobs:
         run: python -c "import copyengine as ce; assert ce._torch_ops.copy_ is not None, ce._torch_ops.error; assert ce._shim.lib is not None, ce._shim.error; print(ce._shim.lib._name)"
       - run: pytest -q
 
-  # Release wheels and sdist (docker/build-wheels.sh, which also runs locally):
-  # manylinux_2_28 on x86_64 and aarch64, CUDA kernels for every GPU
-  # architecture, a prebuilt shim per supported torch release. On a v* tag the
-  # version must match CMakeLists.txt and the files are attached to the GitHub
-  # release.
-  wheel:
+  # Release wheels and sdist (docker/build-wheels.sh, which also runs locally
+  # as one job): manylinux_2_28 on x86_64 and aarch64, CUDA kernels for every
+  # GPU architecture, a prebuilt shim per supported torch release. In stages,
+  # as parallel jobs: the kernel fatbin once (it depends on neither the Python
+  # version nor the host architecture, and is most of the build), a raw wheel
+  # per architecture and Python embedding it, then per architecture the shims,
+  # repair and smoke tests. They start with the tests; only packing waits for
+  # them. On a v* tag the version must match CMakeLists.txt and the files are
+  # attached to the GitHub release and published to PyPI, once, below.
+  version:
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
-    needs: [core, torch, arm, cross-torch, cuda13]
+    runs-on: ubuntu-24.04
+    outputs:
+      suffix: ${{ steps.v.outputs.suffix }}
+    steps:
+      - uses: actions/checkout@v6
+      - id: v
+        name: Tag matches the version
+        run: |
+          suffix=""
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            want=$(sed -n 's/^project(copyengine VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt)
+            tag=${GITHUB_REF_NAME#v}
+            suffix=${tag#"$want"}  # a pre-release: vX.Y.Z.devN or vX.Y.ZrcN
+            [ "$tag" != "$suffix" ] || { echo "tag $GITHUB_REF_NAME, CMakeLists.txt $want"; exit 1; }
+            [[ -z "$suffix" || "$suffix" =~ ^\.dev[0-9]+$|^rc[0-9]+$ ]] || { echo "bad pre-release tag $GITHUB_REF_NAME"; exit 1; }
+          fi
+          echo "suffix=$suffix" >> "$GITHUB_OUTPUT"
+
+  kernels:
+    needs: [version]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    container: quay.io/pypa/manylinux_2_28_x86_64
+    env:
+      CE_WHEEL_STAGE: kernels
+      CE_WHEEL_OUT: kernels
+    steps:
+      - uses: actions/checkout@v6
+      - run: docker/build-wheels.sh
+      - uses: actions/upload-artifact@v5
+        with:
+          name: kernels
+          path: kernels/*
+
+  wheel:
+    needs: [version, kernels]
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
+        python: [cp310, cp311, cp312]
+    runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    timeout-minutes: 45
+    container: quay.io/pypa/manylinux_2_28_${{ matrix.arch }}
+    env:
+      CE_WHEEL_STAGE: wheel
+      CE_WHEEL_PYTHONS: ${{ matrix.python }}
+      CE_WHEEL_FATBIN: kernels/ce_kernels.fatbin
+      CE_WHEEL_OUT: raw
+      CE_WHEEL_VERSION_SUFFIX: ${{ needs.version.outputs.suffix }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v5
+        with:
+          name: kernels
+          path: kernels
+      - run: docker/build-wheels.sh
+      - uses: actions/upload-artifact@v5
+        with:
+          name: raw-${{ matrix.arch }}-${{ matrix.python }}
+          path: raw/*.whl
+
+  pack:
+    needs: [version, wheel, core, torch, arm, cross-torch, cuda13]
     strategy:
       fail-fast: false
       matrix:
@@ -165,21 +232,20 @@ jobs:
             runner: ubuntu-24.04-arm
             sdist: "0"
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 120
+    timeout-minutes: 45
     container: quay.io/pypa/manylinux_2_28_${{ matrix.arch }}
     env:
+      CE_WHEEL_STAGE: pack
+      CE_WHEEL_RAW: raw
       CE_WHEEL_SDIST: ${{ matrix.sdist }}
+      CE_WHEEL_VERSION_SUFFIX: ${{ needs.version.outputs.suffix }}
     steps:
       - uses: actions/checkout@v6
-      - name: Tag matches the version
-        if: startsWith(github.ref, 'refs/tags/v')
-        run: |
-          want=$(sed -n 's/^project(copyengine VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt)
-          tag=${GITHUB_REF_NAME#v}
-          suffix=${tag#"$want"}  # a pre-release: vX.Y.Z.devN or vX.Y.ZrcN
-          [ "$tag" != "$suffix" ] || { echo "tag $GITHUB_REF_NAME, CMakeLists.txt $want"; exit 1; }
-          [[ -z "$suffix" || "$suffix" =~ ^\.dev[0-9]+$|^rc[0-9]+$ ]] || { echo "bad pre-release tag $GITHUB_REF_NAME"; exit 1; }
-          echo "CE_WHEEL_VERSION_SUFFIX=$suffix" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: raw-${{ matrix.arch }}-*
+          merge-multiple: true
+          path: raw
       - run: docker/build-wheels.sh
       - uses: actions/upload-artifact@v5
         with:
@@ -188,7 +254,7 @@ jobs:
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [wheel]
+    needs: [pack]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -209,7 +275,7 @@ jobs:
   # and the `pypi` environment; no token is stored.
   pypi:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [wheel]
+    needs: [pack]
     runs-on: ubuntu-24.04
     environment:
       name: pypi

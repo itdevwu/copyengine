@@ -41,6 +41,11 @@ change incompatibly only in a new minor (0.x) or major release.
   stream current when it was made; a CPU index tensor rewritten after a lazy
   view was built no longer changes the view; `gather` / `scatter_` in a step
   plan take index values where a host index parameter cannot be read.
+- Builds: nvcc compiles the kernels' GPU architectures in parallel, and
+  `-DCE_KERNELS_FATBIN=<path>` embeds a fatbin built before from the same
+  kernel sources and architectures (checked against its `.sources` file).
+  Release wheels compile the kernels once for every Python and host
+  architecture, in jobs that run in parallel.
 - `bench/bench_serving.py` draws new block ids every step, as serving does,
   and adds a step-plan column (`ce_plan`) and per-case profiling.
 

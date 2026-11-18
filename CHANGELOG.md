@@ -6,6 +6,13 @@ change incompatibly only in a new minor (0.x) or major release.
 
 ## Unreleased
 
+- `bench/bench_workloads.py`: copyengine on its target workloads, one suite
+  per kind (rooflines, segment sweeps, paged KV, reblock, resharding, SM
+  caps, interference, quantization with paged gathers and across PCIe, block
+  FP8, every quantization format, small-copy call overhead, two GPUs), one
+  JSON report that compares release against release (`--compare`); the kit
+  runs it with `--bench`.
+
 - Block copies within one pool by GPU indices that may overlap
   (`ce.copy_(ce.lazy(pool)[d], ce.lazy(pool)[s])`, rows of one layout) run as
   three kernels: mark the destination rows, stage only the source rows that
@@ -41,9 +48,8 @@ change incompatibly only in a new minor (0.x) or major release.
   test copies (`stats()["cuda"][i]["peers"]`); where it passes, conversions,
   many-fragment copies and GPU-index gathers / scatters between two GPUs run
   as one kernel on the source GPU (before: refused or one DMA per fragment),
-  and batched DMA is offered. `bench/bench_p2p.py` (KV migration, TP
-  resharding, converting migration); the kit runs the peer tests and, with
-  `--bench`, this benchmark on machines with two GPUs or more.
+  and batched DMA is offered. The kit runs the peer tests on machines with
+  two GPUs or more.
 
 - Threads may share an `Engine`: each thread has its own session (scopes,
   queue, stream, kept buffers, last flush for `freeze()`), while plans,

@@ -140,7 +140,7 @@ def main():
     ap.add_argument("--seeds", type=int, default=200)
     ap.add_argument("--modes", default=MODES)
     ap.add_argument("--timeout", type=int, default=600, help="seconds per seed")
-    ap.add_argument("--bench", action="store_true", help="also run bench/bench_torch.py, bench/bench_compile.py and (two GPUs) bench/bench_p2p.py")
+    ap.add_argument("--bench", action="store_true", help="also run bench/bench_workloads.py (its p2p suite with two GPUs), bench_torch.py and bench_compile.py")
     args = ap.parse_args()
 
     report = {"kit": 1, "started": time.strftime("%Y-%m-%d %H:%M:%S"), "args": vars(args)}
@@ -165,9 +165,8 @@ def main():
             print(f"seed {seed}: " + "; ".join(r["fails"] + r["errors"])[:300], flush=True)
         save()
     if args.bench:
-        report["bench"] = {"bench_torch": bench("bench_torch.py", 3600), "bench_compile": bench("bench_compile.py", 3600)}
-        if len(report["environment"]["gpus"]) > 1:
-            report["bench"]["bench_p2p"] = bench("bench_p2p.py", 3600)
+        report["bench"] = {"bench_workloads": bench("bench_workloads.py", 7200), "bench_torch": bench("bench_torch.py", 3600),
+                           "bench_compile": bench("bench_compile.py", 3600)}
         save()
     f = report["fuzz"]["failing_seeds"]
     print(f"{len(report['fuzz']['seeds'])} seeds, {len(f)} failing: {f[:20]}; report: {args.out}", flush=True)

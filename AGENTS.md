@@ -149,8 +149,11 @@ it merges, against these:
   `just test`, `just test-gpu-matrix` (`CE_SHIM=0`, `CE_TORCH_ALLOCATOR=0`,
   expandable segments), ctest with `CE_WERROR=ON`, `just tidy` (also in CI),
   and the kit's fuzz over every mode; `just sanitize` (compute-sanitizer)
-  before a release candidate, on native Linux. `python bench/bench_torch.py`
-  (and `bench_p2p.py` with two GPUs) compares against torch.
+  before a release candidate, on native Linux. `python bench/bench_workloads.py`
+  (one suite per workload kind, `--compare` across releases) and
+  `bench/bench_torch.py` compare against torch; a performance change is
+  judged on bench_workloads' reports, before and after, on the machines it
+  concerns.
 - Paths one machine cannot reach (another GPU generation, several GPUs,
   another CUDA major) still get what one GPU can check: the build checks
   every driver entry point's prototype (versioned typedefs), and each entry
